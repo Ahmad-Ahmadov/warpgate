@@ -121,7 +121,24 @@
         ...($serverInfo?.runningOnEc2
             ? [{ value: 'IamRole', label: 'IAM role' }]
             : []),
+        // Upstream #2734. Its settings cannot be edited here yet (UPSTREAM-ISSUES
+        // #9), but a target set up that way through the API must not look as if
+        // it had no authentication — that invites replacing a working setup.
+        ...(options.auth.kind === 'Certificate'
+            ? [
+                  {
+                      value: 'Certificate',
+                      label: "Certificate signed by a secret backend's SSH CA",
+                  },
+              ]
+            : []),
     ])
+
+    const authHint = $derived(
+        options.auth.kind === 'Certificate'
+            ? `Signed by the SSH CA of secret backend "${options.auth.backend}" (mount ${options.auth.mount}, role ${options.auth.role}). These settings can only be changed through the API for now.`
+            : undefined,
+    )
 </script>
 
 <h5>Connection</h5>
@@ -181,6 +198,7 @@
     <Select
         label="Authenticate using"
         options={authOptions}
+        hint={authHint}
         bind:value={options.auth.kind}
     />
 
