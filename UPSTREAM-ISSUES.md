@@ -5,6 +5,9 @@ up for reporting upstream. **None of these are changed in this fork** — each i
 a behaviour change rather than a presentation one, and the redesign is
 presentation-only.
 
+Entries 10 and 11 are the exception: backend defects found while syncing with
+upstream v0.30.0, which are fixed in this fork and say so.
+
 Each entry is written to be pasted into an issue with minimal editing.
 
 ---
@@ -274,6 +277,9 @@ to catch. The warning is silent exactly when it matters.
 informational, the intent is unambiguous from the three sibling blocks, and
 this markup was being rewritten anyway. Called out in the screen 14 commit.
 
+**Fixed upstream** in `c48365f0` (v0.30.0), the same one-line change. Nothing
+left to report.
+
 ## 6. Creating or deleting an API token does not update the list
 
 **Where:** `warpgate-web/src/gateway/ApiTokenManager.svelte`
@@ -424,3 +430,120 @@ redraw the three components on `ui/` primitives — `SecretRefInput` is mostly
 logic with a thin sveltestrap shell (Button, FormGroup, Modal, Tooltip), and
 its module-level exports are pure functions that carry over unchanged. Route
 `SecretBackends` from `admin/AppNew.svelte` under `/config/secret-backends`.
+
+**Grown in v0.30.0.** Upstream #2734 adds a third SSH target authentication
+method, "Certificate signed by a secret backend's SSH CA" (backend, SSH engine
+mount, signing role), in `targets/ssh/Options.svelte` and a new
+`CertificateOptions.svelte`, both sveltestrap and both in screens this fork had
+already replaced. The backend and API merged intact; the editor did not. A
+target set up that way through the API keeps its settings when opened and
+saved in this UI (a select keeps a bound value it has no option for), and the
+SSH options screen now names the method and shows its backend, mount and role
+instead of rendering an empty "Authenticate using" select. They can only be
+changed through the API until the editor is ported with the rest.
+
+The local-verification blocker above is gone: the clients now regenerate in a
+`node:24-bookworm` container with a JRE, the way the Docker build does it, and
+`svelte-check` against them is clean.
+
+## 10. Native RDP: a rejected sign-in reaches mstsc as a "protocol error" (0xd06)
+
+**Where:** `ironrdp-server` 0.13.0 `send_access_denied` (vendored at
+`vendor/ironrdp-server`), and `warpgate-protocol-rdp/src/server/mod.rs`
+`handle_connection`.
+
+**Changed in this fork.** Worth reporting to both projects:
+Devolutions/IronRDP for the first defect, warp-tech/warpgate for the second.
+
+### What happens
+
+Connect with `mstsc.exe` and a username or password Warpgate rejects. Instead of
+a "connection denied" message, mstsc shows:
+
+```
+Because of a protocol error, this session will be disconnected.
+Error code: 0xd06  Extended error code: 0x0
+```
+
+Every rejection ends this way: a wrong or empty password, an unknown user, a
+username without a `:target` selector that resolves, or a backend error. The
+listener is TLS-only (`with_tls` advertises `PROTOCOL_SSL` alone, no NLA), so
+credentials arrive in the Client Info PDU and are checked only once the
+connection is up, which is the one place this denial is sent from. The admin
+UI's protocol notes said the client "connects over NLA/CredSSP"; that line is
+corrected in this fork.
+Warpgate's own e2e harness hit the same wall from the FreeRDP side
+(`tests/rdp_client.py`: "on rejection Warpgate closes the socket; FreeRDP then
+only reports a transport error"), so it reads the verdict server-side.
+
+### Two defects
+
+**1. The denial is not a valid PDU.** Credentials are validated after the
+connection is fully established, so the refusal must be the server-initiated
+disconnection sequence of [MS-RDPBCGR] 1.3.1.4.2. `send_access_denied` sent a
+`ServerSetErrorInfoPdu(ServerDeniedConnection)` as the bare 4-byte `errorInfo`
+field (`07 00 00 00`), without the Share Control and Share Data headers that
+2.2.5.1.1 requires. A client parses I/O-channel data as a Share Control PDU:
+these bytes claim `totalLength` 7 with 4 present and `pduType` 0, and read as a
+Basic Security Header they claim flags `0x0007` (security exchange and
+multitransport). Neither parses, so the client reports a protocol error, and
+the `0x…06` family of mstsc's code fits a failure in its security layer.
+IronRDP's acceptor has the same encoding behind a `FIXME`.
+
+**2. Warpgate threw the denial away anyway.** The RDP server runs on its own
+thread against an in-memory duplex, relayed to the viewer's socket by
+`copy_bidirectional` inside a `tokio::select!` with the control loop and the
+server thread's result. On a rejection all three end together: the server
+writes the denial and returns, which closes the control loop's event channel
+and resolves the server's result. Whichever branch won, the select dropped the
+relay with the denial still in the duplex or the relay's buffer. And when the
+relay did win, `copy_bidirectional` failed as soon as the viewer sent input
+after the server ended (mstsc sends input right after activation), again before
+delivering the denial. Then the socket closed with unread input, which makes
+the kernel send a reset.
+
+### Fix (in this fork)
+
+- `encode_access_denied` frames the Set Error Info PDU the way the acceptor
+  frames its finalization Share Data PDUs, which mstsc already accepts from this
+  server, with `pduSource` 0 as the spec requires for this PDU. It then sends an
+  MCS Disconnect Provider Ultimatum (`rn-provider-initiated`). The error code is
+  unchanged (`ERRINFO_SERVER_DENIED_CONNECTION`). Recorded in
+  `vendor/ironrdp-server/PATCHES.md` and `warpgate.patch`.
+- `relay` delivers everything the server wrote before a FIN, discards viewer
+  input the server can no longer take, and reads until the viewer hangs up.
+  `drive_session` gives the relay up to `RELAY_DRAIN_TIMEOUT` (5 s) to finish
+  whichever branch ended the session.
+
+### Reproduction
+
+At protocol level, in unit tests. Putting each old behaviour back makes exactly
+the tests for it fail:
+
+- the upstream encoding: four framing tests fail (one frame, no ultimatum), and
+  IronRDP's own client-side `decode_io_channel` rejects the bare payload
+- `copy_bidirectional`: a viewer that keeps sending receives nothing
+- the old teardown: the viewer receives one byte of the denial
+
+Not reproduced end to end with mstsc. That needs a running gateway, which this
+work did not start; see the deployment check in NOTES.md.
+
+## 11. An empty `WARPGATE_ADMIN_PASSWORD` creates an admin with no password
+
+**Where:** `warpgate/src/commands/setup.rs`, `UnattendedSetupArgs::admin_password`.
+
+**Changed in this fork.**
+
+`unattended-setup` takes the initial admin password from `--admin-password`,
+falling back to `WARPGATE_ADMIN_PASSWORD`. `std::env::var` returns `Some("")`
+for a variable that is set but empty, and that was accepted as the password.
+Compose makes this easy to hit: `${WARPGATE_ADMIN_PASSWORD:-}` hands the
+container an empty string when the variable is unset, and so does an unfilled
+`WARPGATE_ADMIN_PASSWORD=` line in `.env`. The result is a gateway whose
+built-in admin account has no password.
+
+**Fix:** an empty value from either source counts as absent, and an empty flag
+falls through to the environment. With neither set, setup stops with its
+existing "you must supply the admin password" error. A whitespace-only password
+is still a password (it is a deliberate value, and policy is not setup's job).
+Covered by seven unit tests in `setup.rs`.

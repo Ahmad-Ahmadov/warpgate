@@ -2008,3 +2008,149 @@ Until the client is regenerated, treat `svelte-check`'s baseline on this branch
 as "1 known error at SSHKeys.svelte:67", not zero, and re-baseline after any
 regeneration. The honest reading of a local green tick here is "nothing new
 broke", not "the API contract holds" — that second question is schemacheck's.
+
+## Upstream v0.30.0, and mstsc's "protocol error" 0xd06
+
+### The sync
+
+Upstream `warp-tech/warpgate` `main` at `5d4d8da6`, the commit that sets the
+version to v0.30.0, merged into `new-design-full` as `2d7df158`: a merge commit,
+no rebase, no force-push, nothing pushed. Upstream has not tagged it yet (the
+newest tag is `v0.30.0-beta.3`), so builds report `v0.30.0-beta.3-N-g<hash>`.
+The branches had diverged from `df67939f` by 59 fork commits and 108 upstream
+ones. Outside `warpgate-web` the merge result is byte-identical to upstream
+except for this fork's own Docker and documentation files.
+
+Conflict resolution kept the redesigned UI and re-applied upstream's behaviour
+on it; the merge commit lists what that meant screen by screen. Three things
+found afterwards are worth knowing for the next sync:
+
+- **Git spliced a sveltestrap toolbar into WebSsh without a conflict.** Both
+  sides restructured adjacent lines, so upstream's `<Dropdown>` toolbar landed
+  outside the conflict hunk, in front of this fork's toolbar. The only symptom
+  was an "unexpected block closing tag" from `svelte-check`. After resolving,
+  grep the merged Svelte files for components this fork removed (`Dropdown`,
+  `ModalBody`, `color=`) — a clean merge is not a correct one.
+- **Upstream components still lean on Bootstrap variables.** VirtualList (#2650)
+  sets `border-width: 0 0 var(--bs-list-group-border-width)`, which nothing
+  defines here; an undefined `var()` voids the declaration and the border falls
+  back to `medium`. `ui/compat.css` maps the variable and restores row
+  separators that VirtualList's wrapper divs would otherwise strip. Unused by
+  any screen today, but `ItemList` exposes `virtual`, so it would have bitten.
+- **#2734 added an SSH auth method the redesign could not show.** A target set
+  up for Vault-signed certificates rendered an empty "Authenticate using"
+  select. The setting was preserved on save (Svelte keeps a bound value no
+  option matches), but an empty select reads as "nothing configured". It now
+  names the method; the editor stays with the Vault UI (UPSTREAM-ISSUES #9).
+
+Not integrated, by decision: the Vault secret-backend screens, now including
+#2734's certificate editor. Merged but not adopted: VirtualList (#2650) is
+available through `ItemList`'s `virtual`, but upstream enables it on lists this
+fork draws as tables and card grids, which it cannot window, so long target
+and user lists still render every row, as they did before. Not applicable:
+#2669 defers loading a target's roles until the target is loaded, and this
+fork's target screen already only asks for them after that.
+
+### Distroless broke the compose bootstrap
+
+The runtime image is Distroless since #2705: no shell, so the entrypoint script
+that generated and printed an admin password is gone. First-run setup is a
+one-shot `setup` service running `unattended-setup --if-config-exists=skip`,
+which the gateway waits for, and `WARPGATE_ADMIN_PASSWORD` is required on the
+first run. `WARPGATE_EXTERNAL_HOST` is gone with the script; `external_host` is
+set in `data/warpgate.yaml`.
+
+Getting the password into setup exposed an upstream bug: an EMPTY
+`WARPGATE_ADMIN_PASSWORD` was accepted, creating an admin with no password —
+and Compose produces an empty one from `${VAR:-}` or an unfilled `.env` line.
+Setup now treats an empty value as absent (UPSTREAM-ISSUES #11), and the
+compose file passes the variable by name, so an unset one stays unset.
+
+### 0xd06: the denial was malformed, then thrown away
+
+Full write-up in UPSTREAM-ISSUES #10. In short, a rejected native sign-in failed
+twice over:
+
+1. `ironrdp-server`'s `send_access_denied` (upstream IronRDP 0.13.0 code) sent
+   the Set Error Info PDU as its bare 4-byte payload, without the Share Control
+   and Share Data headers. No client can parse that; mstsc calls it a protocol
+   error. Fixed in the vendored crate (`PATCHES.md`), which now also ends with
+   a Disconnect Provider Ultimatum.
+2. Warpgate's relay between the viewer socket and the RDP server's duplex was a
+   `select!` branch that lost to the control loop or the server's result, both
+   of which end at the same moment on a rejection, and `copy_bidirectional`
+   failed on viewer input after the server ended. Either way the denial was
+   dropped. `relay` and `drive_session` in `server/mod.rs` now deliver
+   everything the server wrote and close without a reset.
+
+The evidence, in the order it was gathered: the code (the bytes `07 00 00 00`
+against MS-RDPBCGR 2.2.5.1.1); IronRDP's own client decoder rejecting those
+bytes; pristine `ironrdp-server` 0.13.0 containing the same code, so it is not
+a Warpgate patch gone wrong; and `tests/rdp_client.py`, whose authors had
+already observed that "FreeRDP then only reports a transport error" on
+rejection. The `0x…06` family of the code fits a failure in mstsc's security
+layer, which is where a payload whose first word reads as security flags
+(`0x0007`) would fail — consistent, but the code itself is undocumented.
+
+Each regression test was shown to fail on the old behaviour before it was
+trusted: with the upstream encoding put back, four denial tests fail; with
+`copy_bidirectional` put back, a viewer that keeps typing receives nothing;
+with the old `select!`, it receives one byte. One test needed tightening to be
+a reliable witness: `select!` polls ready branches in random order, so with a
+64-byte pipe the old code could still deliver the whole denial whenever the
+relay happened to be polled first. A one-byte pipe makes it fail every time.
+
+### Validation, and how it was possible here
+
+This machine cannot link Rust (no MSVC build tools or Windows SDK) and its Java
+segfaults, so neither `cargo` nor the OpenAPI generator runs natively. Both run
+in containers instead, against a read-only mount of the working tree and from a
+copy of the tracked files, so nothing in the tree can be modified:
+
+- Rust in `rust:1.97.1-bookworm`, the Dockerfile's build image, with the pinned
+  nightly from `rust-toolchain.toml`.
+- The frontend in `node:24-bookworm` with a JRE, where `npm ci` regenerates both
+  API clients from the committed schemas, as the Docker build does.
+
+The vendored crate cannot be tested from the workspace — Cargo refuses a
+non-member with dev-dependencies — so it is tested standalone from a copy,
+the way IronRDP tests it.
+
+| Check | Result |
+|---|---|
+| `ironrdp-server` unit tests, standalone | 16 passed (6 new) |
+| `warpgate-protocol-rdp` unit tests | 39 passed (6 new) |
+| `warpgate` setup tests | 7 passed (all new) |
+| Reproductions: old encoding / `copy_bidirectional` / old `select!` | 4 / 1 / 1 tests fail, as intended |
+| `cargo test --workspace --all-features` | 555 passed, 0 failed (58 suites) |
+| Migrations through m00092 on seeded SQLite schemas | pass (the m00075/m00080–82 tests run the full chain) |
+| `cargo fmt --check` on the changed crates | clean |
+| `cargo cranky --workspace --all-features`, as CI runs it | 0 errors; none of its warnings are in the changed code |
+| `cargo deny check` | advisories, bans, licenses, sources ok |
+| `svelte-check` against freshly generated clients | 0 errors, 0 warnings, 1,112 files |
+| Biome, `src/` | clean apart from one older warning in the styleguide's AuditTable |
+| `vite build` | ok, 713.3 KB gzipped against the 733.6 KB baseline |
+| Release image, built from a clean clone of `492094ed` with `release-no-lto` as compose does | builds; its own frontend step finds 0 errors, 0 warnings; the binary runs on the Distroless base (`warpgate version`) |
+
+The application itself was not started, as asked: the Python e2e suite and an
+mstsc session need a running gateway.
+
+### Deploying
+
+Rebuild the image on the server: `docker compose up -d --build`. No
+configuration changes are needed for the RDP fix. On first deployment of this
+version with an existing `./data`, setup skips and `WARPGATE_ADMIN_PASSWORD` is
+not read.
+
+To confirm the fix with mstsc, connect with a deliberately wrong password.
+Expected: mstsc reports that the server denied the connection (its message for
+`ERRINFO_SERVER_DENIED_CONNECTION`) instead of "protocol error 0xd06", and the
+gateway logs `Authentication failed` and `Credential validation rejected`. Then
+connect with the username in `user:target` form and the right password, which
+should behave exactly as before. That mstsc session is the one check this work
+could not run.
+
+If you run Warpgate as a cluster: v0.30.0 replaces the shared cluster token
+with mutual TLS between nodes (#2698), and migration `m00091` drops the old
+token. Read upstream's cluster notes before upgrading clustered nodes. A single
+gateway is unaffected.
