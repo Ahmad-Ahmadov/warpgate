@@ -54,13 +54,26 @@ impl SetupArgs {
     }
 }
 
+/// The initial admin password from `--admin-password`, falling back to
+/// `WARPGATE_ADMIN_PASSWORD`. An empty value from either source counts as
+/// absent.
+///
+/// `std::env::var` returns `Some("")` for a variable that is set but empty —
+/// `WARPGATE_ADMIN_PASSWORD=` in a `.env` file, or a Compose default such as
+/// `${WARPGATE_ADMIN_PASSWORD:-}` — and that used to be accepted as the
+/// password, creating the admin account with no password at all. An empty
+/// flag falls through to the environment rather than winning over it.
+fn resolve_admin_password(flag: Option<String>, env: Option<String>) -> Option<String> {
+    let present = |p: &String| !p.is_empty();
+    flag.filter(present).or_else(|| env.filter(present))
+}
+
 impl UnattendedSetupArgs {
     fn admin_password(&self) -> Secret<String> {
-        if let Some(password) = self
-            .admin_password
-            .clone()
-            .or_else(|| std::env::var("WARPGATE_ADMIN_PASSWORD").ok())
-        {
+        if let Some(password) = resolve_admin_password(
+            self.admin_password.clone(),
+            std::env::var("WARPGATE_ADMIN_PASSWORD").ok(),
+        ) {
             Secret::new(password)
         } else {
             error!("You must supply the admin password either through the --admin-password option");
@@ -565,4 +578,52 @@ pub async fn command(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_admin_password;
+
+    fn s(v: &str) -> Option<String> {
+        Some(v.to_owned())
+    }
+
+    #[test]
+    fn an_empty_env_var_is_not_a_password() {
+        // The case that created a password-less admin: the variable is set,
+        // but to nothing.
+        assert_eq!(resolve_admin_password(None, s("")), None);
+    }
+
+    #[test]
+    fn an_empty_flag_falls_through_to_the_env_var() {
+        assert_eq!(resolve_admin_password(s(""), s("from-env")), s("from-env"));
+    }
+
+    #[test]
+    fn both_empty_is_absent() {
+        assert_eq!(resolve_admin_password(s(""), s("")), None);
+    }
+
+    #[test]
+    fn the_flag_wins_over_the_env_var() {
+        assert_eq!(resolve_admin_password(s("flag"), s("env")), s("flag"));
+    }
+
+    #[test]
+    fn the_env_var_is_used_when_there_is_no_flag() {
+        assert_eq!(resolve_admin_password(None, s("env")), s("env"));
+    }
+
+    #[test]
+    fn neither_source_is_absent() {
+        assert_eq!(resolve_admin_password(None, None), None);
+    }
+
+    #[test]
+    fn a_whitespace_password_is_still_a_password() {
+        // Only EMPTY is treated as absent. Rejecting anything else would be a
+        // password policy, which is not this function's job.
+        assert_eq!(resolve_admin_password(None, s(" ")), s(" "));
+    }
 }
