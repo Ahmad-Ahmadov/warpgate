@@ -33,10 +33,10 @@
 # and can be removed from .env.
 #
 # It is passed through by name (`- WARPGATE_ADMIN_PASSWORD`), not as
-# `${WARPGATE_ADMIN_PASSWORD:-}`. The difference matters: the second form hands
-# the container an EMPTY string when the variable is unset, and setup would
-# create the admin account with an empty password. A name-only entry leaves an
-# unset variable unset, so setup refuses instead.
+# `${WARPGATE_ADMIN_PASSWORD:-}`, which hands the container an EMPTY string
+# when the variable is unset. Upstream's setup accepted an empty string and
+# created the admin account with no password; this fork's setup refuses it,
+# and a name-only entry leaves an unset variable unset in the first place.
 #
 # Config and state live in ./data. Delete that directory to start over.
 #
@@ -98,8 +98,7 @@ services:
             - --record-sessions
             - --if-config-exists=skip
         environment:
-            # Name only: an unset variable stays unset. See "First run" above
-            # for why `${WARPGATE_ADMIN_PASSWORD:-}` would be a security bug.
+            # Name only: an unset variable stays unset. See "First run" above.
             - WARPGATE_ADMIN_PASSWORD
         volumes:
             - ./data:/data

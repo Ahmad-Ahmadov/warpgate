@@ -48,12 +48,13 @@ Warpgate is a smart & fully transparent SSH, HTTPS, Kubernetes, MySQL, PostgreSQ
 ## Running this fork
 
 ```bash
+cp .env.example .env    # then set WARPGATE_ADMIN_PASSWORD in it (first run only)
 docker compose up
 ```
 
-That is the whole thing. It builds the image from this working tree, runs
-first-time setup if `./data` has no config yet, and starts the gateway — no
-host toolchain, no build arguments, no separate setup step.
+It builds the image from this working tree, runs first-time setup if `./data`
+has no config yet, and starts the gateway — no host toolchain and no separate
+setup step.
 
 | | |
 |---|---|
@@ -64,16 +65,33 @@ host toolchain, no build arguments, no separate setup step.
 
 The TLS certificate is self-signed on first run, so the browser warns once.
 
-On first run an admin password is generated and **printed to the log** — copy
-it, it is stored only as a hash. To pick your own, see [`.env.example`](.env.example).
+**The first run needs `WARPGATE_ADMIN_PASSWORD`.** The runtime image is
+Google Distroless since upstream #2705 and has no shell, so the old entrypoint
+script that generated a password and printed it to the log is gone. First-run
+setup is now Warpgate's own `unattended-setup --if-config-exists=skip`, run by a
+one-shot `setup` service that the gateway waits for. Without the variable, setup
+refuses and the gateway does not start. An empty value is refused too, rather
+than creating an admin account with an empty password. Once `./data` holds a
+config the variable is never read again, and you can remove it from `.env`.
 
-`WARPGATE_EXTERNAL_HOST` is unset by default and that is deliberate. Warpgate
-scopes the session cookie to it, so an external_host that does not match the
-address people actually type means the browser discards every session cookie —
-the sign-in page loads, takes a password, and returns you to the sign-in page.
+On Linux hosts the container runs as uid 1000, and Docker creates a missing
+`./data` owned by root, so setup fails with a permission error. Create it first
+with `sudo mkdir -p data && sudo chown 1000:1000 data`, or build for your own uid
+with `docker compose build --build-arg USER_ID=$(id -u)`.
+
+`external_host` is unset by default and that is deliberate. Warpgate scopes the
+session cookie to it, so an external_host that does not match the address
+people actually type means the browser discards every session cookie — the
+sign-in page loads, takes a password, and returns you to the sign-in page.
 Unset, cookies follow whatever host the request arrived on, which works at
-localhost, at a hostname and at an IP alike. Set it when you serve HTTP
-targets, whose URLs are generated from it.
+localhost, at a hostname and at an IP alike. Set it when you serve HTTP targets,
+whose URLs are generated from it: edit `external_host` in `data/warpgate.yaml`
+and run `docker compose restart warpgate`. (The `WARPGATE_EXTERNAL_HOST`
+variable is gone: without a shell, compose cannot pass `--external-host` only
+when it is set.)
+
+Other Warpgate commands go through the same image, skipping the setup service:
+`docker compose run --rm --no-deps warpgate check`, or `recover-access`.
 
 For reviewing UI changes, [`docker/docker-compose.dev.yml`](docker/docker-compose.dev.yml)
 rebuilds the frontend in seconds instead of rebuilding the image.
