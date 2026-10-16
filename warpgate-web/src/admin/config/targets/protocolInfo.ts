@@ -138,7 +138,7 @@ export const protocolInfo: Partial<Record<TargetKind, string>> = {
 
 ## Warpgate ↔ client
 
-* The client connects over NLA/CredSSP.
+* The client connects over TLS, without NLA: the username (\`user:target\`) and password arrive in the RDP logon info and are checked once the connection is established.
 * Authentication always starts with a password, other credentials (OTP / web approval) are then collected over a visual UI.
 
 ## RDP protocol
