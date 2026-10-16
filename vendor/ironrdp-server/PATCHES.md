@@ -19,6 +19,36 @@ is why this strikes some deployments and not others; see warp-tech/warpgate#2606
 carrying the headers has been built. It also drops a `* 2` from the adjacent buffer-resize
 `debug!`, which reported twice the size actually allocated.
 
+## Malformed access denial: mstsc "protocol error" 0xd06 on a rejected sign-in
+
+With a `CredentialValidator` configured, `client_accepted` validates the viewer's
+credentials once the connection is fully established, and on rejection `send_access_denied`
+told the client why with a `ServerSetErrorInfoPdu(ServerDeniedConnection)`. Upstream encoded
+that PDU on its own — the bare 4-byte `errorInfo` field (`07 00 00 00`) as the whole payload
+of the Send Data Indication — without the Share Control and Share Data headers [MS-RDPBCGR]
+2.2.5.1.1 requires. A client in the active phase reads the I/O channel as Share Control
+PDUs, and those four bytes are neither one (`totalLength` 7 with 4 bytes present,
+`pduType` 0) nor valid security-header framing (`flags` 0x0007 would claim a
+security-exchange and multitransport packet). So the client cannot read the reason, and
+reports a protocol error instead: mstsc shows "Because of a protocol error, this session will
+be disconnected" with error code 0xd06, FreeRDP a transport error. The same bytes come from
+upstream's acceptor, where a `FIXME` already doubts them; that path is only reached through
+`ServerEvent::SetCredentials`, which Warpgate does not use, so it is left alone.
+
+`warpgate.patch` frames the PDU the way the acceptor frames its connection-finalization Share
+Data PDUs — which every client already accepts from this server — except that `pduSource` is
+0, as the spec requires for this PDU. It then sends an MCS Disconnect Provider Ultimatum
+(`rn-provider-initiated`), completing the server-initiated disconnection sequence of
+[MS-RDPBCGR] 1.3.1.4.2, so the client ends the connection itself instead of only seeing the
+transport close. The denial is still sent only after the validator has rejected, and the
+connection is still closed afterwards; the error code is unchanged. Unit tests at the end of
+`server.rs` parse the result with IronRDP's client-side decoder and check the spec fields on
+the wire.
+
+Getting the PDU right is not enough by itself: Warpgate tore down its byte relay as soon as
+the server ended, discarding the denial before it reached the viewer. That half of the fix
+is in `warpgate-protocol-rdp/src/server/mod.rs` (`relay`, `drive_session`).
+
 `Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
 so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not
 in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor.

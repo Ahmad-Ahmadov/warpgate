@@ -1345,8 +1345,8 @@ impl RdpServer {
 
         // Validate credentials if a validator is configured. The validator runs here, in the
         // async server layer, rather than in the sans-I/O acceptor, because real validators
-        // (PAM/LDAP/DB) are I/O-bound. On rejection, deny with a ServerSetErrorInfoPdu before
-        // closing, matching the acceptor's exact-match denial path.
+        // (PAM/LDAP/DB) are I/O-bound. On rejection, refuse with the server-initiated
+        // disconnection sequence before closing; see `send_access_denied`.
         if let Some(validator) = self.credential_validator.clone() {
             if let Some(creds) = &result.credentials {
                 match validator.validate(creds).await {
@@ -1807,27 +1807,64 @@ async fn deactivate_all(
     Ok(())
 }
 
-/// Send a `ServerSetErrorInfoPdu(ServerDeniedConnection)` to the client, then return.
+/// Refuse a connection whose credentials the validator rejected, then return.
 ///
-/// Used to deny a connection after credential validation rejects it, mirroring the
-/// acceptor's exact-match denial so both paths refuse the same spec-defined way.
+/// Credential validation runs once the connection is fully established, so the client is
+/// already in the active phase and expects the server-initiated disconnection sequence of
+/// [MS-RDPBCGR] 1.3.1.4.2: a Set Error Info PDU naming the reason, then an MCS Disconnect
+/// Provider Ultimatum. See [`encode_access_denied`] for the wire format.
 async fn send_access_denied(
     io_channel_id: u16,
     user_channel_id: u16,
     writer: &mut impl FramedWrite,
 ) -> Result<(), anyhow::Error> {
-    let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
-        ProtocolIndependentCode::ServerDeniedConnection,
-    ));
-    let user_data = encode_vec(&info)?.into();
-    let pdu = SendDataIndication {
+    let frames = encode_access_denied(io_channel_id, user_channel_id)?;
+    writer.write_all(&frames).await?;
+    Ok(())
+}
+
+/// The frames [`send_access_denied`] writes: a Set Error Info PDU carrying
+/// `ERRINFO_SERVER_DENIED_CONNECTION`, then an MCS Disconnect Provider Ultimatum.
+///
+/// Warpgate patch. Upstream sent the bare 4-byte `errorInfo` as the Send Data Indication's
+/// whole payload, without the Share Control and Share Data headers that [MS-RDPBCGR]
+/// 2.2.5.1.1 requires. A client reading the I/O channel parses those four bytes
+/// (`07 00 00 00`) as a header that is neither valid Share Control nor valid security
+/// framing, so instead of the reason it reports a protocol error and drops the connection:
+/// mstsc "Because of a protocol error, this session will be disconnected" (error code
+/// 0xd06), FreeRDP a transport error. The PDU is framed here exactly like the Share Data
+/// PDUs the acceptor sends during connection finalization, except that the spec requires
+/// `pduSource` to be 0 for this one.
+///
+/// The ultimatum then ends the connection at the MCS layer. Without it the client has the
+/// reason but is still waiting for the server to disconnect, and only sees the transport
+/// close, which it may report as a network failure.
+fn encode_access_denied(io_channel_id: u16, user_channel_id: u16) -> Result<Vec<u8>, anyhow::Error> {
+    let error_info = rdp::headers::ShareControlHeader {
+        share_control_pdu: ShareControlPdu::Data(rdp::headers::ShareDataHeader {
+            share_data_pdu: rdp::headers::ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(
+                ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::ServerDeniedConnection),
+            )),
+            stream_priority: rdp::headers::StreamPriority::Undefined,
+            compression_flags: rdp::headers::CompressionFlags::empty(),
+            compression_type: rdp::client_info::CompressionType::K8,
+        }),
+        // [MS-RDPBCGR] 2.2.5.1.1: "the pduSource field MUST be set to 0".
+        pdu_source: 0,
+        // The share the acceptor announced in its Demand Active PDU.
+        share_id: 0,
+    };
+    let error_info = SendDataIndication {
         initiator_id: user_channel_id,
         channel_id: io_channel_id,
-        user_data,
+        user_data: encode_vec(&error_info)?.into(),
     };
-    let msg = encode_vec(&X224(pdu))?;
-    writer.write_all(&msg).await?;
-    Ok(())
+
+    let mut frames = encode_vec(&X224(error_info))?;
+    frames.extend(encode_vec(&X224(mcs::DisconnectProviderUltimatum::from_reason(
+        mcs::DisconnectReason::ProviderInitiated,
+    )))?);
+    Ok(frames)
 }
 
 struct SharedWriter<'w, W: FramedWrite> {
@@ -1866,5 +1903,153 @@ impl<'a, W: FramedWrite> SharedWriter<'a, W> {
         Self {
             writer: Rc::new(Mutex::new(writer)),
         }
+    }
+}
+
+/// Warpgate patch: regression tests for the credential-rejection disconnect.
+#[cfg(test)]
+mod access_denied_tests {
+    use ironrdp_core::{decode, encode_vec};
+    use ironrdp_pdu::mcs::{self, SendDataIndicationCtx};
+    use ironrdp_pdu::rdp::headers::{IoChannelPdu, ShareDataPdu, decode_io_channel};
+    use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
+    use ironrdp_pdu::x224::X224;
+    use tokio::io::AsyncReadExt as _;
+
+    use super::{encode_access_denied, send_access_denied};
+
+    // Typical MCS channel IDs: the I/O channel, and the user channel the client attached.
+    const IO_CHANNEL_ID: u16 = 1003;
+    const USER_CHANNEL_ID: u16 = 1007;
+
+    fn denied_connection() -> ServerSetErrorInfoPdu {
+        ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
+            ProtocolIndependentCode::ServerDeniedConnection,
+        ))
+    }
+
+    /// Splits `bytes` into TPKT frames (version 3, reserved, big-endian length), failing on
+    /// a truncated frame or trailing bytes.
+    fn tpkt_frames(mut bytes: &[u8]) -> Vec<&[u8]> {
+        let mut frames = Vec::new();
+        while !bytes.is_empty() {
+            assert!(bytes.len() >= 4, "truncated TPKT header");
+            assert_eq!(bytes[0], 3, "not a TPKT frame");
+            let len = usize::from(u16::from_be_bytes([bytes[2], bytes[3]]));
+            assert!(
+                (4..=bytes.len()).contains(&len),
+                "TPKT length {len} with {} bytes left",
+                bytes.len()
+            );
+            let (frame, rest) = bytes.split_at(len);
+            frames.push(frame);
+            bytes = rest;
+        }
+        frames
+    }
+
+    /// The two frames of the denial: the Set Error Info PDU, then the ultimatum.
+    fn denial(io_channel_id: u16, user_channel_id: u16) -> Vec<Vec<u8>> {
+        let bytes = encode_access_denied(io_channel_id, user_channel_id).unwrap();
+        let frames: Vec<Vec<u8>> = tpkt_frames(&bytes).into_iter().map(<[u8]>::to_vec).collect();
+        assert_eq!(frames.len(), 2, "expected a Set Error Info PDU and an ultimatum");
+        frames
+    }
+
+    /// What upstream sent is not a PDU a client can parse — the cause of mstsc's
+    /// "protocol error" (0xd06). Pinned so that the reason for the framing stays on record.
+    #[test]
+    fn bare_error_info_is_rejected_by_a_client_parser() {
+        let bare = encode_vec(&denied_connection()).unwrap();
+        assert_eq!(bare, [0x07, 0x00, 0x00, 0x00]);
+
+        let indication = SendDataIndicationCtx {
+            initiator_id: USER_CHANNEL_ID,
+            channel_id: IO_CHANNEL_ID,
+            user_data: &bare,
+        };
+        assert!(decode_io_channel(indication).is_err());
+    }
+
+    /// Parsed the way IronRDP's own client parses every PDU on the I/O channel.
+    #[test]
+    fn denial_is_a_set_error_info_pdu_a_client_can_read() {
+        let frames = denial(IO_CHANNEL_ID, USER_CHANNEL_ID);
+
+        let indication = mcs::decode_send_data_indication(&frames[0]).unwrap();
+        assert_eq!(indication.channel_id, IO_CHANNEL_ID);
+        assert_eq!(indication.initiator_id, USER_CHANNEL_ID);
+
+        let IoChannelPdu::Data(data) = decode_io_channel(indication).unwrap() else {
+            panic!("expected a Share Data PDU");
+        };
+        assert_eq!(data.pdu, ShareDataPdu::ServerSetErrorInfo(denied_connection()));
+        assert_eq!(data.pdu_source, 0);
+    }
+
+    /// The fields [MS-RDPBCGR] 2.2.5.1.1 pins down, checked on the wire rather than through
+    /// IronRDP's decoder, which could share a mistake with its encoder.
+    #[test]
+    fn denial_matches_the_spec_on_the_wire() {
+        let frames = denial(IO_CHANNEL_ID, USER_CHANNEL_ID);
+        let pdu = mcs::decode_send_data_indication(&frames[0]).unwrap().user_data;
+
+        // Share Control Header (6) + Share Data Header (12) + errorInfo (4).
+        assert_eq!(pdu.len(), 22);
+        // totalLength covers the whole PDU. The bare form claimed 7 bytes and had 4.
+        assert_eq!(pdu[0..2], 22u16.to_le_bytes());
+        // pduType: PDUTYPE_DATAPDU (0x7) | TS_PROTOCOL_VERSION (0x10).
+        assert_eq!(pdu[2..4], 0x0017u16.to_le_bytes());
+        // pduSource: "MUST be set to 0".
+        assert_eq!(pdu[4..6], [0, 0]);
+        // pduType2: PDUTYPE2_SET_ERROR_INFO_PDU (47).
+        assert_eq!(pdu[14], 47);
+        // compressedType: none.
+        assert_eq!(pdu[15], 0);
+        // errorInfo: ERRINFO_SERVER_DENIED_CONNECTION (0x00000007).
+        assert_eq!(pdu[18..22], 7u32.to_le_bytes());
+    }
+
+    #[test]
+    fn denial_ends_with_a_provider_initiated_ultimatum() {
+        let frames = denial(IO_CHANNEL_ID, USER_CHANNEL_ID);
+
+        let X224(ultimatum) = decode::<X224<mcs::DisconnectProviderUltimatum>>(&frames[1]).unwrap();
+        assert_eq!(ultimatum.reason, mcs::DisconnectReason::ProviderInitiated);
+    }
+
+    /// pduSource stays 0 whatever the connection's channels are — the other PDUs this server
+    /// sends put the I/O channel ID there, and copying that here is what the spec forbids.
+    #[test]
+    fn denial_is_addressed_to_the_connection_channels() {
+        for (io_channel_id, user_channel_id) in [(1001, 1002), (1003, 1007), (u16::MAX - 1, u16::MAX)] {
+            let frames = denial(io_channel_id, user_channel_id);
+
+            let indication = mcs::decode_send_data_indication(&frames[0]).unwrap();
+            assert_eq!(indication.channel_id, io_channel_id);
+            assert_eq!(indication.initiator_id, user_channel_id);
+
+            let IoChannelPdu::Data(data) = decode_io_channel(indication).unwrap() else {
+                panic!("expected a Share Data PDU");
+            };
+            assert_eq!(data.pdu_source, 0);
+            assert_eq!(data.pdu, ShareDataPdu::ServerSetErrorInfo(denied_connection()));
+        }
+    }
+
+    /// `send_access_denied` writes the denial and nothing else.
+    #[tokio::test]
+    async fn send_access_denied_writes_the_denial() {
+        let (server_side, mut client_side) = tokio::io::duplex(4096);
+        let mut writer = ironrdp_tokio::TokioFramed::new(server_side);
+
+        send_access_denied(IO_CHANNEL_ID, USER_CHANNEL_ID, &mut writer)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let mut received = Vec::new();
+        client_side.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, encode_access_denied(IO_CHANNEL_ID, USER_CHANNEL_ID).unwrap());
     }
 }
