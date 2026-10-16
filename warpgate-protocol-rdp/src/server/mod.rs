@@ -15,16 +15,19 @@
 //! the viewer while recording them — so native RDP records exactly like the in-browser
 //! path.
 
+use std::io;
 use std::net::SocketAddr;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use tokio::io::{AsyncRead, AsyncWrite, copy_bidirectional};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, DuplexStream};
 use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel};
-use tokio::time::{Instant, timeout_at};
+use tokio::sync::oneshot;
+use tokio::time::{Instant, timeout, timeout_at};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 use warpgate_common::helpers::net::accept_loop;
 use warpgate_common::{ListenEndpoint, TargetRdpOptions, WarpgateError};
@@ -61,6 +64,11 @@ const SERVER_INPUT_CAPACITY: usize = 16;
 const RELAY_BUFFER_BYTES: usize = 64 * 1024;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long the viewer's connection stays open once the session has ended, for the RDP
+/// server's last PDUs to reach the viewer and the viewer to hang up. Generous: a viewer
+/// that has them disconnects within a round trip.
+const RELAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Handles to the connected target-side RDP client, kept once authentication succeeds.
 struct BackendBridge {
@@ -156,7 +164,7 @@ pub async fn bind_server(
 async fn handle_connection(
     services: Services,
     server_handle: Arc<tokio::sync::Mutex<WarpgateServerHandle>>,
-    mut viewer: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    viewer: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     remote_address: SocketAddr,
     cert_pem: String,
     key_pem: String,
@@ -171,8 +179,8 @@ async fn handle_connection(
     // `ironrdp-server` requires a `Sync` transport, which the session-wrapped viewer
     // stream is not, so the server runs against an in-memory duplex and we relay the raw
     // (TLS) RDP bytes across.
-    let (server_side, mut relay_side) = tokio::io::duplex(RELAY_BUFFER_BYTES);
-    let mut rdp_done = rdp::run_on_thread(
+    let (server_side, relay_side) = tokio::io::duplex(RELAY_BUFFER_BYTES);
+    let rdp_done = rdp::run_on_thread(
         server_side,
         cert_pem,
         key_pem,
@@ -181,27 +189,100 @@ async fn handle_connection(
         server_in_rx,
     );
 
-    // Run the RDP server and the control loop concurrently; whichever ends first tears
-    // the session down.
-    tokio::select! {
-        result = control_loop(services, server_handle, remote_address, server_out_rx, server_in_tx) => {
-            result?;
-        }
+    drive_session(
+        control_loop(
+            services,
+            server_handle,
+            remote_address,
+            server_out_rx,
+            server_in_tx,
+        ),
+        rdp_done,
+        relay(viewer, relay_side),
+    )
+    .await
+}
+
+/// Run the control loop, the RDP server and the byte relay concurrently; whichever ends
+/// first ends the session.
+///
+/// The relay outlives the other two by up to [`RELAY_DRAIN_TIMEOUT`]. When the RDP server
+/// ends the session itself — refusing a viewer whose credentials were rejected, say — its
+/// last PDUs are still in the duplex when the control loop and the server's own result
+/// report it gone, and dropping the relay then discarded them: the viewer saw the
+/// connection vanish (mstsc: a protocol or network error) instead of the reason.
+async fn drive_session(
+    control: impl Future<Output = Result<()>>,
+    mut rdp_done: oneshot::Receiver<Result<()>>,
+    relay: impl Future<Output = ()>,
+) -> Result<()> {
+    let mut relay = pin!(relay);
+    let mut relay_finished = false;
+
+    let result = tokio::select! {
+        result = control => result,
         result = &mut rdp_done => {
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => warn!(%error, "RDP server failed"),
                 Err(_) => debug!("RDP server ended"),
             }
+            Ok(())
         }
-        result = copy_bidirectional(&mut viewer, &mut relay_side) => {
-            if let Err(error) = result {
-                debug!(%error, "RDP byte relay error");
-            }
+        () = &mut relay => {
+            relay_finished = true;
+            Ok(())
         }
+    };
+
+    if !relay_finished && timeout(RELAY_DRAIN_TIMEOUT, &mut relay).await.is_err() {
+        debug!("Viewer still connected after the RDP session ended; closing");
     }
 
-    Ok(())
+    result
+}
+
+/// Relay raw RDP bytes between the viewer's connection and the RDP server's duplex until
+/// both are done: the server has ended and everything it wrote has reached the viewer,
+/// and the viewer has hung up.
+///
+/// Unlike `copy_bidirectional`, the server ending first is not an error that cuts the
+/// viewer off. A server that ends has usually just written its last PDUs, and input the
+/// viewer sends meanwhile can no longer be delivered; failing on that would drop the
+/// connection with those PDUs undelivered. So the input is discarded instead, and the
+/// viewer gets everything the server wrote, then a FIN. It is then read until it hangs up
+/// (the ultimatum the server ends with tells it to), because closing a socket that still
+/// holds unread input makes the kernel reset the connection, and a reset can destroy the
+/// server's last PDUs before the viewer has read them.
+async fn relay<V>(viewer: V, server: DuplexStream)
+where
+    V: AsyncRead + AsyncWrite,
+{
+    let (mut viewer_rx, mut viewer_tx) = tokio::io::split(viewer);
+    let (mut server_rx, mut server_tx) = tokio::io::split(server);
+
+    let to_viewer = async {
+        tokio::io::copy(&mut server_rx, &mut viewer_tx).await?;
+        viewer_tx.shutdown().await
+    };
+    let from_viewer = async {
+        match tokio::io::copy(&mut viewer_rx, &mut server_tx).await {
+            // The duplex is closed: the server has ended.
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                tokio::io::copy(&mut viewer_rx, &mut tokio::io::sink()).await?;
+            }
+            result => {
+                // Pass the viewer's hang-up on, so that the server ends too.
+                let _ = server_tx.shutdown().await;
+                result?;
+            }
+        }
+        Ok::<_, io::Error>(())
+    };
+
+    if let Err(error) = tokio::try_join!(to_viewer, from_viewer) {
+        debug!(%error, "RDP byte relay error");
+    }
 }
 
 /// Read the RDP server's event stream: authenticate the viewer, connect to the target on
@@ -559,4 +640,153 @@ async fn dial_if_pending(
         *backend = Some(connect_backend(services, server_in_tx, admitted, *screen).await?);
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use std::time::Duration;
+
+    use anyhow::anyhow;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, duplex};
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
+    use super::{RELAY_DRAIN_TIMEOUT, drive_session, relay};
+
+    const DEADLINE: Duration = Duration::from_secs(5);
+
+    /// An RDP server result that has already arrived, as when the server ended the session.
+    fn rdp_ended() -> oneshot::Receiver<anyhow::Result<()>> {
+        let (done_tx, rdp_done) = oneshot::channel();
+        done_tx.send(Ok(())).unwrap();
+        rdp_done
+    }
+
+    #[tokio::test]
+    async fn relays_both_ways_while_the_session_runs() {
+        let (viewer_socket, mut viewer) = duplex(64);
+        let (mut server, relay_side) = duplex(64);
+        let relaying = tokio::spawn(relay(viewer_socket, relay_side));
+
+        let mut buf = [0; 4];
+        viewer.write_all(b"ping").await.unwrap();
+        server.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+        server.write_all(b"pong").await.unwrap();
+        viewer.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pong");
+
+        drop((viewer, server));
+        timeout(DEADLINE, relaying).await.unwrap().unwrap();
+    }
+
+    /// A viewer that hangs up ends the server's side too, so the RDP server ends with it.
+    #[tokio::test]
+    async fn viewer_hang_up_reaches_the_server() {
+        let (viewer_socket, viewer) = duplex(64);
+        let (mut server, relay_side) = duplex(64);
+        let relaying = tokio::spawn(relay(viewer_socket, relay_side));
+
+        drop(viewer);
+        let mut rest = Vec::new();
+        timeout(DEADLINE, server.read_to_end(&mut rest))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rest.is_empty());
+
+        drop(server);
+        timeout(DEADLINE, relaying).await.unwrap().unwrap();
+    }
+
+    /// The viewer is still sending input when the server ends — mstsc does, right after the
+    /// connection is established, which is when a rejected sign-in ends it. That input can
+    /// no longer be delivered, and `copy_bidirectional` failed on it before delivering what
+    /// the server had written last.
+    #[tokio::test]
+    async fn server_output_reaches_a_viewer_that_keeps_sending() {
+        let (viewer_socket, mut viewer) = duplex(64);
+        let (mut server, relay_side) = duplex(64);
+        let relaying = tokio::spawn(relay(viewer_socket, relay_side));
+
+        server.write_all(b"denial").await.unwrap();
+        drop(server);
+        viewer.write_all(b"input").await.unwrap();
+
+        let mut received = Vec::new();
+        timeout(DEADLINE, viewer.read_to_end(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, b"denial");
+
+        drop(viewer);
+        timeout(DEADLINE, relaying).await.unwrap().unwrap();
+    }
+
+    /// On a rejected sign-in the control loop and the RDP server's result both report the
+    /// session over at once, while the server's last PDUs are still in the duplex. Ending
+    /// the session must not take those PDUs with it.
+    #[tokio::test]
+    async fn session_end_does_not_cut_off_the_server() {
+        // A one-byte pipe to the viewer, so that the relay cannot have delivered the
+        // server's output before the session ends, whichever branch ends it.
+        let (viewer_socket, mut viewer) = duplex(1);
+        let (mut server, relay_side) = duplex(64);
+        server.write_all(b"denial").await.unwrap();
+        drop(server);
+
+        let session = tokio::spawn(drive_session(
+            async { Ok(()) },
+            rdp_ended(),
+            relay(viewer_socket, relay_side),
+        ));
+
+        let mut received = Vec::new();
+        timeout(DEADLINE, viewer.read_to_end(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, b"denial");
+
+        drop(viewer);
+        timeout(DEADLINE, session).await.unwrap().unwrap().unwrap();
+    }
+
+    /// The wait for the viewer to hang up is bounded, and the connection closed after it.
+    #[tokio::test(start_paused = true)]
+    async fn session_end_closes_a_viewer_that_never_hangs_up() {
+        let (viewer_socket, mut viewer) = duplex(64);
+        let (server, relay_side) = duplex(64);
+        drop(server);
+
+        let session = drive_session(
+            async { Ok(()) },
+            rdp_ended(),
+            relay(viewer_socket, relay_side),
+        );
+        timeout(RELAY_DRAIN_TIMEOUT * 2, session)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut rest = Vec::new();
+        viewer.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn control_loop_error_is_returned() {
+        let (viewer_socket, _viewer) = duplex(64);
+        let (_server, relay_side) = duplex(64);
+        let (_done_tx, rdp_done) = oneshot::channel();
+
+        let result = drive_session(
+            async { Err(anyhow!("control loop failed")) },
+            rdp_done,
+            relay(viewer_socket, relay_side),
+        )
+        .await;
+        assert!(result.is_err());
+    }
 }
