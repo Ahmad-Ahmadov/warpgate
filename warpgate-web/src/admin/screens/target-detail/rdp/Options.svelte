@@ -41,9 +41,15 @@
         },
     ]
 
+    // Graphics pipeline is upstream #2621 (RDPEGFX). Upstream labels it
+    // experimental; kept as upstream has it rather than judged here.
     const COMPRESSION = [
         { value: RdpTargetCompression.Lossless, label: 'Lossless' },
         { value: RdpTargetCompression.Remotefx, label: 'RemoteFX' },
+        {
+            value: RdpTargetCompression.GraphicsPipeline,
+            label: 'Graphics pipeline (experimental)',
+        },
     ]
 
     const unsafeTls = $derived(
@@ -125,7 +131,7 @@
     label="Compression between Warpgate and target"
     options={COMPRESSION}
     bind:value={options.compression}
-    hint="If Warpgate and the RDP server share a network, lossless significantly improves image quality even for a remote client."
+    hint="If Warpgate and the RDP server share a network, lossless significantly improves image quality even for a remote client. GNOME Remote Desktop and KDE KRDP require the graphics pipeline."
 />
 
 <style>

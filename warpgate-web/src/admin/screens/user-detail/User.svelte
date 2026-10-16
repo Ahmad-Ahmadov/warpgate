@@ -46,6 +46,7 @@
         type UserRoleAssignmentResponse,
     } from 'admin/lib/api'
     import { adminPermissions } from 'admin/lib/store'
+    import { toLocalISO } from 'common/helpers'
     import { stringifyError } from 'common/errors'
     import Loadable from 'common/Loadable.svelte'
     import RateLimitInput from 'common/RateLimitInput.svelte'
@@ -201,13 +202,6 @@
         }
 
         userRoles = await api.getUserRoles(u)
-    }
-
-    // datetime-local wants a local-time string, so the offset is subtracted
-    // before serialising rather than sending UTC.
-    function toLocalISO(date: Date): string {
-        const tzOffset = date.getTimezoneOffset() * 60000
-        return new Date(date.getTime() - tzOffset).toISOString().slice(0, -5)
     }
 
     function nowLocalISO(): string {

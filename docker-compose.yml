@@ -1,10 +1,10 @@
-# Warpgate — one command, from a clean checkout:
+# Warpgate — from a clean checkout:
 #
+#     cp .env.example .env        # then set WARPGATE_ADMIN_PASSWORD in it
 #     docker compose up
 #
 # That builds the image from this working tree, runs first-time setup if there
-# is no config yet, and starts the gateway. Nothing else is required: no host
-# toolchain, no -f flags, no build args, no separate `setup` step.
+# is no config yet, and starts the gateway.
 #
 #   admin UI   https://localhost:8888/@warpgate/admin
 #   portal     https://localhost:8888/@warpgate
@@ -13,32 +13,68 @@
 #
 # The certificate is self-signed on first run, so the browser will warn once.
 #
-# ── First run ────────────────────────────────────────────────────────────────
-# If WARPGATE_ADMIN_PASSWORD is not set, a random one is generated and printed
-# to the log. It is not stored in plaintext anywhere, so copy it when you see
-# it. To choose your own instead, put it in a .env file beside this one — see
-# .env.example.
+# ── Why there are two services ───────────────────────────────────────────────
+# The runtime image is Google Distroless (upstream #2705, which removed 60+
+# CVEs in OS packages Warpgate never used). Distroless has no shell, so
+# first-run logic cannot be a script in the container's entrypoint any more —
+# there is no /bin/sh to run it.
 #
-# Config and state live in ./data. Delete that directory to start over; keep it
-# and `docker compose up` will skip setup and just run.
+# Instead the "only once" decision lives in Warpgate itself. `setup` is a
+# one-shot service running `warpgate unattended-setup --if-config-exists=skip`:
+# with no config it writes one; with a config it logs "skipping setup" and exits
+# successfully. `warpgate` starts only after `setup` has completed successfully.
+# Every `docker compose up` runs setup, and every run after the first is a
+# no-op.
+#
+# ── First run ────────────────────────────────────────────────────────────────
+# WARPGATE_ADMIN_PASSWORD must be set (in .env, or exported) for the FIRST run
+# only. If it is missing, setup exits with Warpgate's own error and the gateway
+# does not start. Once ./data holds a config, the variable is not read again
+# and can be removed from .env.
+#
+# It is passed through by name (`- WARPGATE_ADMIN_PASSWORD`), not as
+# `${WARPGATE_ADMIN_PASSWORD:-}`. The difference matters: the second form hands
+# the container an EMPTY string when the variable is unset, and setup would
+# create the admin account with an empty password. A name-only entry leaves an
+# unset variable unset, so setup refuses instead.
+#
+# Config and state live in ./data. Delete that directory to start over.
 #
 # ── Deploying somewhere other than your laptop ───────────────────────────────
-# WARPGATE_EXTERNAL_HOST is unset by default, and that is the safe setting: it
-# leaves session cookies scoped to whatever host you browse to, so the gateway
-# works at localhost, at a hostname and at an IP without further thought.
+# `external_host` is left unset by setup, which is the safe default: session
+# cookies are then scoped to whatever host you browse to, so the gateway works
+# at localhost, at a hostname and at an IP alike. Set it when you serve HTTP
+# targets, whose URLs are built from it — edit data/warpgate.yaml:
 #
-# Set it when you use HTTP targets, whose URLs are built from it:
+#     external_host: gateway.example.com
 #
-#     WARPGATE_EXTERNAL_HOST=gateway.example.com docker compose up -d
+# and `docker compose restart warpgate`. It must be exactly the host in your
+# users' address bar, or the browser drops every session cookie.
 #
-# Setting it also scopes session cookies to that host, so it must match the
-# address people actually type. Set to `localhost` while users reach the box at
-# 10.13.14.56, the browser drops every session cookie and sign-in silently does
-# nothing.
+# (This used to be a WARPGATE_EXTERNAL_HOST variable. Without a shell there is
+# no way to pass `--external-host` only when the variable is set, and passing it
+# empty stores an empty value that Warpgate then warns about on every start.)
 #
-# It is read ONLY during first-time setup. Afterwards it lives in
-# data/warpgate.yaml and this variable is ignored — to change it later, edit
-# that file, or delete ./data to start over.
+# ── ./data ownership on Linux hosts ──────────────────────────────────────────
+# The container runs as uid 1000. Docker creates a missing ./data as root, which
+# uid 1000 cannot write to; setup then fails with a permission error. Either:
+#
+#     sudo mkdir -p data && sudo chown 1000:1000 data
+#
+# or rebuild for your own uid:
+#
+#     docker compose build --build-arg USER_ID=$(id -u)
+#
+# Docker Desktop's file sharing hides this, so it only bites on Linux.
+#
+# ── Running other Warpgate commands ──────────────────────────────────────────
+# The image's entrypoint is `warpgate`, so subcommands pass straight through:
+#
+#     docker compose run --rm --no-deps warpgate check
+#     docker compose run --rm --no-deps warpgate recover-access
+#     docker compose run --rm --no-deps warpgate setup      # interactive
+#
+# `--no-deps` skips the setup service, which is what you want for these.
 #
 # ── Reviewing UI changes ─────────────────────────────────────────────────────
 # This file does a release build, so a Svelte edit means rebuilding the image.
@@ -48,6 +84,27 @@
 name: warpgate
 
 services:
+    setup:
+        image: warpgate:local
+        # Built by the `warpgate` service below; compose builds every image
+        # before it starts any container, so this one is already there.
+        pull_policy: never
+        command:
+            - unattended-setup
+            - --data-path=/data
+            - --http-port=8888
+            - --ssh-port=2222
+            - --mysql-port=33306
+            - --record-sessions
+            - --if-config-exists=skip
+        environment:
+            # Name only: an unset variable stays unset. See "First run" above
+            # for why `${WARPGATE_ADMIN_PASSWORD:-}` would be a security bug.
+            - WARPGATE_ADMIN_PASSWORD
+        volumes:
+            - ./data:/data
+        restart: 'no'
+
     warpgate:
         build:
             context: .
@@ -64,113 +121,15 @@ services:
                 #     CARGO_PROFILE=release docker compose build
                 CARGO_PROFILE: ${CARGO_PROFILE:-release-no-lto}
         image: warpgate:local
+        depends_on:
+            setup:
+                condition: service_completed_successfully
         ports:
             - '8888:8888'
             - '2222:2222'
             - '33306:33306'
         volumes:
             - ./data:/data
-        environment:
-            # Deliberately EMPTY by default rather than `localhost`.
-            #
-            # external_host decides the session cookie's Domain. Defaulted to
-            # localhost and then reached at any other address, the cookie is
-            # scoped to `.localhost`, the browser discards it, every request is
-            # anonymous, and the sign-in page loads but never takes. Left
-            # empty, cookies are scoped to whatever host the request arrived
-            # on, which is correct everywhere. Set it once you know the public
-            # address — HTTP target URLs need it.
-            WARPGATE_EXTERNAL_HOST: ${WARPGATE_EXTERNAL_HOST:-}
-            # Empty means "generate one and print it".
-            WARPGATE_ADMIN_PASSWORD: ${WARPGATE_ADMIN_PASSWORD:-}
         stdin_open: true
         tty: true
         restart: unless-stopped
-
-        # The image's entrypoint is `warpgate` itself, so `command:` can only
-        # pass it arguments — it cannot express "set up first, but only once".
-        # Overriding the entrypoint with a shell keeps that logic here instead
-        # of adding a wrapper script to the production image, which upstream
-        # does not have and which would then differ from the published one.
-        #
-        # The trailing "warpgate-entrypoint" is load-bearing. Docker appends
-        # the command to this array, and `sh -c SCRIPT foo` binds foo to $0,
-        # not $1 — so without a placeholder to absorb $0, `docker compose run
-        # warpgate setup` left "$#" at 0, the script never saw `setup`, and ran
-        # the gateway instead. With it, arguments start at $1 and the
-        # passthrough below forwards them to warpgate untouched.
-        #
-        # `$$` is an escaped `$`: a single one would be substituted by Compose
-        # before the container ever sees it.
-        entrypoint:
-            - /bin/sh
-            - -c
-            - |
-                set -e
-
-                # Docker creates a missing bind-mount source as root, while
-                # this image runs as uid 1000. On Docker Desktop the mount
-                # layer hides that; on a Linux host it does not, and the
-                # failure you get otherwise is a permission error from deep
-                # inside setup. Say the actual fix instead.
-                if ! touch /data/.writable 2>/dev/null; then
-                    echo "ERROR: /data is not writable by uid $$(id -u)." >&2
-                    echo "  On the host:  sudo chown -R $$(id -u):$$(id -g) ./data" >&2
-                    echo "  Or rebuild for your uid:" >&2
-                    echo "    docker compose build --build-arg USER_ID=\$$(id -u)" >&2
-                    exit 1
-                fi
-                rm -f /data/.writable
-
-                # Anything passed on the command line is a warpgate subcommand
-                # — `docker compose run warpgate setup`, `check`,
-                # `recover-access`, `client-keys`. Forward it and stop; the
-                # bootstrap below is only for the argument-less `up` path.
-                if [ "$$#" -gt 0 ]; then
-                    exec warpgate "$$@"
-                fi
-
-                if [ ! -f /data/warpgate.yaml ]; then
-                    if [ -z "$$WARPGATE_ADMIN_PASSWORD" ]; then
-                        # Generated rather than defaulted. A known password
-                        # baked into a compose file is fine right up until the
-                        # moment someone runs this on a reachable host, and
-                        # this is a gateway to other machines.
-                        WARPGATE_ADMIN_PASSWORD=$$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)
-                        export WARPGATE_ADMIN_PASSWORD
-                        echo
-                        echo "=============================================="
-                        echo "  First run. Admin credentials:"
-                        echo
-                        echo "    username: admin"
-                        echo "    password: $$WARPGATE_ADMIN_PASSWORD"
-                        echo
-                        echo "  Stored only as a hash. Copy it now."
-                        echo "=============================================="
-                        echo
-                    fi
-
-                    if [ -n "$$WARPGATE_EXTERNAL_HOST" ]; then
-                        echo "external host: $$WARPGATE_EXTERNAL_HOST"
-                        echo "Session cookies are scoped to it, so reach the"
-                        echo "gateway at exactly that address or sign-in will"
-                        echo "appear to do nothing."
-                        set -- --external-host "$$WARPGATE_EXTERNAL_HOST"
-                    else
-                        echo "external host: not set. Cookies will be scoped"
-                        echo "to whatever host you browse to, which works at"
-                        echo "any address. Set WARPGATE_EXTERNAL_HOST if you"
-                        echo "use HTTP targets, whose URLs are built from it."
-                        set --
-                    fi
-
-                    warpgate unattended-setup \
-                        --data-path /data \
-                        --http-port 8888 \
-                        --ssh-port 2222 \
-                        --mysql-port 33306 \
-                        --record-sessions "$$@"
-                fi
-
-                exec warpgate run
-            - warpgate-entrypoint

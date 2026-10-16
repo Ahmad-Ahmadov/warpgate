@@ -8,7 +8,10 @@
     import { api, type TargetGroup } from 'admin/lib/api'
     import { adminPermissions } from 'admin/lib/store'
     import GroupColorIcon from 'common/GroupColorIcon.svelte'
-    import ItemList, { type PaginatedResponse } from 'common/ItemList.svelte'
+    import ItemList, {
+        type LoadOptions,
+        type PaginatedResponse,
+    } from 'common/ItemList.svelte'
     import { compare as naturalCompareFactory } from 'natural-orderby'
     import { from, map, type Observable } from 'rxjs'
     import { link, push } from 'svelte-spa-router'
@@ -16,11 +19,18 @@
     import EmptyState from 'ui/EmptyState.svelte'
     import 'ui/layout.css'
 
-    function getTargetGroups(): Observable<PaginatedResponse<TargetGroup>> {
+    function getTargetGroups(
+        options: LoadOptions,
+    ): Observable<PaginatedResponse<TargetGroup>> {
+        // The API has no search parameter, so the search box filters here.
+        const search = options.search?.toLowerCase()
         return from(api.listTargetGroups()).pipe(
             map(groups => {
                 const natural = naturalCompareFactory()
-                const sorted = groups.sort((a, b) =>
+                const matching = search
+                    ? groups.filter(g => g.name.toLowerCase().includes(search))
+                    : groups
+                const sorted = matching.sort((a, b) =>
                     natural(a.name.toLowerCase(), b.name.toLowerCase()),
                 )
                 return { items: sorted, offset: 0, total: sorted.length }

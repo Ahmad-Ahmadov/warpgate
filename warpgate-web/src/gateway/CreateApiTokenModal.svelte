@@ -19,6 +19,8 @@
      * `validated` was approximating.
      */
 
+    import { formatDurationAsHumantime } from 'common/duration'
+    import { toLocalISO } from 'common/helpers'
     import { serverInfo } from 'gateway/lib/store'
     import { untrack } from 'svelte'
     import Button from 'ui/Button.svelte'
@@ -60,17 +62,20 @@
 
     // svelte-ignore state_referenced_locally
     let label = $state(initialLabel)
+    // To the minute: a seconds part would fail the input's default 60 s step.
+    function toInputValue(date: Date): string {
+        return toLocalISO(date).slice(0, 16)
+    }
+
     // svelte-ignore state_referenced_locally
     let expiry = $state(
-        new Date(Date.now() + validatedInitialExpiryMs)
-            .toISOString()
-            .slice(0, 16),
+        toInputValue(new Date(Date.now() + validatedInitialExpiryMs)),
     )
 
     const maxExpiryDate = maxDurationMs
         ? new Date(Date.now() + maxDurationMs)
         : undefined
-    const maxExpiry = maxExpiryDate?.toISOString().slice(0, 16)
+    const maxExpiry = maxExpiryDate ? toInputValue(maxExpiryDate) : undefined
 
     function save() {
         if (!label.trim()) {
@@ -109,7 +114,7 @@
             max={maxExpiry}
             bind:value={expiry}
             hint={maxDurationMs !== null
-                ? `Maximum ${Math.floor(maxDurationMs / 86400 / 1000)} days, set by your administrator.`
+                ? `Maximum ${formatDurationAsHumantime(maxDurationMs / 1000)}, set by your administrator.`
                 : undefined}
         />
     </form>

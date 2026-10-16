@@ -17,7 +17,11 @@
     import { api, type Target, type TargetGroup } from 'admin/lib/api'
     import { autosave } from 'common/autosave'
     import { stringifyError } from 'common/errors'
-    import { type ResolvedGroup, resolveGroup } from 'common/groups'
+    import {
+        orderForGroupedList,
+        type ResolvedGroup,
+        resolveGroup,
+    } from 'common/groups'
     import type {
         GroupState,
         LoadOptions,
@@ -27,7 +31,6 @@
     import { compare as naturalCompareFactory } from 'natural-orderby'
     import { from, map, type Observable } from 'rxjs'
     import { push } from 'svelte-spa-router'
-    import { firstBy } from 'thenby'
     import Badge from 'ui/Badge.svelte'
     import Button from 'ui/Button.svelte'
     import Callout from 'ui/Callout.svelte'
@@ -80,23 +83,17 @@
                 }),
             ]),
         ).pipe(
-            map(([_, targets]) => {
-                const natural = naturalCompareFactory()
-                const groupName = (target: Target) =>
-                    (
-                        groups.find(g => g.id === target.groupId)?.name ?? ''
-                    ).toLowerCase()
-
-                return targets.sort(
-                    firstBy((x: Target) => !x.groupId)
-                        .thenBy((a: Target, b: Target) =>
-                            natural(groupName(a), groupName(b)),
-                        )
-                        .thenBy((a, b) =>
-                            natural(a.name.toLowerCase(), b.name.toLowerCase()),
-                        ),
-                )
-            }),
+            // Alphabetical by group then name, EXCEPT while searching: the
+            // server ranks fuzzy matches (upstream #2714) and re-sorting would
+            // bury the best one. See common/groups.
+            map(([_, targets]) =>
+                orderForGroupedList(targets, options.search, {
+                    groupId: t => t.groupId,
+                    groupName: t =>
+                        groups.find(g => g.id === t.groupId)?.name ?? '',
+                    name: t => t.name,
+                }),
+            ),
             map(targets => ({
                 items: targets,
                 offset: 0,

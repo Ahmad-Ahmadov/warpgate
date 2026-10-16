@@ -11,6 +11,7 @@
         type TargetClickAction,
     } from 'admin/lib/api'
     import HelpText from 'admin/lib/HelpText.svelte'
+    import LogoInput from 'admin/lib/LogoInput.svelte'
     import PermissionGate from 'admin/lib/PermissionGate.svelte'
     import Section from 'admin/lib/Section.svelte'
     import SectionedForm from 'admin/lib/SectionedForm.svelte'
@@ -63,6 +64,7 @@
                 : { mode: 'Auto' }
     }
     let updateError: string | undefined = $state()
+    let pendingLogo: string | null | undefined = $state()
     let testResult: { success: boolean; error?: string } | undefined = $state()
 
     // Sends the edited config as-is; an untouched secret round-trips as
@@ -136,8 +138,13 @@
                     parameters.adminApprovalTimeoutSeconds ?? null,
                 adminApprovalGracePeriodSeconds:
                     parameters.adminApprovalGracePeriodSeconds ?? null,
+                logo: pendingLogo,
             } as unknown as ParameterValues
             await api.updateParameters({ parameterUpdate })
+            if (pendingLogo !== undefined) {
+                parameters.logoEtag = (await api.getParameters({})).logoEtag
+                pendingLogo = undefined
+            }
             await reloadServerInfo()
         } catch (err) {
             updateError = await stringifyError(err)
@@ -406,6 +413,13 @@
                             </Section>
 
                             <Section id="ui" title="UI">
+                                <Subsection title="Logo">
+                                    <LogoInput
+                                        etag={parameters.logoEtag}
+                                        bind:value={pendingLogo}
+                                    />
+                                </Subsection>
+
                                 <Checkbox
                                     label="Enable in-browser clients (SSH terminal, RDP/VNC desktop)"
                                     bind:checked={parameters.webClientsEnabled}
@@ -917,6 +931,28 @@
                                             bind:value={s3.prefix}
                                         >
                                     </label>
+                                    <label class="wg-field-group">
+                                        <span class="wg-field-label"
+                                            >Local scratch directory</span
+                                        >
+
+                                        <input
+                                            type="text"
+                                            class="form-control"
+                                            placeholder="data/recordings-scratch"
+                                            value={s3.scratchPath ?? ''}
+                                            oninput={e =>
+                                                (s3.scratchPath =
+                                                    e.currentTarget.value ||
+                                                    undefined)}
+                                        >
+                                    </label>
+                                    <HelpText>
+                                        Recordings are buffered here before
+                                        upload. Relative paths resolve against
+                                        the config file's directory, which the
+                                        Warpgate user must be able to write to.
+                                    </HelpText>
                                     <Checkbox
                                         label="Path-style addressing"
                                         bind:checked={s3.pathStyle}

@@ -61,7 +61,21 @@
             // Both sign-out choices when the session came via SSO with single
             // logout; otherwise the one that exists. Logging out everywhere
             // ends sessions beyond Warpgate, so it is marked destructive.
-            items: $serverInfo?.authorizedViaSsoWithSingleLogout
+            // Three cases, from upstream #2740 (OIDC backchannel logout):
+            //  - local logout disabled by policy: ONLY "Log out everywhere".
+            //    Offering a local-only logout would leave the IdP session
+            //    alive in a deployment that has said it must not be.
+            //  - SSO with single logout: both choices.
+            //  - otherwise: a plain logout.
+            items: $serverInfo?.localLogoutDisabled
+                ? [
+                      {
+                          id: 'slo',
+                          label: 'Log out everywhere',
+                          onselect: () => void singleLogout(),
+                      },
+                  ]
+                : $serverInfo?.authorizedViaSsoWithSingleLogout
                 ? [
                       {
                           id: 'logout',

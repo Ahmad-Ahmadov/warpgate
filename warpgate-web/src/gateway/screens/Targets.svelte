@@ -67,7 +67,7 @@
     import ConnectionInstructions from 'common/ConnectionInstructions.svelte'
     import { stringifyError } from 'common/errors'
     import GettingStarted from 'common/GettingStarted.svelte'
-    import { resolveGroup } from 'common/groups'
+    import { orderForGroupedList, resolveGroup } from 'common/groups'
     import ItemList, {
         type LoadOptions,
         type PaginatedResponse,
@@ -79,10 +79,8 @@
         TargetKind,
         type TargetSnapshot,
     } from 'gateway/lib/api'
-    import { compare as naturalCompareFactory } from 'natural-orderby'
     import { from, map, type Observable } from 'rxjs'
     import { get } from 'svelte/store'
-    import { firstBy } from 'thenby'
     import Badge from 'ui/Badge.svelte'
     import Button from 'ui/Button.svelte'
     import Callout from 'ui/Callout.svelte'
@@ -144,27 +142,14 @@
     ): Observable<PaginatedResponse<TargetSnapshot>> {
         return from(api.getTargets({ search: options.search })).pipe(
             map(result => {
-                const naturalCompare = naturalCompareFactory()
-
-                const sorted = result.sort(
-                    firstBy<TargetSnapshot, boolean>(
-                        (x: TargetSnapshot) => !x.group,
-                    )
-                        // Natural sort between groups
-                        .thenBy((a: TargetSnapshot, b: TargetSnapshot) =>
-                            naturalCompare(
-                                (a.group?.name ?? '').toLowerCase(),
-                                (b.group?.name ?? '').toLowerCase(),
-                            ),
-                        )
-                        // Natural sort within a group
-                        .thenBy((a: TargetSnapshot, b: TargetSnapshot) =>
-                            naturalCompare(
-                                a.name.toLowerCase(),
-                                b.name.toLowerCase(),
-                            ),
-                        ),
-                )
+                // Alphabetical by group then name, EXCEPT while searching: the
+                // server ranks fuzzy matches (upstream #2714) and re-sorting
+                // would bury the best one. See common/groups.
+                const sorted = orderForGroupedList(result, options.search, {
+                    groupId: t => t.group?.id,
+                    groupName: t => t.group?.name ?? '',
+                    name: t => t.name,
+                })
 
                 // Chips reflect everything the search returned, not what the
                 // chip filter then narrows it to — otherwise picking one chip

@@ -1,10 +1,10 @@
-use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use sea_orm::{DatabaseConnection, EntityTrait};
-use tokio::sync::Mutex;
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use warpgate_common::{Secret, SecretError, SecretRef, SecretResolver};
+use warpgate_common_cache::Cache;
 use warpgate_db_entities::SecretBackend;
 use warpgate_secrets_vault::VaultBackend;
 
@@ -13,47 +13,69 @@ use crate::logging::AuditEvent;
 /// Resolves references against the backends stored in the database.
 pub struct SecretBackendRegistry {
     db: DatabaseConnection,
-    // Caches clients for as long as the config does not change
-    cache: Mutex<HashMap<String, (SecretBackend::Model, Arc<VaultBackend>)>>,
+    // Key = backend name
+    clients: Cache<String, SecretBackend::Model, Arc<VaultBackend>>,
 }
 
 impl SecretBackendRegistry {
     pub fn new(db: DatabaseConnection) -> Self {
         Self {
             db,
-            cache: Mutex::new(HashMap::new()),
+            clients: Cache::new(Duration::MAX),
         }
     }
 
     async fn get(&self, name: &str) -> Result<Arc<VaultBackend>, SecretError> {
-        let rows = SecretBackend::Entity::find()
-            .all(&self.db)
+        let row = SecretBackend::Entity::find()
+            .filter(SecretBackend::Column::Name.eq(name))
+            .one(&self.db)
             .await
-            .map_err(|e| SecretError::Backend(e.to_string()))?;
-
-        let mut cache = self.cache.lock().await;
-        // Drop clients for deleted configs
-        cache.retain(|cached, _| rows.iter().any(|row| &row.name == cached));
-
-        let Some(row) = rows.into_iter().find(|row| row.name == name) else {
-            return Err(SecretError::BackendNotConfigured {
+            .map_err(|e| SecretError::Backend(e.to_string()))?
+            .ok_or_else(|| SecretError::BackendNotConfigured {
                 backend: name.to_owned(),
-            });
-        };
+            })?;
 
-        if let Some((cached, backend)) = cache.get(name)
-            && *cached == row
-        {
-            return Ok(backend.clone());
-        }
-
-        let backend = Arc::new(VaultBackend::new(&row.config()).await?);
-        cache.insert(name.to_owned(), (row, backend.clone()));
-        Ok(backend)
+        self.clients
+            .get_or_build(&row.name, &row, || async {
+                Ok(Arc::new(VaultBackend::new(&row.config()).await?))
+            })
+            .await
     }
 
     pub async fn health_of(&self, name: &str) -> Result<(), SecretError> {
         self.get(name).await?.health().await
+    }
+
+    /// Signs an SSH public key with the SSH secrets engine of `backend`,
+    /// returning the certificate in OpenSSH wire format.
+    pub async fn sign_ssh_key(
+        &self,
+        backend: &str,
+        mount: &str,
+        role: &str,
+        public_key: &str,
+        principal: &str,
+        key_id: &str,
+    ) -> Result<String, SecretError> {
+        let result = match self.get(backend).await {
+            Ok(backend) => {
+                backend
+                    .sign_ssh_key(mount, role, public_key, principal, key_id)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+
+        AuditEvent::SshCertificateIssued {
+            backend: backend.to_owned(),
+            role: role.to_owned(),
+            principal: principal.to_owned(),
+            key_id: key_id.to_owned(),
+            success: result.is_ok(),
+        }
+        .emit();
+
+        result
     }
 }
 

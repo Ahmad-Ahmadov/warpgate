@@ -743,6 +743,25 @@ textarea.form-control {
     border-bottom: 0;
 }
 
+/*
+ * common/VirtualList (upstream #2650) wraps every row in a `<div data-index>`.
+ * That makes each item the :last-child of its own wrapper, so the rule above
+ * would strip every separator; put them back and drop only the final row's.
+ * VirtualList's own scoped rule then sets the widths from Bootstrap's
+ * --bs-list-group-border-width, which nothing defines now that Bootstrap is
+ * gone — an undefined var() makes the whole declaration fall back to `medium`
+ * (about 3px) — so the variable is mapped onto the token here.
+ */
+.list-group {
+    --bs-list-group-border-width: var(--wg-border-width);
+}
+[data-index] > .list-group-item {
+    border-bottom: var(--wg-border-width) solid var(--wg-border);
+}
+[data-index]:last-child > .list-group-item {
+    border-bottom: 0;
+}
+
 .list-group-item-action:hover {
     background: var(--wg-row-hover);
 }
