@@ -328,7 +328,8 @@ ADMIN_API_TEST_CASES: list[AdminApiTestCase] = [
     ),
     AdminApiTestCase(
         id="get_secret_backend",
-        permission=None,
+        # Same as get_secret_backends: a backend's configuration is not for any admin.
+        permission="config_edit",
         call=lambda api, r: api.get_secret_backend_with_http_info(str(uuid4())),
         expected_statuses={404},
     ),

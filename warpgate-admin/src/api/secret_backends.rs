@@ -397,6 +397,9 @@ impl Api {
         admin: AdminContext,
         Path(id): Path<Uuid>,
     ) -> Result<GetSecretBackendResponse, WarpgateError> {
+        // As for the list: a backend's address, namespace, AppRole role ID and
+        // path allowlist are configuration, not something any admin may read.
+        admin.require(AdminPermission::ConfigEdit)?;
         let Some(backend) = SecretBackend::Entity::find_by_id(id)
             .one(&admin.services().db)
             .await?
