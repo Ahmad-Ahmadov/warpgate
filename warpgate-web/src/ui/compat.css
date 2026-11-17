@@ -708,6 +708,15 @@ textarea.form-control {
     text-decoration: underline;
 }
 
+/*
+ * Bootstrap's dimmed-text colour. Upstream #2794 moved the log viewer's
+ * secondary text to it; with Bootstrap gone it was undefined, and the text
+ * silently stopped being dimmed. Mapped onto the token, so it follows the theme.
+ */
+:root {
+    --bs-secondary-color: var(--wg-text-muted);
+}
+
 /* ── lists ───────────────────────────────────────────────────────────── */
 .list-group {
     display: flex;
