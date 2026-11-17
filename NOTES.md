@@ -2272,3 +2272,69 @@ for Rust, and `node:24-bookworm` with a JRE to regenerate the clients.
 
 Not run, as before: the application itself (so no mstsc session and no Python
 e2e suite) and MySQL/PostgreSQL migrations, which need live servers.
+
+## Feature gap audit against upstream 7ebeb145, and the Vault UI
+
+### How the gaps were found
+
+Not from memory. Three scripted comparisons of upstream's `warpgate-web/src`
+against this fork's, using the committed OpenAPI schemas as the inventory:
+
+1. **Operations.** For every operation in both schemas: does upstream's UI call
+   it, does the fork's? Of 157, 141 are called by both. Upstream calls 9 that
+   the fork did not, all of them the Vault feature. Seven are called by
+   neither UI; of those, only the certificate label PATCH is a UI capability
+   (the rest are SSO callbacks, OIDC back-channel logout, and single-item
+   GETs whose data the lists already carry).
+2. **Fields.** Schema properties upstream's UI references that the fork's
+   never does: the Vault fields, an SSH key's `secretBackend`, and a role
+   assignment's `grantedAt`.
+3. **Edits and enum values.** Fields upstream lets you edit and enum values it
+   names. Apart from Vault, these turned out to be already handled, behind an
+   `else` branch or under local names.
+
+Behaviour changes with no API surface (sessions ending with a role, ticket
+revocation, the database plaintext rule) cannot show up in such a diff, so the
+commit list was read for those separately.
+
+### What changed
+
+- Vault: see UPSTREAM-ISSUES #9, "Ported".
+- `GET /secret-backends/{id}` now needs `ConfigEdit`, like the list. It was the
+  one RBAC gap in that API.
+- User detail: when each active role was granted (`grantedAt`), and a note
+  that removing a role ends the sessions it admitted (#2789).
+- Credentials: certificate credentials can be renamed (label PATCH; neither UI
+  offered it).
+- Targets list: an "Admin approval" column. Upstream's customizable columns
+  (#2860) carry it; this fork keeps its fixed columns, which already show
+  everything else upstream's do.
+- Database targets: in "Preferred" TLS mode, a note that a database offering
+  no TLS will no longer receive the password in plaintext (`8b9daba4`).
+- Tickets: revoking also ends sessions opened with the ticket (`d61b051b`);
+  the dialog now says so.
+- `ui/compat.css`: `--bs-secondary-color`, which upstream's log viewer started
+  using (#2794), is mapped onto the muted-text token. It was undefined, so
+  that text had silently stopped being dimmed.
+
+### Deliberately not adopted
+
+Upstream's navigation (#2870) and customizable columns (#2860), as at the sync.
+Config-file-only settings (the token endpoint allowlist, cluster mTLS,
+`control_plane_host`) stay in `warpgate.yaml`; upstream has no API for them
+either.
+
+### Validation
+
+Native only; no Docker.
+
+- **Frontend:** the API clients were regenerated locally with the JDK's
+  `java.exe`; the `javapath` stub on PATH crashes. `svelte-check` reports 0
+  errors and 0 warnings. Biome is clean on every changed file, and the
+  binding, class and label audits show nothing new. `vite build` passes:
+  726.7 KB gzipped against the 733.6 KB baseline. The Vault screen is a
+  4.2 KB lazy chunk.
+- **Rust:** the one Rust change is formatted (rustfmt) but was not compiled.
+  There are no MSVC build tools, and WSL has no toolchain. It matches the six
+  neighbouring handlers line for line.
+- **Not run:** the e2e suite, including the updated `test_api.py` case.

@@ -390,12 +390,16 @@ server log, though the console line would remain.
 **Not changed in this fork.** It is an API response-shape change, and this
 redesign is scoped to presentation. Reported rather than fixed.
 
-## 9. Vault / OpenBao secret-management UI is not ported to this fork
+## 9. Vault / OpenBao secret-management UI was not ported to this fork
 
-Upstream #2185 (`7311279e`) adds secret references — a target password, an SSH
-client key or an LDAP bind password can be `secret://backend/path#key` instead
-of a stored value, resolved at use time from HashiCorp Vault or OpenBao. For a
-PAM product that is a significant feature.
+**Ported in November 2026** — see the end of this entry. Kept for the history.
+
+Upstream #2185 (`7311279e`) adds secret references — a target password or
+token, or an SSH client key, can be `secret://backend/path#key` instead of a
+stored value, resolved at use time from HashiCorp Vault or OpenBao. For a PAM
+product that is a significant feature. (An earlier version of this entry also
+listed the LDAP bind password: the backend does not resolve references there,
+so neither UI offers one.)
 
 **The backend is fully merged.** The Rust implementation, the database
 migrations, the API and `openapi-schema.json` all came across intact, so
@@ -445,6 +449,34 @@ changed through the API until the editor is ported with the rest.
 The local-verification blocker above is gone: the clients now regenerate in a
 `node:24-bookworm` container with a JRE, the way the Docker build does it, and
 `svelte-check` against them is clean.
+
+### Ported (November 2026)
+
+Drawn on `ui/` primitives at upstream's own paths, with upstream's module
+exports, so later upstream changes map onto these files:
+
+- **Configuration → Secret backends** (`/config/secret-backends`, sidebar and
+  command palette, `configEdit`): list with a live health status per backend
+  and its error, add, edit and delete. Vault or OpenBao; token, AppRole or
+  Kubernetes login; namespace; TLS verification switch; allowed path
+  prefixes. Secrets are write-only: blank on edit keeps the stored one while
+  the login method is unchanged, as the server enforces. Save and delete
+  errors (a taken name, a backend still referenced) are shown with the
+  server's reason.
+- **`SecretRefInput`** on every credential the backend resolves: SSH, RDP, VNC
+  and database passwords, and the Kubernetes bearer token. Enter a value, or
+  pick backend, path and field; the reference is checked live, and other
+  targets or keys using the same secret are listed.
+- **SSH certificate authentication** (#2734): backend, SSH engine mount and
+  signing role are now editable, replacing the read-only summary.
+- **SSH client keys**: import by referencing a secret
+  (`importSshOwnKeyReference`), and a badge for the backend a key comes from.
+
+Also fixed on the server: `GET /secret-backends/{id}` had no permission check
+while the list needed `ConfigEdit`, so any admin could read a backend's
+address, namespace, AppRole role ID and path allowlist (never its secrets,
+which are redacted). It now needs `ConfigEdit` too; `tests/test_api.py` is
+updated to match. Worth reporting upstream.
 
 ## 10. Native RDP: a rejected sign-in reaches mstsc as a "protocol error" (0xd06)
 
