@@ -496,8 +496,9 @@
         <p class="panel">
             Access to <strong>{d.target}</strong> as
             <strong>{d.username}</strong>
-            stops working immediately for anyone holding this ticket's secret.
-            The secret cannot be reinstated — issue a new ticket instead.
+            stops working immediately for anyone holding this ticket's secret,
+            and sessions already opened with it end now. The secret cannot be
+            reinstated — issue a new ticket instead.
         </p>
     {/if}
 </ConfirmDialog>

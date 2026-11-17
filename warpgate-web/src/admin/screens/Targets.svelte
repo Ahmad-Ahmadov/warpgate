@@ -128,6 +128,9 @@
         { key: 'name', label: 'Name', sortable: true },
         { key: 'address', label: 'Address' },
         { key: 'protocol', label: 'Protocol', width: '8rem' },
+        // Upstream #2860 shows this as a list column; a gated target is the
+        // first thing an operator scanning the list needs to know about.
+        { key: 'approval', label: 'Admin approval', width: '9rem' },
         { key: 'roles', label: 'Allowed roles', width: '10rem', align: 'end' },
     ]
 
@@ -212,6 +215,13 @@
             <td class="wg-mono muted">{addressOf(target)}</td>
             <td>
                 {PROTOCOL_LABELS[target.options.kind] ?? target.options.kind}
+            </td>
+            <td>
+                {#if target.requireApproval}
+                    <Badge tone="warning">Required</Badge>
+                {:else}
+                    <span class="muted">Not required</span>
+                {/if}
             </td>
             <td class="num">
                 {#if target.allowRoles.length}

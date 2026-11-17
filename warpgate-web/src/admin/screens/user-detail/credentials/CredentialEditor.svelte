@@ -80,6 +80,8 @@
     import Callout from 'ui/Callout.svelte'
     import ConfirmDialog from 'ui/ConfirmDialog.svelte'
     import EmptyState from 'ui/EmptyState.svelte'
+    import Input from 'ui/Input.svelte'
+    import Modal from 'ui/Modal.svelte'
     import Tooltip from 'ui/Tooltip.svelte'
     import { toast } from 'ui/toasts.svelte'
     import AuthPolicyEditor from './AuthPolicyEditor.svelte'
@@ -341,6 +343,40 @@
     }
 
     const canEdit = $derived($adminPermissions.usersEdit)
+
+    // A certificate's label can be changed after issuing (PATCH, label only).
+    // The API has had it for a while; neither UI offered it.
+    let renaming: (ExistingCredential & { label: string }) | null = $state(null)
+    let renameLabel = $state('')
+    let renameOpen = $state(false)
+
+    function startRename(credential: ExistingCredential & { label: string }) {
+        renaming = credential
+        renameLabel = credential.label
+        renameOpen = true
+    }
+
+    async function saveRename() {
+        const credential = renaming
+        const label = renameLabel.trim()
+        if (!credential || !label) {
+            return
+        }
+        try {
+            const updated = await api.updateCertificateCredential({
+                userId,
+                id: credential.id,
+                updateCertificateCredential: { label },
+            })
+            credential.label = updated.label
+            renameOpen = false
+            toast.success('Certificate renamed')
+        } catch (err) {
+            toast.error('The certificate was not renamed', {
+                detail: await stringifyError(err),
+            })
+        }
+    }
     // Directory-sourced keys: editing them here would be overwritten by the
     // next sync, so the controls are disabled rather than silently futile.
     const publicKeyLocked = $derived(ldapLinked || !canEdit)
@@ -475,6 +511,16 @@
                                 ? 'Revoke'
                                 : 'Delete'}
                         </Button>
+                        {#if credential.kind === CredentialKind.Certificate}
+                            <Button
+                                variant="ghost"
+                                size="compact"
+                                disabled={!canEdit}
+                                onclick={() => startRename(credential)}
+                            >
+                                Rename
+                            </Button>
+                        {/if}
                     </div>
                 </li>
             {/each}
@@ -525,6 +571,36 @@
             editingCertificateCredential = false
         }}
     />
+{/if}
+
+{#if renameOpen}
+    <Modal
+        bind:open={renameOpen}
+        title="Rename certificate"
+        size="sm"
+        onclose={() => (renameOpen = false)}
+    >
+        <form
+            id="wg-rename-certificate-form"
+            onsubmit={e => {
+                e.preventDefault()
+                saveRename()
+            }}
+        >
+            <Input label="Label" required autofocus bind:value={renameLabel} />
+        </form>
+        {#snippet footer()}
+            <Button onclick={() => (renameOpen = false)}>Cancel</Button>
+            <Button
+                variant="primary"
+                type="submit"
+                form="wg-rename-certificate-form"
+                disabled={!renameLabel.trim()}
+            >
+                Rename
+            </Button>
+        {/snippet}
+    </Modal>
 {/if}
 
 <ConfirmDialog

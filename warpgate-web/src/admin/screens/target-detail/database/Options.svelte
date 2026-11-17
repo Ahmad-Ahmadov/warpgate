@@ -18,6 +18,7 @@
     import SecretRefInput from 'common/SecretRefInput.svelte'
     import Input from 'ui/Input.svelte'
     import Select from 'ui/Select.svelte'
+    import { TlsMode } from 'admin/lib/api'
     import TlsConfiguration from '../TlsConfiguration.svelte'
 
     interface Props {
@@ -79,12 +80,26 @@
 <h5>Transport</h5>
 
 <TlsConfiguration bind:value={options.tls} subject="this database" />
+{#if options.tls.mode === TlsMode.Preferred}
+    <!-- Upstream 8b9daba4: "Preferred" no longer falls back to a plaintext password. -->
+    <p class="tls-note">
+        If the database offers no TLS, Warpgate will not send the password in
+        plaintext and the sign-in fails. To allow plaintext deliberately, choose
+        Disabled.
+    </p>
+{/if}
 
 <style>
     h5 {
         margin: var(--wg-space-xl) 0 var(--wg-space-md);
         font: var(--wg-text-label-md);
         color: var(--wg-text-muted);
+    }
+
+    .tls-note {
+        margin: calc(var(--wg-space-sm) * -1) 0 0;
+        color: var(--wg-text-muted);
+        font: var(--wg-text-body-md);
     }
 
     h5:first-child {

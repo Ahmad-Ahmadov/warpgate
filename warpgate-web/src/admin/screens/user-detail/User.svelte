@@ -60,6 +60,7 @@
     import ConfirmDialog from 'ui/ConfirmDialog.svelte'
     import Input from 'ui/Input.svelte'
     import Modal from 'ui/Modal.svelte'
+    import RelativeDate from 'ui/RelativeDate.svelte'
     import Select from 'ui/Select.svelte'
     import Tabs from 'ui/Tabs.svelte'
     import Toggle from 'ui/Toggle.svelte'
@@ -385,6 +386,13 @@
                     </div>
                 {:else if active === 'roles'}
                     <div class="panel">
+                        <!-- Upstream #2789: access ends with the assignment. -->
+                        <p class="roles-note">
+                            Removing a role ends this user's open sessions to
+                            targets that no other role grants them, at once. A
+                            role that expires does the same shortly after.
+                            Sessions started with a ticket are not affected.
+                        </p>
                         <ul class="role-list">
                             {#each allRoles as role (role.id)}
                                 {@const activeAssignment = userRoles.find(
@@ -410,6 +418,18 @@
                                         onchange={() => toggleRole(role)}
                                     />
                                     <div class="role-meta">
+                                        {#if activeAssignment?.grantedAt}
+                                            <!-- When the role was assigned, as upstream's user screen shows. -->
+                                            <span
+                                                class="granted"
+                                                title={activeAssignment.grantedAt.toLocaleString()}
+                                            >
+                                                Granted
+                                                <RelativeDate
+                                                    date={activeAssignment.grantedAt}
+                                                />
+                                            </span>
+                                        {/if}
                                         {#if expiry}
                                             <span
                                                 class="expiry expiry-{expiry.urgency}"
@@ -644,6 +664,18 @@
         align-items: center;
         gap: var(--wg-space-md);
         flex: none;
+    }
+
+    .roles-note {
+        margin: 0 0 var(--wg-space-md);
+        color: var(--wg-text-muted);
+        font: var(--wg-text-body-md);
+    }
+
+    .granted {
+        color: var(--wg-text-muted);
+        font: var(--wg-text-label-sm);
+        white-space: nowrap;
     }
 
     .expiry {
