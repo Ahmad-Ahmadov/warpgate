@@ -319,6 +319,12 @@ impl AdminPermissionSet {
         self.0 & perm.bit() != 0
     }
 
+    /// Every permission in `other` is also in `self`.
+    #[must_use]
+    pub const fn is_superset_of(self, other: Self) -> bool {
+        other.0 & !self.0 == 0
+    }
+
     /// Holding any permission at all makes the principal an administrator.
     #[must_use]
     pub const fn is_admin(self) -> bool {
@@ -387,6 +393,20 @@ mod admin_permission_set_tests {
         for perm in AdminPermission::iter() {
             assert!(all.contains(perm), "missing {perm:?}");
         }
+    }
+
+    #[test]
+    fn superset_requires_every_permission() {
+        let mut narrow = empty_role();
+        narrow.users_edit = true;
+        let mut broad = narrow.clone();
+        broad.config_edit = true;
+        let narrow = AdminPermissionSet::from_roles([narrow]);
+        let broad = AdminPermissionSet::from_roles([broad]);
+        assert!(broad.is_superset_of(narrow));
+        assert!(!narrow.is_superset_of(broad));
+        assert!(narrow.is_superset_of(narrow));
+        assert!(narrow.is_superset_of(AdminPermissionSet::none()));
     }
 
     #[test]
@@ -542,6 +562,11 @@ pub struct HttpConfig {
 
     #[serde(default)]
     pub sni_certificates: Vec<SniCertificateConfig>,
+
+    /// API endpoints allowed when using token auth. Each item is a "<METHOD> <path>".
+    /// `<METHOD>` may be `*`. In `<path>`, `*` matches one segment and `**` any number.
+    #[serde(default)]
+    pub user_api_token_allowed_endpoints: Option<Vec<String>>,
 }
 
 impl Default for HttpConfig {
@@ -557,6 +582,7 @@ impl Default for HttpConfig {
             session_max_age: _default_session_max_age(),
             cookie_max_age: _default_cookie_max_age(),
             sni_certificates: vec![],
+            user_api_token_allowed_endpoints: None,
         }
     }
 }
@@ -963,11 +989,28 @@ pub struct WarpgateConfig {
     pub store: WarpgateConfigStore,
 }
 
+/// Ignores anything that does not look like a bare hostname or at least a
+/// legacy host:port.
+fn bare_host_name(value: &str) -> Option<String> {
+    Some(value.parse::<Authority>().ok()?.host().to_owned())
+}
+
 impl WarpgateConfig {
     pub fn external_host_name(&self) -> Option<String> {
-        let ext = self.store.external_host.as_deref()?;
-        // ignore anything that does not look like a bare hostname or at least a legacy host:port
-        Some(ext.parse::<Authority>().ok()?.host().to_owned())
+        bare_host_name(self.store.external_host.as_deref()?)
+    }
+
+    /// The host where /@warpgate API access is allowed, here either the HTTP external host or the global external host
+    pub fn control_plane_host(&self) -> Option<String> {
+        let external_host = self.external_host_name()?;
+        Some(
+            self.store
+                .http
+                .external_host
+                .as_deref()
+                .and_then(bare_host_name)
+                .unwrap_or(external_host),
+        )
     }
 
     pub fn validate(&self) {
@@ -1034,5 +1077,33 @@ mod tests {
         );
         assert_eq!(name("https://warp.example.com:8888"), None);
         assert_eq!(name("warp.example.com/gateway"), None);
+    }
+
+    #[test]
+    fn control_plane_host_needs_external_host() {
+        let host = |ext: Option<&str>, http_ext: Option<&str>| {
+            WarpgateConfig {
+                store: WarpgateConfigStore {
+                    external_host: ext.map(ToOwned::to_owned),
+                    http: super::HttpConfig {
+                        external_host: http_ext.map(ToOwned::to_owned),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            }
+            .control_plane_host()
+        };
+
+        assert_eq!(host(None, None), None);
+        assert_eq!(host(None, Some("portal.example.com")), None);
+        assert_eq!(
+            host(Some("example.com"), None).as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            host(Some("example.com"), Some("portal.example.com:8443")).as_deref(),
+            Some("portal.example.com")
+        );
     }
 }

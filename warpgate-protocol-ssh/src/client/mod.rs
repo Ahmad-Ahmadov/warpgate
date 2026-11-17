@@ -5,7 +5,6 @@ mod error;
 mod handler;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{fmt, io};
@@ -750,6 +749,8 @@ impl Connector {
                     kex::DH_G16_SHA512,
                     kex::DH_G14_SHA256,
                     kex::DH_GEX_SHA256,
+                    kex::DH_GEX_SHA1,
+                    kex::DH_G14_SHA1,
                     kex::DH_G1_SHA1,
                     kex::EXTENSION_SUPPORT_AS_CLIENT,
                     kex::EXTENSION_SUPPORT_AS_SERVER,
@@ -845,12 +846,7 @@ impl Connector {
             .target_handshake_timeout;
 
         let config = self.build_ssh_config(&first).await;
-        let address_str = format!("{}:{}", first.host, first.port);
-        let address = address_str
-            .to_socket_addrs()
-            .map_err(ConnectionError::Io)
-            .and_then(|mut x| x.next().ok_or(ConnectionError::Resolve))
-            .inspect_err(|e| error!(?e, address=%address_str, "Cannot resolve address"))?;
+        let address = (first.host.as_str(), first.port);
         info!(?address, username = %first.username, "Connecting");
         let (event_tx, event_rx) = unbounded_channel();
         let handler = ClientHandler {

@@ -40,28 +40,60 @@
         if (!parameters) {
             return
         }
-        parameters.recordingsStorage =
-            kind === 'S3'
-                ? {
-                      kind: 'S3',
-                      bucket: '',
-                      region: 'us-east-1',
-                      pathStyle: false,
-                      prefix: '',
-                      credentials: { mode: 'Auto' },
-                  }
-                : { kind: 'Disk', path: './data/recordings' }
+        if (kind === 'S3') {
+            parameters.recordingsStorage = {
+                kind: 'S3',
+                bucket: '',
+                region: 'us-east-1',
+                pathStyle: false,
+                prefix: '',
+                credentials: { mode: 'Auto' },
+                serveThroughWarpgate: false,
+            }
+        } else if (kind === 'Azure') {
+            // Upstream #2678.
+            parameters.recordingsStorage = {
+                kind: 'Azure',
+                account: '',
+                container: '',
+                prefix: '',
+                credentials: { mode: 'ManagedIdentity' },
+                serveThroughWarpgate: false,
+            }
+        } else {
+            parameters.recordingsStorage = {
+                kind: 'Disk',
+                path: './data/recordings',
+            }
+        }
     }
 
     function setCredentialMode(mode: string): void {
-        if (parameters?.recordingsStorage.kind !== 'S3') {
-            return
+        const storage = parameters?.recordingsStorage
+        if (storage?.kind === 'S3') {
+            // Omit secretAccessKey so an untouched field keeps the stored secret.
+            storage.credentials =
+                mode === 'Static'
+                    ? { mode: 'Static', accessKeyId: '' }
+                    : { mode: 'Auto' }
+        } else if (storage?.kind === 'Azure') {
+            // Only a service principal carries anything to fill in; the other
+            // modes resolve their credential from the environment.
+            if (mode === 'ServicePrincipal') {
+                storage.credentials = {
+                    mode: 'ServicePrincipal',
+                    tenantId: '',
+                    clientId: '',
+                    clientSecret: '',
+                }
+            } else if (mode === 'WorkloadIdentity') {
+                storage.credentials = { mode: 'WorkloadIdentity' }
+            } else if (mode === 'DeveloperTools') {
+                storage.credentials = { mode: 'DeveloperTools' }
+            } else {
+                storage.credentials = { mode: 'ManagedIdentity' }
+            }
         }
-        // Omit secretAccessKey so an untouched field keeps the stored secret.
-        parameters.recordingsStorage.credentials =
-            mode === 'Static'
-                ? { mode: 'Static', accessKeyId: '' }
-                : { mode: 'Auto' }
     }
     let updateError: string | undefined = $state()
     let pendingLogo: string | null | undefined = $state()
@@ -70,12 +102,13 @@
     // Sends the edited config as-is; an untouched secret round-trips as
     // undefined and the server refills it from the stored value.
     async function testStorage(): Promise<void> {
-        if (parameters?.recordingsStorage.kind !== 'S3') {
+        const storage = parameters?.recordingsStorage
+        if (!storage || storage.kind === 'Disk') {
             return
         }
         testResult = undefined
         testResult = await api.testRecordingsStorage({
-            recordingsStorageConfig: parameters.recordingsStorage,
+            recordingsStorageConfig: storage,
         })
         if (!testResult.success) {
             throw new Error(testResult.error ?? 'Connection failed')
@@ -853,6 +886,9 @@
                                         <option value="S3">
                                             S3 / S3-compatible
                                         </option>
+                                        <option value="Azure">
+                                            Azure Blob Storage
+                                        </option>
                                     </select>
                                 </label>
 
@@ -889,11 +925,6 @@
                                             bind:value={s3.bucket}
                                         >
                                     </label>
-                                    <HelpText>
-                                        The bucket needs a CORS policy allowing
-                                        this origin to issue GET requests with a
-                                        Range header.
-                                    </HelpText>
                                     <label class="wg-field-group">
                                         <span class="wg-field-label"
                                             >Region</span
@@ -1011,6 +1042,198 @@
                                             >
                                         </label>
                                     {/if}
+                                {:else if parameters.recordingsStorage.kind === 'Azure'}
+                                    <!-- Upstream #2678. -->
+                                    {@const azure = parameters.recordingsStorage}
+                                    <label class="wg-field-group">
+                                        <span class="wg-field-label"
+                                            >Storage account</span
+                                        >
+
+                                        <input
+                                            type="text"
+                                            class="form-control"
+                                            placeholder="mywarpgatestorage"
+                                            required
+                                            pattern={'[a-z0-9]{3,24}'}
+                                            bind:value={azure.account}
+                                        >
+                                    </label>
+                                    <label class="wg-field-group">
+                                        <span class="wg-field-label"
+                                            >Container</span
+                                        >
+
+                                        <input
+                                            type="text"
+                                            class="form-control"
+                                            required
+                                            pattern={'[a-z0-9-]{3,63}'}
+                                            bind:value={azure.container}
+                                        >
+                                    </label>
+                                    <label class="wg-field-group">
+                                        <span class="wg-field-label"
+                                            >Endpoint (blank = public Azure)</span
+                                        >
+
+                                        <input
+                                            type="text"
+                                            class="form-control"
+                                            placeholder="https://myaccount.blob.core.windows.net"
+                                            pattern="https://[a-z0-9.\-]+\.blob\.(core\.windows\.net|core\.usgovcloudapi\.net|core\.chinacloudapi\.cn|storage\.azure\.net)/?"
+                                            value={azure.endpoint ?? ''}
+                                            oninput={e =>
+                                                (azure.endpoint =
+                                                    e.currentTarget.value ||
+                                                    undefined)}
+                                        >
+                                    </label>
+                                    <HelpText>Set this for sovereign clouds.</HelpText>
+                                    <label class="wg-field-group">
+                                        <span class="wg-field-label"
+                                            >Blob prefix</span
+                                        >
+
+                                        <input
+                                            type="text"
+                                            class="form-control"
+                                            bind:value={azure.prefix}
+                                        >
+                                    </label>
+
+                                    <label class="wg-field-group">
+                                        <span class="wg-field-label"
+                                            >Credentials</span
+                                        >
+
+                                        <select
+                                            id="recordingsAzureCredentialMode"
+                                            class="form-select"
+                                            value={azure.credentials.mode}
+                                            onchange={e => setCredentialMode(e.currentTarget.value)}
+                                        >
+                                            <option value="ManagedIdentity">
+                                                Managed identity
+                                            </option>
+                                            <option value="WorkloadIdentity">
+                                                Workload identity (AKS)
+                                            </option>
+                                            <option value="ServicePrincipal">
+                                                Service principal
+                                            </option>
+                                            <option value="DeveloperTools">
+                                                Azure CLI (development)
+                                            </option>
+                                        </select>
+                                    </label>
+                                    <HelpText>
+                                        A storage account key cannot be used:
+                                        the Azure SDK authenticates with Entra
+                                        ID only.
+                                    </HelpText>
+
+                                    {#if azure.credentials.mode === 'ManagedIdentity'}
+                                        {@const creds = azure.credentials}
+                                        <label class="wg-field-group">
+                                            <span class="wg-field-label"
+                                                >Client ID (blank =
+                                                system-assigned)</span
+                                            >
+
+                                            <input
+                                                type="text"
+                                                class="form-control"
+                                                autocomplete="off"
+                                                value={creds.clientId ?? ''}
+                                                oninput={e =>
+                                                    (creds.clientId =
+                                                        e.currentTarget.value ||
+                                                        undefined)}
+                                            >
+                                        </label>
+                                        <HelpText>
+                                            Set this only for a user-assigned
+                                            identity.
+                                        </HelpText>
+                                    {:else if azure.credentials.mode === 'WorkloadIdentity'}
+                                        <HelpText>
+                                            Taken from the pod environment:
+                                            AZURE_TENANT_ID, AZURE_CLIENT_ID and
+                                            AZURE_FEDERATED_TOKEN_FILE.
+                                        </HelpText>
+                                    {:else if azure.credentials.mode === 'ServicePrincipal'}
+                                        {@const creds = azure.credentials}
+                                        <label class="wg-field-group">
+                                            <span class="wg-field-label"
+                                                >Tenant ID</span
+                                            >
+
+                                            <input
+                                                type="text"
+                                                class="form-control"
+                                                autocomplete="off"
+                                                required
+                                                bind:value={creds.tenantId}
+                                            >
+                                        </label>
+                                        <label class="wg-field-group">
+                                            <span class="wg-field-label"
+                                                >Client ID</span
+                                            >
+
+                                            <input
+                                                type="text"
+                                                class="form-control"
+                                                autocomplete="off"
+                                                required
+                                                bind:value={creds.clientId}
+                                            >
+                                        </label>
+                                        <label class="wg-field-group">
+                                            <span class="wg-field-label"
+                                                >Client secret</span
+                                            >
+
+                                            <input
+                                                type="password"
+                                                class="form-control"
+                                                autocomplete="off"
+                                                placeholder="********"
+                                                bind:value={creds.clientSecret}
+                                            >
+                                        </label>
+                                    {:else}
+                                        <HelpText>
+                                            Uses the Azure CLI sign-in of the
+                                            user running Warpgate. For
+                                            development only.
+                                        </HelpText>
+                                    {/if}
+                                {/if}
+
+                                {#if parameters.recordingsStorage.kind !== 'Disk'}
+                                    {@const remote = parameters.recordingsStorage}
+                                    <!-- Upstream #2678: S3 and Azure alike. -->
+                                    <Checkbox
+                                        label="Serve recordings through Warpgate"
+                                        bind:checked={remote.serveThroughWarpgate}
+                                    />
+                                    <HelpText>
+                                        {#if remote.serveThroughWarpgate}
+                                            Playback is streamed by Warpgate, so
+                                            the browser never needs to reach the
+                                            storage directly. Works behind a
+                                            private endpoint.
+                                        {:else}
+                                            Playback redirects the browser to a
+                                            signed URL, which is cheaper but
+                                            needs the storage to be reachable
+                                            from the browser and to carry a CORS
+                                            policy allowing this origin to issue
+                                            GET requests with a Range header.
+                                        {/if}
+                                    </HelpText>
 
                                     <Button
                                         type="button"

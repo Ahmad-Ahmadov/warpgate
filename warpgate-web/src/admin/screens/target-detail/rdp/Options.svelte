@@ -83,6 +83,16 @@
     <Input label="Domain" mono hint="Optional." bind:value={options.domain} />
 </div>
 
+<!-- Upstream #2754. -->
+<Input
+    label="Kerberos KDC URL"
+    mono
+    placeholder="tcp://dc.example.com:88"
+    pattern="(tcp|udp|https?)://.+"
+    hint="Optional. Enables Kerberos authentication, which accounts in Protected Users require: a tcp://, udp:// or KDC proxy https:// URL. The target host must then be a DNS name, not an IP address."
+    bind:value={options.kdcUrl}
+/>
+
 {#if options.auth.kind === 'Password'}
     <Input
         label="Password"

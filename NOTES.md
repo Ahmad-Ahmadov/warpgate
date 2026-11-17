@@ -2154,3 +2154,121 @@ If you run Warpgate as a cluster: v0.30.0 replaces the shared cluster token
 with mutual TLS between nodes (#2698), and migration `m00091` drops the old
 token. Read upstream's cluster notes before upgrading clustered nodes. A single
 gateway is unaffected.
+
+## Upstream main 7ebeb145: v0.30.3, the v0.30.4 fixes, and two weeks more
+
+### What was merged, and why main
+
+Upstream published v0.30.0–v0.30.3 from `main`, then cut v0.30.4 from a new
+`v0.30` maintenance branch. That tag is only a version bump on top of `main` at
+`fe73525a`: its five security fixes are all on `main`. So `main` at `7ebeb145`
+(2026-11-16) is a superset of the latest stable release, plus Azure Blob
+recordings and other work, and is what was merged. One side effect: `main`'s
+crates still say 0.30.3.
+
+The branches had diverged from `5d4d8da6` by 67 fork commits and 107 upstream
+ones. The merge is **staged, not committed**, as asked; the prepared message is
+in `.git/MERGE_MSG`, so a plain `git commit` concludes it.
+
+### The new navigation, and what it leaked
+
+Upstream #2870 moved the admin pages to `/manage/...`, gave them a sidebar, and
+split `Parameters.svelte` into nine section files. This fork has its own shell,
+routes and Parameters screen, so none of that is adopted. Two lessons:
+
+- **Route edits arrive silently.** Wherever a fork file kept upstream's original
+  line, git applied the `/config/` to `/manage/` change without a conflict. It
+  reached 16 files, three of them (`CreateUser`, `CreateRole`,
+  `CreateAdminRole`) with no conflict at all: saving would have redirected to a
+  route this fork does not have. A fourth received a call into upstream's
+  sidebar. After any upstream navigation change, grep the merged tree for the
+  new route prefix.
+- **So do removals.** #2860 (customizable list columns) moved the portal's
+  collapsed-groups store into `ItemList`. The fork keeps its own `ItemList`, but
+  `store.ts` merged cleanly and lost the export the portal imports, which would
+  only have failed at build time. The store is back.
+
+Customizable columns themselves are not adopted: they change `ItemList`'s API
+for list-group screens, and this fork's lists are tables and card grids.
+
+### What was ported by hand
+
+Upstream changed screens this fork replaced, so their behaviour was carried
+over to the replacements:
+
+- sign-in finishes on the control-plane host (`72fbe4c5`)
+- the admin shell shows configuration warnings again. The redesign had dropped
+  that banner, and #2817 is why it is now text rather than HTML.
+- portal: target names are URL-encoded (#2817), and the empty state says who
+  can grant access (#2804). #2801 (keyboard access to database targets) was
+  already covered: every card has a real button.
+- RDP targets: Kerberos KDC URL (#2754)
+- Parameters: Azure Blob Storage recordings and "Serve recordings through
+  Warpgate" (#2678)
+- new MySQL/PostgreSQL targets default to TLS required (`8b9daba4`)
+- credentials: each empty section says what it is for (#2803)
+
+The API changed in exactly three fields (`kdc_url`, `serve_through_warpgate`,
+`control_plane_host`) plus the Azure types, and all of them are now used.
+
+### RDP: the fork's IronRDP patch is retired
+
+Upstream #2871 re-vendored `ironrdp-server` on `ironrdp-acceptor` 0.12, which
+fixes the malformed access denial itself (UPSTREAM-ISSUES #10). Credentials are
+now checked as the Client Info PDU arrives, and a rejection is answered with a
+properly framed Set Error Info PDU carrying
+`ERRINFO_SERVER_INSUFFICIENT_PRIVILEGES`. So mstsc should now show its message
+for that code, not the "server denied the connection" one the previous section
+expects. `vendor/` is identical to upstream. The relay fix is Warpgate's own and
+stays.
+
+IronRDP does not test that refusal, so `rejection_tests` now does, end to end:
+the real server state machine on a loopback socket, a control loop that rejects,
+Warpgate's own IronRDP client over TLS, and IronRDP's client-side decoder on
+everything the client received.
+
+### Dependencies and advisories
+
+`cargo deny` fails on upstream `main` as it is today: advisories published after
+its last dependency bump. Two had semver-compatible fixes and are applied here,
+the only lockfile entries that differ from upstream: `libz-sys` 1.1.33 (a zlib
+heap overflow) and `rustix` 1.1.6 (unsound `xattr`). Four remain, none of them
+fixable by a compatible update:
+
+- RUSTSEC-2026-0459, an SQLite CVE. Exploiting it needs a crafted database and
+  WAL file pair on the gateway's own disk. The fix needs `libsqlite3-sys` 0.39,
+  which `sqlx` 0.8 cannot take.
+- `chrono`, `humantime` and `pin-utils` are unmaintained, with no replacement.
+
+Whether to silence them in `deny.toml` or wait for upstream is a policy call,
+not a merge one.
+
+### Migrations
+
+`m00093` makes `log.session_id` nullable (a table rebuild on SQLite, data
+kept); `m00095` adds `kubernetes_sessions`. **`m00094` makes role names unique,
+and renames duplicates first**: a second role called `dba` becomes `dba (2)`.
+Anything that refers to roles by name, such as SSO role mappings, should be
+checked after upgrading. `m00079` changed only by refactoring, so its having
+already run is harmless.
+
+### Validation
+
+Same containers as before: `rust:1.98.1-bookworm` (the Dockerfile's new image)
+for Rust, and `node:24-bookworm` with a JRE to regenerate the clients.
+
+| Check | Result |
+|---|---|
+| `cargo check --workspace --all-features --all-targets` | passes |
+| `cargo test --workspace --all-features` | 633 passed, 0 failed, 2 ignored (Azure tests that need an Azure VM) |
+| `warpgate-protocol-rdp` unit tests | 51 passed, including the two new rejection tests and the six relay tests |
+| Migrations through m00095, on seeded SQLite schemas | pass |
+| `cargo fmt --check`, `cargo cranky --workspace --all-features` | clean, 0 errors |
+| `cargo deny check` | fails on the four advisories above, as upstream does; bans, licenses and sources pass |
+| `svelte-check` against freshly generated clients | 0 errors, 0 warnings, 1,117 files |
+| Biome, `vite build` | the one older styleguide warning; build ok |
+| Bundle | 717.2 KB gzipped against the 733.6 KB baseline |
+| Release image (`release-no-lto`, from the staged tree) | builds; its own frontend step finds 0 errors |
+
+Not run, as before: the application itself (so no mstsc session and no Python
+e2e suite) and MySQL/PostgreSQL migrations, which need live servers.

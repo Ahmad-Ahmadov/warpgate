@@ -625,11 +625,13 @@
                                 </div>
                                 <div class="session">
                                     {#if item.sessionId}
+                                        <!-- Short ID; the full one is in the tooltip -->
                                         <a
                                             href="/status/sessions/{item.sessionId}"
+                                            title={item.sessionId}
                                             use:link
                                         >
-                                            {item.sessionId}
+                                            {item.sessionId.slice(0, 8)}
                                         </a>
                                     {/if}
                                 </div>
@@ -648,7 +650,8 @@
                                             name={richEntry.grantee_username}
                                         />
                                     </div>
-                                {:else if richEntry?._type === 'AccessRoleRevoked1'}
+                                {:else if richEntry?._type ===
+                                    'AccessRoleRevoked1'}
                                     <div class="rich-entry">
                                         Revoked
                                         <AccessRoleBadge
@@ -661,7 +664,8 @@
                                             name={richEntry.grantee_username}
                                         />
                                     </div>
-                                {:else if richEntry?._type === 'AdminRoleGranted1'}
+                                {:else if richEntry?._type ===
+                                    'AdminRoleGranted1'}
                                     <div class="rich-entry">
                                         Granted
                                         <AdminRoleBadge
@@ -674,7 +678,8 @@
                                             name={richEntry.grantee_username}
                                         />
                                     </div>
-                                {:else if richEntry?._type === 'AdminRoleRevoked1'}
+                                {:else if richEntry?._type ===
+                                    'AdminRoleRevoked1'}
                                     <div class="rich-entry">
                                         Revoked
                                         <AdminRoleBadge
@@ -703,7 +708,8 @@
                                             name={richEntry.username}
                                         />
                                     </div>
-                                {:else if richEntry?._type === 'UserAuthenticated1'}
+                                {:else if richEntry?._type ===
+                                    'UserAuthenticated1'}
                                     <div class="rich-entry">
                                         Authenticated
                                         <UserBadge
@@ -722,7 +728,8 @@
                                             >
                                         {/if}
                                     </div>
-                                {:else if richEntry?._type === 'UserAuthenticationFailed1'}
+                                {:else if richEntry?._type ===
+                                    'UserAuthenticationFailed1'}
                                     <div class="rich-entry auth-failed">
                                         <span class="event-label">
                                             Authentication failed
@@ -755,7 +762,8 @@
                                             >
                                         {/if}
                                     </div>
-                                {:else if richEntry?._type === 'TargetSessionStarted1'}
+                                {:else if richEntry?._type ===
+                                    'TargetSessionStarted1'}
                                     <div class="rich-entry">
                                         Target session started for
                                         <UserBadge
@@ -768,7 +776,8 @@
                                             name={richEntry.target_name}
                                         />
                                     </div>
-                                {:else if richEntry?._type === 'TargetSessionEnded1'}
+                                {:else if richEntry?._type ===
+                                    'TargetSessionEnded1'}
                                     <div class="rich-entry">
                                         Target session ended for
                                         <UserBadge
@@ -781,7 +790,8 @@
                                             name={richEntry.target_name}
                                         />
                                     </div>
-                                {:else if richEntry?._type === 'CredentialCreated1'}
+                                {:else if richEntry?._type ===
+                                    'CredentialCreated1'}
                                     <div class="rich-entry">
                                         Added
                                         {richEntry.credential_type}
@@ -802,7 +812,8 @@
                                             </span>
                                         {/if}
                                     </div>
-                                {:else if richEntry?._type === 'CredentialDeleted1'}
+                                {:else if richEntry?._type ===
+                                    'CredentialDeleted1'}
                                     <div class="rich-entry">
                                         Removed
                                         {richEntry.credential_type}
@@ -837,7 +848,8 @@
                                         targeting
                                         <strong>{richEntry.target}</strong>
                                     </div>
-                                {:else if richEntry?._type === 'WebApprovalBypassed1'}
+                                {:else if richEntry?._type ===
+                                    'WebApprovalBypassed1'}
                                     <div class="rich-entry">
                                         Web approval bypassed for
                                         <UserBadge
@@ -847,7 +859,8 @@
                                         on
                                         <strong>{richEntry.target}</strong>
                                     </div>
-                                {:else if richEntry?._type === 'KubernetesExecStarted1'}
+                                {:else if richEntry?._type ===
+                                    'KubernetesExecStarted1'}
                                     <div class="rich-entry">
                                         <UserBadge
                                             id={richEntry.user_id}
@@ -876,7 +889,8 @@
                                             name={richEntry.target_name}
                                         />
                                     </div>
-                                {:else if richEntry?._type === 'KubernetesAttachStarted1'}
+                                {:else if richEntry?._type ===
+                                    'KubernetesAttachStarted1'}
                                     <div class="rich-entry">
                                         <UserBadge
                                             id={richEntry.user_id}
@@ -898,7 +912,8 @@
                                             name={richEntry.target_name}
                                         />
                                     </div>
-                                {:else if richEntry?._type === 'KubernetesPortForwardStarted1'}
+                                {:else if richEntry?._type ===
+                                    'KubernetesPortForwardStarted1'}
                                     <div class="rich-entry">
                                         <UserBadge
                                             id={richEntry.user_id}
@@ -924,7 +939,8 @@
                                             name={richEntry.target_name}
                                         />
                                     </div>
-                                {:else if richEntry?._type === 'KubernetesStreamRejected1'}
+                                {:else if richEntry?._type ===
+                                    'KubernetesStreamRejected1'}
                                     <div class="rich-entry">
                                         Cluster rejected
                                         <strong>{richEntry.subresource}</strong>
@@ -941,7 +957,8 @@
                                             {richEntry.status}
                                         </span>
                                     </div>
-                                {:else if richEntry?._type === 'KubernetesDebugContainerCreated1'}
+                                {:else if richEntry?._type ===
+                                    'KubernetesDebugContainerCreated1'}
                                     <div class="rich-entry">
                                         <UserBadge
                                             id={richEntry.user_id}
@@ -967,7 +984,8 @@
                                             name={richEntry.target_name}
                                         />
                                     </div>
-                                {:else if richEntry?._type === 'KubernetesPodCreated1'}
+                                {:else if richEntry?._type ===
+                                    'KubernetesPodCreated1'}
                                     <div class="rich-entry">
                                         <UserBadge
                                             id={richEntry.user_id}
@@ -977,7 +995,10 @@
                                         <strong
                                             >{richEntry.namespace}/{richEntry.pod}</strong
                                         >
-                                        ({formatJsonList(richEntry.images, ', ')})
+                                        ({formatJsonList(
+                                            richEntry.images,
+                                            ', ',
+                                        )})
                                         {#if richEntry.node_name}
                                             on node
                                             <strong
@@ -1009,7 +1030,9 @@
                                     <span class="text">
                                         {item.text}
                                     </span>
-                                    {#each genericValues(item) as pair (pair[0])}
+                                    {#each genericValues(
+                                        item,
+                                    ) as pair (pair[0])}
                                         <span class="key-value">
                                             <span class="key">{pair[0]}:</span>
                                             <span class="value">{pair[1]}</span>
@@ -1022,7 +1045,11 @@
                 {/each}
                 <div
                     class="virtual-spacer"
-                    style="height: {Math.max(0, $virtualizerStore.getTotalSize() - (virtualItems.at(-1)?.end ?? 0))}px"
+                    style="height: {Math.max(
+                        0,
+                        $virtualizerStore.getTotalSize() -
+                            (virtualItems.at(-1)?.end ?? 0),
+                    )}px"
                 ></div>
             </div>
             {#if !endReached}
@@ -1031,10 +1058,15 @@
                         <IntersectionObserver
                             element={loadOlderButton}
                             on:observe={event => {
-                            if (!loading && !error && event.detail.isIntersecting && !endReached) {
-                                loadOlder()
-                            }
-                        }}
+                                if (
+                                    !loading &&
+                                    !error &&
+                                    event.detail.isIntersecting &&
+                                    !endReached
+                                ) {
+                                    loadOlder()
+                                }
+                            }}
                         >
                             <button
                                 type="button"
@@ -1133,7 +1165,7 @@
         white-space: nowrap;
 
         .timestamp {
-            opacity: .75;
+            color: var(--bs-secondary-color);
         }
 
         .content {
@@ -1153,7 +1185,7 @@
                 gap: .75rem;
 
                 .key {
-                    opacity: .5;
+                    color: var(--bs-secondary-color);
                     font-style: italic;
                 }
 

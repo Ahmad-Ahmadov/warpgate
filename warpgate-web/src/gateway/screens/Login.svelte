@@ -57,6 +57,7 @@
      * "Forgot password?" is omitted because there is no password-reset
      * endpoint — a link that goes nowhere is worse than no link.
      */
+    import { onControlPlane } from 'common/controlPlane'
     import { stringifyError } from 'common/errors'
     import { navigateToExternalUrl, routeQueryParams } from 'common/helpers'
     import Loadable from 'common/Loadable.svelte'
@@ -70,6 +71,7 @@
         SsoProviderKind,
     } from 'gateway/lib/api'
     import { reloadServerInfo, serverInfo } from 'gateway/lib/store'
+    import { get } from 'svelte/store'
     import { replace } from 'svelte-spa-router'
     import Button from 'ui/Button.svelte'
     import Callout from 'ui/Callout.svelte'
@@ -154,9 +156,16 @@
         }
     }
 
+    // Upstream 72fbe4c5: a sign-in on another host (an HTTP target's
+    // subdomain) finishes on the control plane, so the session cookie is set
+    // where the admin UI and portal will look for it.
     function success() {
-        const target = nextURL ? sanitizeRedirect(nextURL) : undefined
-        if (target) {
+        const next = nextURL ? sanitizeRedirect(nextURL) : undefined
+        const target = onControlPlane(
+            get(serverInfo),
+            new URL(next ?? '/@warpgate#/', location.origin),
+        )
+        if (next || new URL(target).origin !== location.origin) {
             location.assign(target)
         } else {
             replace('/')

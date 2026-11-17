@@ -363,7 +363,7 @@
         onTogglePlaying={() => player.togglePlaying()}
         onToggleFullscreen={toggleFullscreen}
         onGoLive={() => player.goLive()}
-        onSeek={pct => player.scrub($duration * pct / 100)}
+        onSeek={pct => player.scrub(($duration * pct) / 100)}
     />
 </div>
 

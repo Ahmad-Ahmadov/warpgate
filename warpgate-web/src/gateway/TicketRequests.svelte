@@ -21,6 +21,7 @@
         type TicketRequestTarget,
     } from 'gateway/lib/api'
     import { serverInfo } from 'gateway/lib/store'
+    import { onMount } from 'svelte'
     import Fa from 'svelte-fa'
     import Button from 'ui/Button.svelte'
     import Callout from 'ui/Callout.svelte'
@@ -48,6 +49,14 @@
     let ticketRequestTargets: TicketRequestTarget[] | undefined = $state()
     let showForm = $state(!!paramTarget)
     let showAllRequests = $state(false)
+    let now = $state(Date.now())
+
+    onMount(() => {
+        const interval = setInterval(() => {
+            now = Date.now()
+        }, 1000)
+        return () => clearInterval(interval)
+    })
 
     const REQUEST_PAGE_SIZE = 25
     let visibleRequests = $derived.by(() => {
@@ -278,10 +287,11 @@
                             type="text"
                             bind:value={description}
                             class="form-control"
-                            class:is-invalid={descriptionMissing && descriptionTouched}
+                            class:is-invalid={descriptionMissing &&
+                                descriptionTouched}
                             placeholder="Why do you need access?"
                             maxlength="2000"
-                            onblur={() => descriptionTouched = true}
+                            onblur={() => (descriptionTouched = true)}
                         >
                     </label>
                     {#if descriptionMissing}
@@ -393,6 +403,8 @@
         {#if tickets.length}
             <div class="list-group list-group-flush">
                 {#each tickets as ticket (ticket.id)}
+                    {@const expired =
+                        ticket.expiry != null && ticket.expiry.getTime() <= now}
                     <div class="list-group-item gap-3">
                         <Fa icon={faTicket} fw class="text-success" />
                         <div class="me-auto">
@@ -404,8 +416,10 @@
                             {/if}
                             {#if ticket.expiry}
                                 <small class="d-block text-muted">
-                                    Expires
-                                    <RelativeDate date={ticket.expiry} />
+                                    {expired ? 'Expired' : 'Expires'}
+                                    {#key expired}
+                                        <RelativeDate date={ticket.expiry} />
+                                    {/key}
                                 </small>
                             {/if}
                             {#if ticket.usesLeft != null}
@@ -423,7 +437,7 @@
                             size="compact"
                             onclick={() => deleteTicket(ticket)}
                         >
-                            Revoke
+                            {expired ? 'Dismiss' : 'Revoke'}
                         </Button>
                     </div>
                 {/each}

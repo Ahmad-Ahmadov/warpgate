@@ -790,3 +790,251 @@ mod relay_tests {
         assert!(result.is_err());
     }
 }
+
+/// A rejected sign-in, end to end through the real server state machine and a real RDP
+/// client: the client must receive a refusal it can parse. Warpgate used to send one that
+/// no client could read, which mstsc reported as "protocol error" 0xd06. The refusal now
+/// comes from IronRDP's acceptor, which has no test of its own for it, so this pins it.
+#[cfg(test)]
+mod rejection_tests {
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use ironrdp_connector as connector;
+    use ironrdp_pdu::mcs::decode_send_data_indication;
+    use ironrdp_pdu::rdp::headers::{IoChannelPdu, ShareDataPdu, decode_io_channel};
+    use ironrdp_pdu::rdp::server_error_info::{
+        ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu,
+    };
+    use ironrdp_tokio::TokioFramed;
+    use ironrdp_tokio::reqwest::ReqwestNetworkClient;
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+    use warpgate_common::RdpTlsSecurity;
+
+    use super::protocol::{AuthVerdict, Event};
+    use super::rdp::run_on_thread;
+    use crate::client::{test_connector_config, upgrade_tls};
+
+    const DEADLINE: Duration = Duration::from_secs(30);
+
+    /// A stream that keeps a copy of everything read from it.
+    struct Recorder<S> {
+        inner: S,
+        seen: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for Recorder<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let before = buf.filled().len();
+            let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+            if let Poll::Ready(Ok(())) = poll {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&buf.filled()[before..]);
+            }
+            poll
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for Recorder<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// The TPKT frames at the start of `bytes`, up to the first that is not one.
+    fn tpkt_frames(mut bytes: &[u8]) -> Vec<&[u8]> {
+        let mut frames = Vec::new();
+        while bytes.len() >= 4 && bytes[0] == 3 {
+            let len = usize::from(u16::from_be_bytes([bytes[2], bytes[3]]));
+            if len < 4 || len > bytes.len() {
+                break;
+            }
+            let (frame, rest) = bytes.split_at(len);
+            frames.push(frame);
+            bytes = rest;
+        }
+        frames
+    }
+
+    /// Every Set Error Info PDU in `bytes` that a client's I/O-channel parser accepts.
+    fn error_infos(bytes: &[u8]) -> Vec<ErrorInfo> {
+        tpkt_frames(bytes)
+            .into_iter()
+            .filter_map(|frame| {
+                let indication = decode_send_data_indication(frame).ok()?;
+                match decode_io_channel(indication).ok()? {
+                    IoChannelPdu::Data(data) => match data.pdu {
+                        ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(info)) => Some(info),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// The detector itself: it finds a framed refusal and ignores the bare four bytes
+    /// Warpgate used to send, so the test below fails if those ever come back.
+    #[test]
+    fn error_infos_tells_a_framed_refusal_from_a_bare_one() {
+        use ironrdp_core::encode_vec;
+        use ironrdp_pdu::mcs::SendDataIndication;
+        use ironrdp_pdu::rdp::client_info::CompressionType;
+        use ironrdp_pdu::rdp::headers::{
+            CompressionFlags, ShareControlHeader, ShareControlPdu, ShareDataHeader, StreamPriority,
+        };
+        use ironrdp_pdu::x224::X224;
+
+        let refusal = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
+            ProtocolIndependentCode::ServerInsufficientPrivileges,
+        ));
+        let frame = |user_data: Vec<u8>| {
+            encode_vec(&X224(SendDataIndication {
+                initiator_id: 1007,
+                channel_id: 1003,
+                user_data: user_data.into(),
+            }))
+            .unwrap()
+        };
+
+        let bare = frame(encode_vec(&refusal).unwrap());
+        let framed = frame(
+            encode_vec(&ShareControlHeader {
+                share_control_pdu: ShareControlPdu::Data(ShareDataHeader {
+                    share_data_pdu: ShareDataPdu::ServerSetErrorInfo(refusal.clone()),
+                    stream_priority: StreamPriority::Undefined,
+                    compression_flags: CompressionFlags::empty(),
+                    compression_type: CompressionType::K8,
+                }),
+                pdu_source: 0,
+                share_id: 0,
+            })
+            .unwrap(),
+        );
+
+        assert!(error_infos(&bare).is_empty());
+        assert_eq!(error_infos(&framed), [refusal.0]);
+    }
+
+    #[tokio::test]
+    async fn rejected_sign_in_reaches_the_client_as_a_readable_refusal() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.signing_key.serialize_pem();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_tcp = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server_tcp, _) = listener.accept().await.unwrap();
+
+        // Warpgate's side: the real server state machine, and a control loop that turns
+        // every credential down, as it does a wrong password.
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let (_in_tx, in_rx) = mpsc::channel(16);
+        let server_done = run_on_thread(server_tcp, cert_pem, key_pem, (1024, 768), out_tx, in_rx);
+        let control = tokio::spawn(async move {
+            let mut asked = 0;
+            while let Some(event) = out_rx.recv().await {
+                if let Event::AuthRequest { reply, .. } = event {
+                    asked += 1;
+                    let _ = reply.send(AuthVerdict::Deny);
+                }
+            }
+            asked
+        });
+
+        // The viewer's side: Warpgate's own IronRDP client configuration, over TLS only,
+        // which is how mstsc reaches this listener. It advertises error-info support, as
+        // mstsc does; without that the server would send no refusal at all.
+        let client_addr = client_tcp.local_addr().unwrap();
+        let mut framed = TokioFramed::new(client_tcp);
+        let mut connector = connector::ClientConnector::new(
+            test_connector_config("alice:target", "wrong password"),
+            client_addr,
+        );
+        let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector)
+            .await
+            .unwrap();
+        let (tls, server_public_key) = upgrade_tls(
+            framed.into_inner_no_leftover(),
+            "localhost".to_owned(),
+            false,
+            RdpTlsSecurity::Tls12,
+        )
+        .await
+        .unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut framed = TokioFramed::new(Recorder {
+            inner: tls,
+            seen: Arc::clone(&seen),
+        });
+        let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+        let outcome = timeout(
+            DEADLINE,
+            ironrdp_tokio::connect_finalize(
+                upgraded,
+                connector,
+                &mut framed,
+                &mut ReqwestNetworkClient::new(),
+                "localhost".into(),
+                server_public_key,
+                None,
+            ),
+        )
+        .await
+        .expect("the handshake hung instead of ending");
+        assert!(
+            outcome
+                .and_then(connector::ConnectionOutcome::into_connected)
+                .is_err(),
+            "a rejected sign-in must not connect"
+        );
+        drop(framed);
+
+        let asked = timeout(DEADLINE, control).await.unwrap().unwrap();
+        assert_eq!(
+            asked, 1,
+            "the server asks Warpgate about the credentials once"
+        );
+        let _ = timeout(DEADLINE, server_done).await;
+
+        let seen = seen.lock().unwrap().clone();
+        let refusals = error_infos(&seen);
+        assert!(
+            matches!(
+                refusals.as_slice(),
+                [ErrorInfo::ProtocolIndependentCode(
+                    ProtocolIndependentCode::ServerInsufficientPrivileges
+                        | ProtocolIndependentCode::ServerDeniedConnection
+                )]
+            ),
+            "expected one readable refusal from the server, found {refusals:?} in {} bytes",
+            seen.len()
+        );
+    }
+}

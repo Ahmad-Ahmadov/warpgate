@@ -5,14 +5,18 @@ import { api, type Info } from './api'
 
 export const serverInfo = writable<Info | undefined>(undefined)
 
-const [openTargetsInNewTabPreference] = autosave<boolean | null>(
-    'target-list:open-in-new-tab',
-    null,
-)
-
+// The portal's collapsed target groups. Upstream #2860 moved this into
+// ItemList's `storageKey` along with its customizable columns; this fork keeps
+// its own ItemList (card grid, bindable `collapsedGroups`), so it keeps the
+// store. Same storage key, so a collapsed group stays collapsed either way.
 export const [collapsedTargetGroups] = autosave<string[]>(
     'target-list:collapsed-groups',
     [],
+)
+
+const [openTargetsInNewTabPreference] = autosave<boolean | null>(
+    'target-list:open-in-new-tab',
+    null,
 )
 
 export const openTargetsInNewTab = derived(

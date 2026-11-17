@@ -145,15 +145,22 @@
             return
         }
         switch (msg.type) {
-            case 'state':
+            case 'state': {
+                // the server replays the phase on every attach, so act on transitions only
+                const wasConnected = phase?.phase === 'connected'
                 phase = msg
-                if (msg.phase === 'connected' && channelOrder.length === 0) {
+                if (
+                    msg.phase === 'connected' &&
+                    !wasConnected &&
+                    channelOrder.length === 0
+                ) {
                     requestNewChannel()
                 }
                 if (msg.phase === 'closed') {
                     ws.close()
                 }
                 break
+            }
             case 'channel_opened':
                 openChannel(msg.channel_id)
                 break
@@ -314,8 +321,14 @@
                     active={id === activeChannelId}
                     {fontSize}
                     readOnly={!connected}
-                    onInput={data => send({ type: 'input', channel_id: id, data: bytesToBase64(data) })}
-                    onResize={(cols, rows) => send({ type: 'resize', channel_id: id, cols, rows })}
+                    onInput={data =>
+                        send({
+                            type: 'input',
+                            channel_id: id,
+                            data: bytesToBase64(data),
+                        })}
+                    onResize={(cols, rows) =>
+                        send({ type: 'resize', channel_id: id, cols, rows })}
                     onTitleChange={title => {
                         channels.set(id, {
                             ...channel,
@@ -339,7 +352,8 @@
                         tabindex="0"
                         role="button"
                         onclick={() => switchToChannel(id)}
-                        onkeydown={e => e.key === 'Enter' && switchToChannel(id)}
+                        onkeydown={e =>
+                            e.key === 'Enter' && switchToChannel(id)}
                     >
                         <span class="label"
                             >{ch.terminalTitle ?? ch.label}</span
@@ -347,7 +361,10 @@
                         <button
                             type="button"
                             class="btn btn-link btn-sm close-button"
-                            onclick={e => { e.stopPropagation(); closeTab(id) }}
+                            onclick={e => {
+                                e.stopPropagation()
+                                closeTab(id)
+                            }}
                         >
                             <Fa icon={faTimes} />
                         </button>

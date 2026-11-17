@@ -515,6 +515,26 @@ the kernel send a reset.
   `drive_session` gives the relay up to `RELAY_DRAIN_TIMEOUT` (5 s) to finish
   whichever branch ended the session.
 
+### Defect 1 fixed upstream, November 2026
+
+Upstream #2871 re-vendored `ironrdp-server` from an IronRDP master snapshot
+(0.14.0) on the published `ironrdp-acceptor` 0.12. Credentials are now checked
+during the handshake, as soon as the Client Info PDU arrives, and on rejection
+`Acceptor::encode_access_denied` sends a properly framed Set Error Info PDU
+(Share Control and Share Data headers, `pduSource` 0), with
+`ERRINFO_SERVER_INSUFFICIENT_PRIVILEGES`, then the connection closes. It is sent
+only to clients that advertise error-info support, which mstsc and FreeRDP do.
+There is no Disconnect Provider Ultimatum: the denial arrives before
+activation, where the close itself ends the connection.
+
+This fork's patch to `send_access_denied` was therefore dropped at the
+November sync; `vendor/` is identical to upstream. Defect 2, the relay, is
+Warpgate's own and remains this fork's fix. IronRDP has no test of its own for
+the refusal, so `rejection_tests` in `warpgate-protocol-rdp/src/server/mod.rs`
+pins it: the real server state machine, a control loop that rejects, Warpgate's
+own IronRDP client over TLS, and IronRDP's client-side decoder on what the
+client received.
+
 ### Reproduction
 
 At protocol level, in unit tests. Putting each old behaviour back makes exactly

@@ -13,7 +13,7 @@
 
 use zune_jpeg::zune_core::bytestream::ZCursor;
 
-use super::DesktopEvent;
+use super::{DesktopEvent, MAX_DESKTOP_DIM};
 
 /// PNG encoding failed. Carries the codec's message; callers map it into their own error.
 #[derive(Debug, thiserror::Error)]
@@ -76,6 +76,12 @@ impl Framebuffer {
     }
 
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
+        let max = u32::from(MAX_DESKTOP_DIM);
+        let (width, height) = if width > max || height > max {
+            (0, 0)
+        } else {
+            (width, height)
+        };
         self.width = width;
         self.height = height;
         let needed = (width as usize)
@@ -249,6 +255,8 @@ impl Framebuffer {
                 );
             }
             DesktopEvent::Cursor { .. }
+            | DesktopEvent::CursorDefault
+            | DesktopEvent::CursorHidden
             | DesktopEvent::State(_)
             | DesktopEvent::Clipboard(_)
             | DesktopEvent::Bell
@@ -361,7 +369,9 @@ pub fn decode_jpeg_rgb(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::DesktopRect;
+    use std::sync::Arc;
+
+    use super::super::{DesktopConnectionError, DesktopRect};
     use super::*;
 
     fn decode_png(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
@@ -375,6 +385,16 @@ mod tests {
 
     /// A refinement must be pixel-exact: it exists to replace lossy pixels, so any loss
     /// here defeats the whole feature.
+    #[test]
+    fn oversized_resize_leaves_the_framebuffer_empty() {
+        let mut fb = Framebuffer::default();
+        fb.resize(65535, 65535);
+        assert!(fb.is_empty());
+        assert!(fb.rgba().is_empty());
+        fb.resize(u32::from(MAX_DESKTOP_DIM), 1);
+        assert_eq!(fb.size(), (u32::from(MAX_DESKTOP_DIM), 1));
+    }
+
     #[test]
     fn region_png_roundtrips_losslessly() {
         let mut fb = Framebuffer::default();
@@ -494,7 +514,9 @@ mod tests {
             height: 1,
         });
         fb.apply(&DesktopEvent::Bell);
-        fb.apply(&DesktopEvent::Error("boom".into()));
+        fb.apply(&DesktopEvent::Error(Arc::new(
+            DesktopConnectionError::Session(anyhow::anyhow!("boom")),
+        )));
         assert_eq!(fb.size(), (1, 1));
     }
 

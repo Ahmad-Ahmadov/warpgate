@@ -9,7 +9,7 @@ use warpgate_common::{SecretResolver, TargetVncOptions, VncTargetAuth, WarpgateE
 use warpgate_core::{
     AdmittedTarget, DESKTOP_CONNECT_TIMEOUT, DESKTOP_HANDSHAKE_TIMEOUT,
     DESKTOP_INPUT_CHANNEL_CAPACITY, DesktopClientHandles, DesktopConnectionError, DesktopEvent,
-    DesktopInput, DesktopRect, DesktopState, LogonState, within_deadline,
+    DesktopInput, DesktopRect, DesktopState, LogonState, check_desktop_size, within_deadline,
 };
 
 const fn rect_from(r: vnc::Rect) -> DesktopRect {
@@ -139,7 +139,8 @@ fn spawn_client(
             )
             .await
             {
-                let _ = event_tx.send(DesktopEvent::backend_error(&error)).await;
+                let error = Arc::new(error);
+                let _ = event_tx.send(DesktopEvent::Error(error.clone())).await;
                 error!(
                     "VNC backend client failed: {:#}",
                     anyhow::Error::from(error)
@@ -223,10 +224,13 @@ async fn run(
             event = client.poll_event() => {
                 match event {
                     Ok(Some(event)) => {
-                        if let Some(mapped) = map_event(event)
-                            && event_tx.send(mapped).await.is_err()
-                        {
-                            break;
+                        if let Some(mapped) = map_event(event) {
+                            if let DesktopEvent::Resize { width, height } = mapped {
+                                check_desktop_size(width, height)?;
+                            }
+                            if event_tx.send(mapped).await.is_err() {
+                                break;
+                            }
                         }
                         // Keep the framebuffer flowing.
                         client.input(X11Event::Refresh).await.ok();
@@ -299,7 +303,9 @@ fn map_event(event: VncEvent) -> Option<DesktopEvent> {
         VncEvent::Bell => DesktopEvent::Bell,
         VncEvent::Error(message) => {
             error!(%message, "VNC backend reported an error");
-            DesktopEvent::backend_error(&DesktopConnectionError::Session(anyhow::anyhow!(message)))
+            DesktopEvent::Error(Arc::new(DesktopConnectionError::Session(anyhow::anyhow!(
+                message
+            ))))
         }
         // Everything else (including the server's pixel-format echo — we fix our own)
         // is not surfaced.
@@ -310,6 +316,7 @@ fn map_event(event: VncEvent) -> Option<DesktopEvent> {
 #[cfg(test)]
 mod tests {
     use vnc::VncEvent;
+    use warpgate_common::UserFacingReason;
     use warpgate_core::DesktopEvent;
 
     use super::map_event;
@@ -319,9 +326,9 @@ mod tests {
         let shown = match map_event(VncEvent::Error(
             "Connection reset by peer (os error 54)".into(),
         )) {
-            Some(DesktopEvent::Error(message)) => message,
+            Some(DesktopEvent::Error(error)) => error.user_facing_reason(),
             other => format!("{other:?}"),
         };
-        assert_eq!(shown, "Target connection failed: The target session failed");
+        assert_eq!(shown, "The target session failed");
     }
 }

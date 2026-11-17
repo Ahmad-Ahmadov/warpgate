@@ -276,6 +276,10 @@
                 <Callout
                     >One-time passwords are required on this server.</Callout
                 >
+            {:else if c.otp.length === 0}
+                <p class="empty-hint">
+                    Add an authenticator app as a second factor for signing in.
+                </p>
             {/if}
         </section>
 
@@ -335,6 +339,11 @@
                     Your credential policy requires a public key for SSH
                     authentication. Without one you will not be able to sign in.
                 </Callout>
+            {:else if c.publicKeys.length === 0 && !c.ldapLinked}
+                <p class="empty-hint">
+                    Add an SSH public key to connect to SSH targets without a
+                    password.
+                </p>
             {/if}
         </section>
 
@@ -376,6 +385,10 @@
                     Your credential policy requires a certificate for Kubernetes
                     authentication. Without one you will not be able to sign in.
                 </Callout>
+            {:else if c.certificates.length === 0}
+                <p class="empty-hint">
+                    Issue a client certificate to connect to Kubernetes targets.
+                </p>
             {/if}
         </section>
 
@@ -459,6 +472,13 @@
 
     section {
         margin-bottom: var(--wg-space-2xl);
+    }
+
+    /* An empty section says what it is for (upstream #2803). */
+    .empty-hint {
+        margin: 0;
+        color: var(--wg-text-muted);
+        font: var(--wg-text-body-md);
     }
 
     .section-head {

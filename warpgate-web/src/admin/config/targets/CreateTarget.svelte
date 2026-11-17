@@ -12,6 +12,7 @@
         TlsMode,
     } from 'admin/lib/api'
     import { adminPermissions } from 'admin/lib/store'
+    import { DEFAULT_PORTS } from 'admin/lib/targetAddress'
     import { stringifyError } from 'common/errors'
     import { TargetKind } from 'gateway/lib/api'
     import { onMount } from 'svelte'
@@ -37,7 +38,7 @@
                 Ssh: {
                     kind: TargetKind.Ssh,
                     host: '192.168.0.1',
-                    port: 22,
+                    port: DEFAULT_PORTS.Ssh,
                     username: 'root',
                     allowInsecureAlgos: false,
                     auth: {
@@ -56,9 +57,9 @@
                 MySql: {
                     kind: TargetKind.MySql,
                     host: '192.168.0.1',
-                    port: 3306,
+                    port: DEFAULT_PORTS.MySql,
                     tls: {
-                        mode: TlsMode.Preferred,
+                        mode: TlsMode.Required,
                         verify: true,
                     },
                     username: 'root',
@@ -70,9 +71,9 @@
                 Postgres: {
                     kind: TargetKind.Postgres,
                     host: '192.168.0.1',
-                    port: 5432,
+                    port: DEFAULT_PORTS.Postgres,
                     tls: {
-                        mode: TlsMode.Preferred,
+                        mode: TlsMode.Required,
                         verify: true,
                     },
                     username: 'postgres',
@@ -98,7 +99,7 @@
                 Vnc: {
                     kind: TargetKind.Vnc,
                     host: '192.168.0.1',
-                    port: 5900,
+                    port: DEFAULT_PORTS.Vnc,
                     auth: {
                         kind: 'None' as const,
                     },
@@ -106,7 +107,7 @@
                 Rdp: {
                     kind: TargetKind.Rdp,
                     host: '192.168.0.1',
-                    port: 3389,
+                    port: DEFAULT_PORTS.Rdp,
                     username: 'Administrator',
                     auth: {
                         kind: 'Password' as const,

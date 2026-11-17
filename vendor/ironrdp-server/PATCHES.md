@@ -1,10 +1,22 @@
-Fork of `ironrdp-server` 0.13.0.
+Snapshot of `ironrdp-server` from IronRDP master at `1f4dee6b` (2026-10-27, "fix(server):
+size the display for non-resizing clients before input", #2261), version `0.14.0`.
+
+## Why a git snapshot
+
+IronRDP published the rest of its crates on 2026-10-27/28 (`ironrdp-pdu` 0.11,
+`ironrdp-connector` 0.12, `ironrdp-session` 0.13, `ironrdp-egfx` 0.5, ...) but not
+`ironrdp-server`, whose last release (0.13.0) only builds against the previous generation.
+`1f4dee6b` is the latest server commit whose dependencies are all those published
+releases: the commits after it (#2232, #2272, #2293, #2107, ...) rely on changes to
+`ironrdp-acceptor`, `ironrdp-error` and `ironrdp-dvc` that have no release yet.
+
+Re-vendor from a published `ironrdp-server` 0.14+ once one exists.
 
 ## RemoteFX header blocks lost to a buffer retry
 
 `RemoteFxHandler` carries the desktop size as an `Option`, and `Some` is what makes
 `RfxEncoder::encode` emit the once-per-connection RFX header blocks (`TS_RFX_SYNC`,
-`TS_RFX_CONTEXT`, `TS_RFX_CHANNELS`, `TS_RFX_CODEC_VERSIONS`). Upstream `take()`s that
+`TS_RFX_CONTEXT`, `TS_RFX_CHANNELS`, `TS_RFX_CODEC_VERSIONS`). The snapshot `take()`s that
 `Option` *inside* the loop that grows the output buffer on `NotEnoughBytes`, so a first
 frame whose encoding overruns the buffer consumes the headers on the attempt that failed
 and re-encodes without them. The buffer is sized from the frame's raw BGRA length, and RFX
@@ -12,43 +24,18 @@ always emits whole 64x64 tiles, so anything tile-padded — a few-pixel rect, or
 like a 1px window border — encodes larger than its source and takes that path. The headers
 are never re-armed, so every later frame is rejected (FreeRDP: `rfx_process_message:
 incomplete header blocks processing`) and the viewer stays black for the life of the
-connection while input still works. Which frame arrives first is the target's choice, which
-is why this strikes some deployments and not others; see warp-tech/warpgate#2606.
+connection while input still works; see warp-tech/warpgate#2606.
 
 `warpgate.patch` reads the size without consuming it and clears it only once a message
 carrying the headers has been built. It also drops a `* 2` from the adjacent buffer-resize
-`debug!`, which reported twice the size actually allocated.
+`debug!`, which reported twice the size actually allocated. Upstream fixed the same bug
+differently in #2274 (take before the loop, buffer reused), which is past the snapshot.
 
-## Malformed access denial: mstsc "protocol error" 0xd06 on a rejected sign-in
+## Manifest
 
-With a `CredentialValidator` configured, `client_accepted` validates the viewer's
-credentials once the connection is fully established, and on rejection `send_access_denied`
-told the client why with a `ServerSetErrorInfoPdu(ServerDeniedConnection)`. Upstream encoded
-that PDU on its own — the bare 4-byte `errorInfo` field (`07 00 00 00`) as the whole payload
-of the Send Data Indication — without the Share Control and Share Data headers [MS-RDPBCGR]
-2.2.5.1.1 requires. A client in the active phase reads the I/O channel as Share Control
-PDUs, and those four bytes are neither one (`totalLength` 7 with 4 bytes present,
-`pduType` 0) nor valid security-header framing (`flags` 0x0007 would claim a
-security-exchange and multitransport packet). So the client cannot read the reason, and
-reports a protocol error instead: mstsc shows "Because of a protocol error, this session will
-be disconnected" with error code 0xd06, FreeRDP a transport error. The same bytes come from
-upstream's acceptor, where a `FIXME` already doubts them; that path is only reached through
-`ServerEvent::SetCredentials`, which Warpgate does not use, so it is left alone.
-
-`warpgate.patch` frames the PDU the way the acceptor frames its connection-finalization Share
-Data PDUs — which every client already accepts from this server — except that `pduSource` is
-0, as the spec requires for this PDU. It then sends an MCS Disconnect Provider Ultimatum
-(`rn-provider-initiated`), completing the server-initiated disconnection sequence of
-[MS-RDPBCGR] 1.3.1.4.2, so the client ends the connection itself instead of only seeing the
-transport close. The denial is still sent only after the validator has rejected, and the
-connection is still closed afterwards; the error code is unchanged. Unit tests at the end of
-`server.rs` parse the result with IronRDP's client-side decoder and check the spec fields on
-the wire.
-
-Getting the PDU right is not enough by itself: Warpgate tore down its byte relay as soon as
-the server ended, discarding the denial before it reached the viewer. That half of the fix
-is in `warpgate-protocol-rdp/src/server/mod.rs` (`relay`, `drive_session`).
-
-`Cargo.toml` additionally sets `[lints.rust] warnings = { level = "allow", priority = 1 }`
-so this vendored path dependency's warnings don't surface in Warpgate's builds. This is not
-in `warpgate.patch` (which is source-only); re-apply it by hand on re-vendor.
+`Cargo.toml` is the snapshot's with the `*.workspace = true` package fields inlined, the
+`path = "../..."` dependency entries removed (every dependency resolves to its crates.io
+release), `[lints] workspace = true` replaced by `warnings = { level = "allow", priority = 1 }`
+under `[lints.rust]`, and `zstd-safe = "8.2"` (upstream pins `7.2`; the streaming API the
+code uses is unchanged). `LICENSE-*` are copies: in the IronRDP repository they are
+symlinks to the workspace root. None of this is in `warpgate.patch` (source-only).

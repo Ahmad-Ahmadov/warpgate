@@ -12,6 +12,7 @@
     import { get } from 'svelte/store'
     import Router, { router, type WrappedComponent } from 'svelte-spa-router'
     import { wrap } from 'svelte-spa-router/wrap'
+    import Callout from 'ui/Callout.svelte'
     import AnalyticsConsentModal from './AnalyticsConsentModal.svelte'
     import { crumbsFor } from './crumbs'
     import { ADMIN_PERMISSIONS, adminPermissions } from './lib/store'
@@ -236,6 +237,27 @@
             <AuthBar />
         {/snippet}
 
+        <!--
+          Problems the server found in its configuration: a key with no effect,
+          an external_host that does not match, credential-encryption trouble.
+          Upstream shows them above every admin page and the redesign had lost
+          them. Sent only to admins who can edit the configuration, and shown
+          as text: upstream #2817 stopped rendering them as HTML.
+        -->
+        {#if $serverInfo?.configWarnings?.length}
+            <Callout
+                tone="warning"
+                title="Issues found in the configuration"
+                class="config-warnings"
+            >
+                <ul>
+                    {#each $serverInfo.configWarnings as warning (warning)}
+                        <li>{warning}</li>
+                    {/each}
+                </ul>
+            </Callout>
+        {/if}
+
         <Router {routes} />
     </AppShell>
 </Loadable>
@@ -245,6 +267,15 @@
 {/if}
 
 <style>
+    :global(.config-warnings) {
+        margin-bottom: var(--wg-space-lg);
+    }
+
+    :global(.config-warnings) ul {
+        margin: var(--wg-space-xs) 0 0;
+        padding-left: var(--wg-space-lg);
+    }
+
     .wg-brand-link {
         display: flex;
         align-items: center;
