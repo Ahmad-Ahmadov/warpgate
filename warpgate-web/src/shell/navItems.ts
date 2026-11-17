@@ -42,6 +42,7 @@ const ICONS = {
     ticket: 'M2 5h12v2a1.5 1.5 0 000 3v2H2v-2a1.5 1.5 0 000-3z',
     sliders: 'M2 5h8M12 5h2M2 11h2M6 11h8M10 3v4M4 9v4',
     directory: 'M2 3h5l1 2h6v8H2z',
+    vault: 'M2 3h12v10H2zM8 6a2 2 0 100 4 2 2 0 000-4zM8 8h3M4 13v1M12 13v1',
 }
 
 export const NAV_SECTIONS: NavSection[] = [
@@ -179,6 +180,14 @@ export const NAV_SECTIONS: NavSection[] = [
                 href: '#/config/ldap-servers',
                 match: '/config/ldap-servers',
                 icon: ICONS.directory,
+                requires: 'configEdit',
+            },
+            {
+                id: 'secret-backends',
+                label: 'Secret backends',
+                href: '#/config/secret-backends',
+                match: '/config/secret-backends',
+                icon: ICONS.vault,
                 requires: 'configEdit',
             },
             {

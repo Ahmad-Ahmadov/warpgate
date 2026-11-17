@@ -13,6 +13,8 @@
      */
     import type { TargetOptionsTargetKubernetesOptions } from 'admin/lib/api'
     import { serverInfo } from 'gateway/lib/store'
+    import { adminPermissions } from 'admin/lib/store'
+    import SecretRefInput from 'common/SecretRefInput.svelte'
     import Input from 'ui/Input.svelte'
     import Select from 'ui/Select.svelte'
     import Textarea from 'ui/Textarea.svelte'
@@ -72,12 +74,10 @@
 {/if}
 
 {#if options.auth.kind === 'Token'}
-    <Input
-        label="Bearer token"
-        type="password"
-        autocomplete="off"
-        mono
+    <SecretRefInput
         bind:value={options.auth.token}
+        inlineLabel="Bearer token"
+        disabled={!$adminPermissions.targetsEdit}
     />
 {/if}
 

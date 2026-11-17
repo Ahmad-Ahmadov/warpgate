@@ -14,6 +14,8 @@
         TargetOptionsTargetPostgresOptions,
     } from 'admin/lib/api'
     import { serverInfo } from 'gateway/lib/store'
+    import { adminPermissions } from 'admin/lib/store'
+    import SecretRefInput from 'common/SecretRefInput.svelte'
     import Input from 'ui/Input.svelte'
     import Select from 'ui/Select.svelte'
     import TlsConfiguration from '../TlsConfiguration.svelte'
@@ -67,11 +69,10 @@
 </div>
 
 {#if options.auth?.kind === 'Password'}
-    <Input
-        label="Password"
-        type="password"
-        autocomplete="off"
+    <SecretRefInput
         bind:value={options.auth.password}
+        inlineLabel="Password"
+        disabled={!$adminPermissions.targetsEdit}
     />
 {/if}
 

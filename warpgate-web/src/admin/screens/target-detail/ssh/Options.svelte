@@ -30,6 +30,9 @@
     import { TargetKind } from 'gateway/lib/api'
     import { serverInfo } from 'gateway/lib/store'
     import { untrack } from 'svelte'
+    import SecretRefInput, {
+        loadSecretBackends,
+    } from 'common/SecretRefInput.svelte'
     import Callout from 'ui/Callout.svelte'
     import Checkbox from 'ui/Checkbox.svelte'
     import Input from 'ui/Input.svelte'
@@ -115,16 +118,21 @@
         })),
     ])
 
+    let secretBackendOptions = $state<{ value: string; label: string }[]>([])
+    loadSecretBackends().then(list => {
+        secretBackendOptions = list.map(b => ({ value: b.name, label: b.name }))
+    })
+
     const authOptions = $derived([
         { value: 'PublicKey', label: "Warpgate's own private keys" },
         { value: 'Password', label: 'Password' },
         ...($serverInfo?.runningOnEc2
             ? [{ value: 'IamRole', label: 'IAM role' }]
             : []),
-        // Upstream #2734. Its settings cannot be edited here yet (UPSTREAM-ISSUES
-        // #9), but a target set up that way through the API must not look as if
-        // it had no authentication — that invites replacing a working setup.
-        ...(options.auth.kind === 'Certificate'
+        // Upstream #2734: Warpgate gets a short-lived certificate for each
+        // connection from a secret backend's SSH engine. Offered once a
+        // backend exists, and always for a target already using it.
+        ...(secretBackendOptions.length || options.auth.kind === 'Certificate'
             ? [
                   {
                       value: 'Certificate',
@@ -134,11 +142,32 @@
             : []),
     ])
 
-    const authHint = $derived(
-        options.auth.kind === 'Certificate'
-            ? `Signed by the SSH CA of secret backend "${options.auth.backend}" (mount ${options.auth.mount}, role ${options.auth.role}). These settings can only be changed through the API for now.`
-            : undefined,
-    )
+    // A target can name a backend that no longer exists; it stays selectable,
+    // marked, rather than the select silently showing nothing.
+    const certificateBackendOptions = $derived.by(() => {
+        const current =
+            options.auth.kind === 'Certificate' ? options.auth.backend : ''
+        return current && !secretBackendOptions.some(b => b.value === current)
+            ? [
+                  ...secretBackendOptions,
+                  { value: current, label: `${current} (not found)` },
+              ]
+            : secretBackendOptions
+    })
+
+    // Switching the kind keeps the rest of the auth object, so a certificate
+    // auth needs its own fields filled in, as upstream's editor does.
+    $effect(() => {
+        if (options.auth.kind === 'Certificate') {
+            untrack(() => {
+                if (options.auth.kind === 'Certificate') {
+                    options.auth.backend ??= ''
+                    options.auth.mount ??= 'ssh'
+                    options.auth.role ??= ''
+                }
+            })
+        }
+    })
 </script>
 
 <h5>Connection</h5>
@@ -198,7 +227,6 @@
     <Select
         label="Authenticate using"
         options={authOptions}
-        hint={authHint}
         bind:value={options.auth.kind}
     />
 
@@ -220,14 +248,44 @@
     {/if}
 
     {#if options.auth.kind === 'Password'}
-        <Input
-            label="Password"
-            type="password"
-            autocomplete="off"
+        <SecretRefInput
             bind:value={options.auth.password}
+            inlineLabel="Password"
+            disabled={!$adminPermissions.targetsEdit}
         />
     {/if}
 </div>
+
+{#if options.auth.kind === 'Certificate'}
+    <div class="row">
+        <Select
+            label="Secret backend"
+            required
+            placeholder="Choose a backend"
+            options={certificateBackendOptions}
+            bind:value={options.auth.backend}
+        />
+        <Input
+            label="SSH engine mount"
+            mono
+            required
+            placeholder="ssh"
+            bind:value={options.auth.mount}
+        />
+        <Input
+            label="Signing role"
+            mono
+            required
+            bind:value={options.auth.role}
+        />
+    </div>
+    <p class="cert-hint">
+        For each connection Warpgate generates a key pair and has the backend
+        sign its public key with this role. The target must trust the backend's
+        SSH CA, and the backend's allowed paths must include
+        <code>{options.auth.mount || 'ssh'}/sign/{options.auth.role || 'role'}</code>.
+    </p>
+{/if}
 
 <div class="insecure">
     <Checkbox
@@ -267,6 +325,12 @@
 
     .auth-row > :global(.manage-keys) {
         flex: none;
+    }
+
+    .cert-hint {
+        margin: 0;
+        color: var(--wg-text-muted);
+        font: var(--wg-text-body-md);
     }
 
     .manage-keys {

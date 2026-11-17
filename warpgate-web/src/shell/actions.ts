@@ -155,6 +155,14 @@ export const NAVIGATION_ACTIONS: PaletteAction[] = [
         requires: 'configEdit',
     },
     {
+        id: 'nav.secretBackends',
+        label: 'Secret backends',
+        group: 'Go to',
+        keywords: 'vault openbao secrets references credentials',
+        href: '#/config/secret-backends',
+        requires: 'configEdit',
+    },
+    {
         id: 'nav.parameters',
         label: 'Global parameters',
         group: 'Go to',

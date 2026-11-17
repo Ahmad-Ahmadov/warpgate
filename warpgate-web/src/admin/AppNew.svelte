@@ -213,6 +213,10 @@
         '/config/parameters': wrap({
             asyncComponent: () => import('./config/Parameters.svelte'),
         }),
+        '/config/secret-backends': wrap({
+            asyncComponent: () =>
+                import('./config/secret-backends/SecretBackends.svelte'),
+        }),
     }
 
     const path = $derived(router.location)

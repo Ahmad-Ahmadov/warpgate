@@ -42,6 +42,11 @@
     import { stringifyError } from 'common/errors'
     import Loadable from 'common/Loadable.svelte'
     import RateLimitInput from 'common/RateLimitInput.svelte'
+    import {
+        SECRET_USAGE_CONTEXT,
+        type SecretUsageContext,
+    } from 'common/SecretRefInput.svelte'
+    import { setContext } from 'svelte'
     import { TargetKind } from 'gateway/lib/api'
     import { serverInfo } from 'gateway/lib/store'
     import {
@@ -84,6 +89,15 @@
     let error: string | undefined = $state()
     let selectedUsername: string | undefined = $state($serverInfo?.username)
     let target: Target | undefined = $state()
+
+    // Credential fields in the option screens below offer secret references;
+    // this tells the picker which target they belong to, so "also used by"
+    // leaves this one out.
+    setContext<SecretUsageContext>(SECRET_USAGE_CONTEXT, () =>
+        target
+            ? { kind: 'Target', id: target.id, name: target.name }
+            : undefined,
+    )
     let roleIsAllowed: Record<string, boolean> = $state({})
     let instructionsOpen = $state(false)
     let deleteOpen = $state(false)

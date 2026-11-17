@@ -9,6 +9,7 @@
     import CopyableTextArea from 'common/CopyableTextArea.svelte'
     import { stringifyError } from 'common/errors'
     import InfoBox from 'common/InfoBox.svelte'
+    import { isSecretRef } from 'common/SecretRefInput.svelte'
     import Badge from 'ui/Badge.svelte'
     import Button from 'ui/Button.svelte'
     import Callout from 'ui/Callout.svelte'
@@ -60,6 +61,17 @@
                 await api.updateSshOwnKey({
                     id: key.id,
                     updateSSHClientKeyRequest: { label, isDefault },
+                })
+                return
+            }
+            // Upstream #2185: a reference is stored as such and resolved on use.
+            if (isSecretRef(secretKey)) {
+                await api.importSshOwnKeyReference({
+                    importSshClientKeyReferenceRequest: {
+                        label,
+                        reference: secretKey,
+                        isDefault,
+                    },
                 })
                 return
             }
@@ -121,6 +133,9 @@
                     <strong>{key.label}</strong>
                     {#if key.isDefault}
                         <Badge tone="primary">Default</Badge>
+                    {/if}
+                    {#if key.secretBackend}
+                        <Badge mono>From {key.secretBackend}</Badge>
                     {/if}
                     {#if $adminPermissions.configEdit}
                         <Button
