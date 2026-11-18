@@ -13,6 +13,7 @@
     import ConfirmDialog from 'ui/ConfirmDialog.svelte'
     import Input from 'ui/Input.svelte'
     import { defaultLdapPortForTlsMode, testLdapConnection } from './common'
+    import LdapAuthenticationField from './LdapAuthenticationField.svelte'
     import LdapConnectionFields from './LdapConnectionFields.svelte'
 
     interface Props {
@@ -35,6 +36,7 @@
     })
     let enabled = $state(true)
     let autoLinkSsoUsers = $state(false)
+    let authenticateUsers = $state(false)
     let description = $state('')
     let usernameAttribute = $state<LdapUsernameAttribute>(
         LdapUsernameAttribute.Cn,
@@ -70,6 +72,7 @@
         tls = { mode: result.tlsMode, verify: result.tlsVerify }
         enabled = result.enabled
         autoLinkSsoUsers = result.autoLinkSsoUsers
+        authenticateUsers = result.authenticateUsers
         description = result.description || ''
         sshKeyAttribute = result.sshKeyAttribute || 'sshPublicKey'
         uuidAttribute = result.uuidAttribute || ''
@@ -121,6 +124,7 @@
                     usernameAttribute,
                     sshKeyAttribute,
                     uuidAttribute,
+                    authenticateUsers,
                 },
             })
             await load()
@@ -221,6 +225,8 @@
                 </div>
             </div>
 
+            <LdapAuthenticationField bind:authenticateUsers {tls} />
+
             {#if testResult}
                 <div
                     class="alert {testResult.success ? 'alert-success' : 'alert-danger'}"
@@ -275,4 +281,11 @@
         Their Warpgate accounts remain, but the credentials that came from the
         directory — including SSH keys loaded from it — are no longer available.
     </p>
+    {#if server?.authenticateUsers}
+        <p>
+            While linked users sign in with their directory password, the
+            server cannot be deleted: turn that off and save first, or unlink
+            those users.
+        </p>
+    {/if}
 </ConfirmDialog>

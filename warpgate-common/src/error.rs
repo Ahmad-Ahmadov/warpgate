@@ -206,6 +206,8 @@ impl UserFacingReason for LdapError {
             Self::NoUsername(_) => "cannot determine username for user",
             Self::NoUUID(_) => "cannot determine UUID for user",
             Self::AmbiguousMatch { .. } => "LDAP lookup matched more than one entry",
+            Self::InsecureTransport => "LDAP sign-in requires LDAPS or StartTLS",
+            Self::BindFailed { .. } => "LDAP server could not check the password",
             Self::LdapClientError(_) | Self::JsonError(_) => "LDAP error",
         }
         .into()

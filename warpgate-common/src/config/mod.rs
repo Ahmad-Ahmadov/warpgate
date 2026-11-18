@@ -110,8 +110,11 @@ pub struct UserRequireCredentialsPolicy {
 }
 
 impl UserRequireCredentialsPolicy {
+    /// `existing_kinds` are the kinds of credential the user can sign in
+    /// with — which includes a password their LDAP server checks, though
+    /// Warpgate stores none.
     #[must_use]
-    pub fn upgrade_to_otp(&self, with_existing_credentials: &[UserAuthCredential]) -> Self {
+    pub fn upgrade_to_otp(&self, existing_kinds: &[CredentialKind]) -> Self {
         let mut copy = self.clone();
 
         if let Some(policy) = &mut copy.http {
@@ -119,10 +122,7 @@ impl UserRequireCredentialsPolicy {
         } else {
             // Upgrade to OTP only if there is a password credential
             let mut kinds = vec![];
-            if with_existing_credentials
-                .iter()
-                .any(|c| c.kind() == CredentialKind::Password)
-            {
+            if existing_kinds.contains(&CredentialKind::Password) {
                 kinds.push(CredentialKind::Password);
             }
             if !kinds.is_empty() {
@@ -136,9 +136,9 @@ impl UserRequireCredentialsPolicy {
         } else {
             // Upgrade to OTP only if there is a password or public key credential
             let mut kinds = vec![];
-            if with_existing_credentials.iter().any(|c| {
-                c.kind() == CredentialKind::Password || c.kind() == CredentialKind::PublicKey
-            }) {
+            if existing_kinds.contains(&CredentialKind::Password)
+                || existing_kinds.contains(&CredentialKind::PublicKey)
+            {
                 kinds.push(CredentialKind::Password);
             }
             if !kinds.is_empty() {

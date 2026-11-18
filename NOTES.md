@@ -2338,3 +2338,103 @@ Native only; no Docker.
   There are no MSVC build tools, and WSL has no toolchain. It matches the six
   neighbouring handlers line for line.
 - **Not run:** the e2e suite, including the updated `test_api.py` case.
+
+## Native LDAP sign-in for imported users
+
+Users imported from (or linked to) an LDAP server can sign in with their
+directory username and password. Warpgate checks the password by binding to
+the server as the user at every login, and stores nothing derived from it.
+
+### The switch, and upgrades
+
+`ldap_servers.authenticate_users` (migration `m00096`), shown as "Users sign
+in with their directory password" on the server's screen. It is **off for
+existing servers**, so upgrading changes nobody's login. New servers created
+from the UI start with it on; the API's own default stays off, so an older
+client creates the server it always did, and `PUT` without the field keeps the
+current value.
+
+`User::Model::ldap_password_server` is the one place that decides whether a
+user's password belongs to the directory. Every path asks it: password
+validation, the credential policy, OTP enrolment, the admin and self-service
+password endpoints, and `recover-access`.
+
+### How a password is checked
+
+`warpgate_ldap::authenticate_user`:
+
+1. Refuses a server whose TLS mode is `Disabled`. The admin API refuses to
+   turn the switch on without TLS too. `Preferred` is as strict as `Required`
+   here, because `ldap3` fails the connection when StartTLS fails rather than
+   carrying on in plaintext.
+2. Refuses an empty password before contacting anything. A simple bind with a
+   DN and no password is an *unauthenticated* bind (RFC 4513 §5.1.2), and many
+   servers answer it with success.
+3. Finds the entry with the service account, **by the object UUID** the user
+   was imported with, through the server's user filter. So a rename or a move
+   in the directory is followed, and an entry the filter no longer matches is
+   refused. That is where a filter excluding disabled accounts takes effect.
+4. Binds as that DN with the password, on a connection of its own. The
+   directory applies its own restrictions: disabled, locked and expired
+   accounts, expired passwords, logon hours. AD's reason (`data 533`, `775`,
+   and so on) is decoded for the log.
+
+A result that is about the user (`49`, `32`, `50`, `53`) is a rejection.
+Anything else (busy, unavailable, `strongerAuthRequired`) is an error. The
+whole exchange is bounded at 20 s.
+
+### Security decisions
+
+- **No fallback.** For these users, local password rows are never consulted,
+  even when the directory is unreachable. Otherwise a password could outlive
+  the directory disabling the account. Creating a local password for them is
+  refused (409, admin and self-service). Old rows are ignored, and the UI marks
+  them safe to delete.
+- **Lockout.** All of this sits behind the one `submit_credential` chokepoint,
+  so the IP block and user lockout checks run before any bind. A rejection
+  counts as a failed attempt like a wrong local password. An *error* (the
+  directory could not answer) does not, so an outage cannot lock everyone out
+  once it ends.
+- **What clients see.** A rejection looks exactly like a wrong local password.
+  An error reaches the client only through `UserFacingReason`: "LDAP server
+  could not check the password", "LDAP connection failed", and so on, with no
+  DN, host or server text. The specific reason goes to the server log.
+- **Remembered approvals.** The stored-credential identity is the entry's UUID.
+  Its fingerprint covers the server, the entry and the directory's
+  `pwdLastSet` / `pwdChangedTime` when readable. Changing the password in the
+  directory therefore ends remembered approvals, as replacing a local password
+  does.
+- **Deleting a server** that signs users in is refused while users are linked
+  to it (409). Users of a vanished server would silently go back to local
+  passwords, and that should be a decision, made by turning the switch off.
+- **`recover-access`** unlinks a directory-authenticated user, because the
+  password it sets would otherwise never be checked. The prompt says so.
+- Certificate verification off is allowed, since it is the operator's call,
+  but the server screen warns that it exposes passwords to anyone on the path.
+
+### API surface
+
+- `LdapServerResponse` / `Create…` / `Update…`: `authenticate_users`.
+- `DELETE /ldap-servers/{id}`: new 409.
+- `POST /users/{id}/credentials/passwords`: new 409.
+- `GET /users/{id}/ldap-link` (`get_user_ldap_link`, any admin, like
+  `get_user`): server id, server name, `password_authentication`. The user
+  screen needs it without `ConfigEdit`.
+- Gateway: `CredentialsState.ldap_password`, and a 409 from
+  `change_my_password`.
+
+The committed schemas were edited by hand (cargo cannot run here) and the
+clients regenerated from them.
+
+### Validation
+
+- **Rust:** formatted, not compiled; there is no MSVC toolchain, and WSL has
+  none either. Unit tests were added but not run. In `warpgate-ldap`: the bind
+  result classification, AD sub-codes, the TLS refusal and the empty-password
+  refusal. In `warpgate-core` (sqlite): no fallback to a local password, no
+  bind without TLS, local passwords kept while the switch is off, and Password
+  offered by the policy without a stored one.
+- **Frontend:** clients regenerated; `svelte-check` 0 errors and 0 warnings;
+  `vite build` passes.
+- **Not run:** anything against a real directory. The e2e suite has no LDAP
+  server, and its LDAP endpoints short-circuit under `WARPGATE_UNDER_TEST`.

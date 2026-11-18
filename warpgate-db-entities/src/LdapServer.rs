@@ -28,6 +28,10 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub ssh_key_attribute: String,
     pub uuid_attribute: String,
+    /// Linked users sign in with their directory password, checked by
+    /// binding to this server; their local password credentials are not
+    /// consulted. See [`crate::User::Model::ldap_password_server`].
+    pub authenticate_users: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

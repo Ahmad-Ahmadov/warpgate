@@ -544,6 +544,12 @@ ADMIN_API_TEST_CASES: list[AdminApiTestCase] = [
         expected_statuses={200},
     ),
     AdminApiTestCase(
+        id="get_user_ldap_link",
+        permission=None,
+        call=lambda api, r: api.get_user_ldap_link_with_http_info(r["user_id"]),
+        expected_statuses={200},
+    ),
+    AdminApiTestCase(
         id="unlink_user_from_ldap",
         permission="users_edit",
         call=lambda api, r: api.unlink_user_from_ldap_with_http_info(r["user_id"]),

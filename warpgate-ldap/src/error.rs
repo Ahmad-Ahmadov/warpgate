@@ -37,4 +37,15 @@ pub enum LdapError {
 
     #[error("LDAP lookup matched {count} entries, expected at most one: {filter}")]
     AmbiguousMatch { filter: String, count: usize },
+
+    /// A user's password is only ever sent over LDAPS or StartTLS.
+    #[error(
+        "refusing to send a user's password over an unencrypted LDAP connection; set the server's TLS mode to Preferred or Required"
+    )]
+    InsecureTransport,
+
+    /// The directory could not answer a user's bind — a server-side or
+    /// configuration problem rather than a verdict on the password.
+    #[error("LDAP bind failed with result code {result_code}: {text}")]
+    BindFailed { result_code: u32, text: String },
 }

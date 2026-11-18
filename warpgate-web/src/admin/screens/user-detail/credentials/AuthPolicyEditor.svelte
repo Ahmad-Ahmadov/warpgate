@@ -62,12 +62,15 @@
     interface Props {
         value: UserRequireCredentialsPolicy
         existingCredentials?: ExistingCredential[]
+        /** The user has a password their LDAP server checks, none stored. */
+        passwordFromLdap?: boolean
         globalParameters?: ParameterValues
     }
 
     let {
         value = $bindable(),
         existingCredentials,
+        passwordFromLdap = false,
         globalParameters,
     }: Props = $props()
 
@@ -145,6 +148,10 @@
             )
             // In-browser approval needs no stored credential.
             s.add(CredentialKind.WebUserApproval)
+            // Nor does a password the user's LDAP server checks.
+            if (passwordFromLdap) {
+                s.add(CredentialKind.Password)
+            }
             return s
         },
     )

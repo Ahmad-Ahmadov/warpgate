@@ -107,6 +107,16 @@ fn extract_ldap_user(search_entry: &SearchEntry, config: &LdapConfig) -> Result<
         .cloned()
         .unwrap_or_default();
 
+    // Only present when the search asked for it (`*` and `+`, as single-user
+    // lookups do), and readable by the service account.
+    let password_last_set = PASSWORD_LAST_SET_ATTRIBUTES.iter().find_map(|attr| {
+        search_entry
+            .attrs
+            .get(*attr)
+            .and_then(|v| v.first())
+            .cloned()
+    });
+
     Ok(LdapUser {
         username,
         email,
@@ -114,8 +124,13 @@ fn extract_ldap_user(search_entry: &SearchEntry, config: &LdapConfig) -> Result<
         dn,
         object_uuid,
         ssh_public_keys,
+        password_last_set,
     })
 }
+
+/// Active Directory's, then the OpenLDAP password policy overlay's (an
+/// operational attribute, hence the `+` in single-user searches).
+const PASSWORD_LAST_SET_ATTRIBUTES: [&str; 2] = ["pwdLastSet", "pwdChangedTime"];
 
 pub async fn list_users(config: &LdapConfig) -> Result<Vec<LdapUser>> {
     let mut ldap = connect(config).await?;
@@ -247,7 +262,15 @@ pub async fn find_user_by_uuid(
     object_uuid: &Uuid,
 ) -> Result<Option<LdapUser>> {
     let mut ldap = connect(config).await?;
+    find_user_by_uuid_on(&mut ldap, config, object_uuid).await
+}
 
+/// [`find_user_by_uuid`] on a connection the caller has already bound.
+pub(crate) async fn find_user_by_uuid_on(
+    ldap: &mut ldap3::Ldap,
+    config: &LdapConfig,
+    object_uuid: &Uuid,
+) -> Result<Option<LdapUser>> {
     // Convert UUID to different formats for searching
     // OpenLDAP uses standard UUID string format (with dashes)
     let uuid_str = object_uuid.to_string();
@@ -270,7 +293,7 @@ pub async fn find_user_by_uuid(
         // we try to query with multiple values OR'ed
 
         if let Some(user) = find_user_by_filter(
-            &mut ldap,
+            ldap,
             config,
             &format!("(&{user_filter}({custom_uuid_attr}={uuid_str}))"),
         )
@@ -281,7 +304,7 @@ pub async fn find_user_by_uuid(
 
         // Active Directory
         if let Some(user) = find_user_by_filter(
-            &mut ldap,
+            ldap,
             config,
             &format!("(&{user_filter}({custom_uuid_attr}={binary_guid_str}))"),
         )
@@ -291,7 +314,7 @@ pub async fn find_user_by_uuid(
         }
     } else {
         if let Some(user) = find_user_by_filter(
-            &mut ldap,
+            ldap,
             config,
             // OpenLDAP style
             &format!("(&{user_filter}(entryUUID={uuid_str}))"),
@@ -302,7 +325,7 @@ pub async fn find_user_by_uuid(
         }
 
         if let Some(user) = find_user_by_filter(
-            &mut ldap,
+            ldap,
             config,
             &format!("(&{user_filter}(objectGUID={uuid_str}))"),
         )
@@ -312,7 +335,7 @@ pub async fn find_user_by_uuid(
         }
 
         if let Some(user) = find_user_by_filter(
-            &mut ldap,
+            ldap,
             config,
             // Active Directory
             &format!("(&{user_filter}(objectGUID={binary_guid_str}))"),

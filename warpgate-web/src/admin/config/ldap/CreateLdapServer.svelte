@@ -12,6 +12,7 @@
     import Callout from 'ui/Callout.svelte'
     import Input from 'ui/Input.svelte'
     import { defaultLdapPortForTlsMode, testLdapConnection } from './common'
+    import LdapAuthenticationField from './LdapAuthenticationField.svelte'
     import LdapConnectionFields from './LdapConnectionFields.svelte'
 
     let name = $state('')
@@ -22,6 +23,10 @@
     let userFilter = $state('(objectClass=person)')
     let enabled = $state(true)
     let autoLinkSsoUsers = $state(false)
+    // On for a new server: signing in with the directory password is what
+    // importing users is for. The API's own default stays off for clients
+    // that predate the setting.
+    let authenticateUsers = $state(true)
     let description = $state('')
     let usernameAttribute = $state(LdapUsernameAttribute.Cn)
     let sshKeyAttribute = $state('sshPublicKey')
@@ -80,6 +85,7 @@
                     usernameAttribute,
                     sshKeyAttribute,
                     uuidAttribute,
+                    authenticateUsers,
                 },
             })
 
@@ -114,6 +120,8 @@
             bind:sshKeyAttribute
             bind:uuidAttribute
         />
+
+        <LdapAuthenticationField bind:authenticateUsers {tls} />
 
         {#if testResult}
             <div

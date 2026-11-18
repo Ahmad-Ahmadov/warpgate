@@ -128,6 +128,96 @@ async fn reconcile_ldap_ssh_keys(
     })
 }
 
+/// Checks a password for a user whose LDAP server authenticates them, by
+/// binding to the directory as the user. Nothing about the password is kept.
+///
+/// `Ok(None)` is a refusal the user caused — a wrong password, an account the
+/// directory has disabled, locked or expired, an entry the user filter no
+/// longer matches — and counts towards login protection like any wrong
+/// password. `Err` is the directory being unable to answer (unreachable, TLS
+/// failure, service account refused, server disabled here), which does not:
+/// an outage must not lock everyone out once it ends. Either way the client
+/// learns only that the login did not succeed, plus a generic reason for an
+/// `Err`; the specific reason goes to the log.
+async fn validate_ldap_password(
+    user_model: &entities::User::Model,
+    ldap_server: &entities::LdapServer::Model,
+    password: &str,
+) -> Result<Option<StoredCredential>, WarpgateError> {
+    if !ldap_server.enabled {
+        warn!(
+            username = %user_model.username,
+            ldap_server = %ldap_server.name,
+            "Password sign-in refused: the user's LDAP server is disabled"
+        );
+        return Err(warpgate_ldap::LdapError::InvalidConfiguration(
+            "the LDAP server is disabled".into(),
+        )
+        .into());
+    }
+
+    let Some(object_uuid) = user_model.ldap_object_uuid else {
+        error!(
+            username = %user_model.username,
+            ldap_server = %ldap_server.name,
+            "Password sign-in refused: the user is linked to LDAP without a directory entry UUID; unlink and link them again"
+        );
+        return Ok(None);
+    };
+
+    let ldap_config = warpgate_ldap::LdapConfig::try_from(ldap_server)?;
+    match warpgate_ldap::authenticate_user(&ldap_config, &object_uuid, password).await {
+        Ok(warpgate_ldap::LdapAuthOutcome::Authenticated(ldap_user)) => {
+            info!(
+                username = %user_model.username,
+                ldap_server = %ldap_server.name,
+                "Password verified by the LDAP server"
+            );
+            Ok(Some(StoredCredential::new(
+                StoredCredentialKind::Password,
+                object_uuid,
+                StoredCredentialFingerprint::of_stored_verifier(&ldap_password_verifier(
+                    ldap_server.id,
+                    &ldap_user,
+                )),
+            )))
+        }
+        Ok(warpgate_ldap::LdapAuthOutcome::Rejected(reason)) => {
+            warn!(
+                username = %user_model.username,
+                ldap_server = %ldap_server.name,
+                %reason,
+                "The LDAP server refused the password"
+            );
+            Ok(None)
+        }
+        Err(error) => {
+            error!(
+                username = %user_model.username,
+                ldap_server = %ldap_server.name,
+                %error,
+                "Could not check the password with the LDAP server"
+            );
+            Err(error.into())
+        }
+    }
+}
+
+/// What identifies a directory password in remembered approvals, standing in
+/// for the stored hash a local password is fingerprinted by: the server and
+/// entry it belongs to, and the directory's record of its last change, so
+/// changing the password in the directory ends remembered approvals as
+/// replacing a local one does. Holds nothing derived from the password.
+fn ldap_password_verifier(ldap_server_id: Uuid, ldap_user: &warpgate_ldap::LdapUser) -> Vec<u8> {
+    let mut verifier = b"ldap-bind\0".to_vec();
+    verifier.extend_from_slice(ldap_server_id.as_bytes());
+    verifier.extend_from_slice(ldap_user.object_uuid.as_bytes());
+    if let Some(changed) = &ldap_user.password_last_set {
+        verifier.extend_from_slice(changed.as_bytes());
+    }
+    verifier
+}
+
 impl DatabaseConfigProvider {
     pub fn new(db: &DatabaseConnection) -> Self {
         Self { db: db.clone() }
@@ -416,6 +506,9 @@ impl ConfigProvider for DatabaseConfigProvider {
             return Ok(None);
         };
 
+        // Such a user has a password without Warpgate storing one.
+        let password_from_ldap = user_model.ldap_password_server(db).await?.is_some();
+
         let user = user_model.load_details(db).await?;
 
         let mut available_credential_types = user
@@ -424,6 +517,9 @@ impl ConfigProvider for DatabaseConfigProvider {
             .map(UserAuthCredential::kind)
             .collect::<HashSet<_>>();
         available_credential_types.insert(CredentialKind::WebUserApproval);
+        if password_from_ldap {
+            available_credential_types.insert(CredentialKind::Password);
+        }
 
         let supported_credential_types = supported_credential_types
             .iter()
@@ -633,30 +729,46 @@ impl ConfigProvider for DatabaseConfigProvider {
                     })
             }
 
-            AuthCredential::Password(client_password) => user_model
-                .find_related(entities::PasswordCredential::Entity)
-                .order_by_asc(entities::PasswordCredential::Column::Id)
-                .all(db)
-                .await?
-                .into_iter()
-                .find(|c| {
-                    verify_password_hash(client_password.expose_secret(), &c.argon_hash)
-                        .unwrap_or_else(|e| {
-                            error!(
-                                username = &user_model.username[..],
-                                "Error verifying password hash: {e}"
-                            );
-                            false
-                        })
-                })
-                .map(|c| {
-                    StoredCredential::new(
-                        StoredCredentialKind::Password,
-                        c.id,
-                        // Fingerprint the hash, not the password
-                        StoredCredentialFingerprint::of_stored_verifier(c.argon_hash.as_bytes()),
+            // A user whose LDAP server authenticates them has their password
+            // checked there and only there: falling back to a local password
+            // would let one outlive the directory disabling the account.
+            AuthCredential::Password(client_password) => {
+                if let Some(ldap_server) = user_model.ldap_password_server(db).await? {
+                    validate_ldap_password(
+                        &user_model,
+                        &ldap_server,
+                        client_password.expose_secret(),
                     )
-                }),
+                    .await?
+                } else {
+                    user_model
+                        .find_related(entities::PasswordCredential::Entity)
+                        .order_by_asc(entities::PasswordCredential::Column::Id)
+                        .all(db)
+                        .await?
+                        .into_iter()
+                        .find(|c| {
+                            verify_password_hash(client_password.expose_secret(), &c.argon_hash)
+                                .unwrap_or_else(|e| {
+                                    error!(
+                                        username = &user_model.username[..],
+                                        "Error verifying password hash: {e}"
+                                    );
+                                    false
+                                })
+                        })
+                        .map(|c| {
+                            StoredCredential::new(
+                                StoredCredentialKind::Password,
+                                c.id,
+                                // Fingerprint the hash, not the password
+                                StoredCredentialFingerprint::of_stored_verifier(
+                                    c.argon_hash.as_bytes(),
+                                ),
+                            )
+                        })
+                }
+            }
 
             AuthCredential::Otp(client_otp) => user_model
                 .find_related(entities::OtpCredential::Entity)
@@ -1375,5 +1487,173 @@ mod tests {
                 .unwrap(),
             None,
         );
+    }
+
+    /// An LDAP server row for the tests below. Its host does not resolve:
+    /// every case here must be decided before a connection is attempted.
+    async fn ldap_server(
+        db: &DatabaseConnection,
+        authenticate_users: bool,
+        tls_mode: &str,
+    ) -> Uuid {
+        entities::LdapServer::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            name: Set(format!("directory-{}", Uuid::new_v4())),
+            host: Set("ldap.invalid".to_owned()),
+            port: Set(636),
+            bind_dn: Set(String::new()),
+            bind_password: Set(String::new()),
+            user_filter: Set("(objectClass=person)".to_owned()),
+            base_dns: Set(serde_json::json!(["dc=example,dc=com"])),
+            tls_mode: Set(tls_mode.to_owned()),
+            tls_verify: Set(true),
+            enabled: Set(true),
+            auto_link_sso_users: Set(false),
+            description: Set(String::new()),
+            username_attribute: Set("cn".to_owned()),
+            ssh_key_attribute: Set("sshPublicKey".to_owned()),
+            uuid_attribute: Set(String::new()),
+            authenticate_users: Set(authenticate_users),
+        }
+        .insert(db)
+        .await
+        .unwrap()
+        .id
+    }
+
+    async fn link_to_ldap(db: &DatabaseConnection, username: &str, server_id: Uuid) {
+        let user = entities::User::Entity::find()
+            .filter(entities::User::Entity::username_eq_ci(username))
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap();
+        entities::User::ActiveModel {
+            id: Set(user.id),
+            ldap_server_id: Set(Some(server_id)),
+            ldap_object_uuid: Set(Some(Uuid::new_v4())),
+            ..Default::default()
+        }
+        .update(db)
+        .await
+        .unwrap();
+    }
+
+    async fn migrated_db() -> DatabaseConnection {
+        set_config_migration_values(ConfigMigrationValues::default());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        migrate_database(&db).await.unwrap();
+        db
+    }
+
+    /// The local password a directory-authenticated user may still have
+    /// from before must not get them in: the directory could have disabled
+    /// the account, and only a bind would notice.
+    #[tokio::test]
+    async fn a_directory_authenticated_user_never_falls_back_to_a_local_password() {
+        let db = migrated_db().await;
+        user_with_password(&db, "alice", "").await;
+        let server_id = ldap_server(&db, true, "required").await;
+        link_to_ldap(&db, "alice", server_id).await;
+
+        let provider = DatabaseConfigProvider::new(&db);
+        // Matches the stored local hash, and is refused before any bind:
+        // an empty password would make the bind an unauthenticated one.
+        assert_eq!(
+            provider
+                .validate_credential("alice", &AuthCredential::Password(String::new().into()))
+                .await
+                .unwrap(),
+            None,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_directory_password_is_never_sent_without_tls() {
+        let db = migrated_db().await;
+        user_with_password(&db, "alice", "local-password").await;
+        let server_id = ldap_server(&db, true, "disabled").await;
+        link_to_ldap(&db, "alice", server_id).await;
+
+        let provider = DatabaseConfigProvider::new(&db);
+        let result = provider
+            .validate_credential(
+                "alice",
+                &AuthCredential::Password("local-password".to_string().into()),
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(WarpgateError::Ldap(
+                    warpgate_ldap::LdapError::InsecureTransport
+                ))
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// Linking alone changes nothing until the server is set to
+    /// authenticate its users, so upgrading keeps everyone's login.
+    #[tokio::test]
+    async fn a_linked_user_keeps_local_passwords_until_the_server_authenticates() {
+        let db = migrated_db().await;
+        user_with_password(&db, "alice", "local-password").await;
+        let server_id = ldap_server(&db, false, "required").await;
+        link_to_ldap(&db, "alice", server_id).await;
+
+        let provider = DatabaseConfigProvider::new(&db);
+        assert!(
+            provider
+                .validate_credential(
+                    "alice",
+                    &AuthCredential::Password("local-password".to_string().into()),
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_directory_authenticated_user_is_asked_for_a_password() {
+        let db = migrated_db().await;
+        for username in ["alice", "bob"] {
+            entities::User::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                username: Set(username.to_owned()),
+                description: Set(String::new()),
+                credential_policy: Set(serde_json::json!(null)),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        let server_id = ldap_server(&db, true, "required").await;
+        link_to_ldap(&db, "alice", server_id).await;
+
+        let provider = DatabaseConfigProvider::new(&db);
+        let needed = |username: &'static str| {
+            let provider = &provider;
+            async move {
+                let policy = provider
+                    .get_credential_policy(
+                        username,
+                        &[CredentialKind::Password, CredentialKind::WebUserApproval],
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                match policy.is_sufficient(Protocol::Ssh, &HashSet::new()) {
+                    warpgate_common::auth::CredentialPolicyResponse::Need(kinds) => kinds,
+                    warpgate_common::auth::CredentialPolicyResponse::Ok => HashSet::new(),
+                }
+            }
+        };
+
+        // No password is stored for either of them.
+        assert!(needed("alice").await.contains(&CredentialKind::Password));
+        assert!(!needed("bob").await.contains(&CredentialKind::Password));
     }
 }

@@ -51,18 +51,34 @@ pub async fn command(params: &GlobalParams, username: Option<&String>) -> Result
         }
     };
 
+    // A local password is never checked for a user whose LDAP server signs
+    // them in, and recovering access is often needed precisely because that
+    // server is unreachable — so such a user is unlinked from it.
+    let ldap_server = match User::Entity::find_by_id(user.id).one(db).await? {
+        Some(model) => model.ldap_password_server(db).await?,
+        None => None,
+    };
+
     let password = Secret::new(
         dialoguer::Password::with_theme(&theme)
             .with_prompt(format!("New password for {}", user.username))
             .interact()?,
     );
 
+    let prompt = match &ldap_server {
+        Some(server) => format!(
+            "This tool will add a new password for the user, set their HTTP auth policy to only require a password, and unlink them from the LDAP server {} that signs them in now. Continue?",
+            server.name
+        ),
+        None => "This tool will add a new password for the user and set their HTTP auth policy to only require a password. Continue?".to_owned(),
+    };
     if !dialoguer::Confirm::with_theme(&theme)
-            .default(true)
-            .with_prompt("This tool will add a new password for the user and set their HTTP auth policy to only require a password. Continue?")
-            .interact()? {
-                std::process::exit(0);
-            }
+        .default(true)
+        .with_prompt(prompt)
+        .interact()?
+    {
+        std::process::exit(0);
+    }
 
     PasswordCredential::ActiveModel {
         user_id: Set(user.id),
@@ -76,13 +92,23 @@ pub async fn command(params: &GlobalParams, username: Option<&String>) -> Result
         .get_or_insert_with(Default::default)
         .http = Some(vec![CredentialKind::Password]);
 
-    User::ActiveModel {
+    let mut update = User::ActiveModel {
         id: Set(user.id),
         credential_policy: Set(serde_json::to_value(Some(&user.credential_policy))?),
         ..Default::default()
+    };
+    if ldap_server.is_some() {
+        update.ldap_server_id = Set(None);
+        update.ldap_object_uuid = Set(None);
     }
-    .update(db)
-    .await?;
+    update.update(db).await?;
+
+    if let Some(server) = &ldap_server {
+        info!(
+            "Unlinked {} from the LDAP server {}; link them again from the admin UI once it is reachable",
+            user.username, server.name
+        );
+    }
 
     info!("All done. You can now log in");
 

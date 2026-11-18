@@ -618,6 +618,16 @@
               }
             }
           },
+          "409": {
+            "description": "The account's password belongs to the directory.",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "422": {
             "description": "",
             "content": {
@@ -1861,6 +1871,7 @@
           "sso",
           "credential_policy",
           "ldap_linked",
+          "ldap_password",
           "password_policy"
         ],
         "properties": {
@@ -1896,6 +1907,10 @@
           },
           "ldap_linked": {
             "type": "boolean"
+          },
+          "ldap_password": {
+            "type": "boolean",
+            "description": "The password is the directory's, checked by binding to the LDAP\nserver, and is changed there."
           },
           "password_policy": {
             "$ref": "#/components/schemas/PasswordPolicy"

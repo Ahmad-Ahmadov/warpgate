@@ -96,6 +96,12 @@
         username: string
         credentialPolicy: UserRequireCredentialsPolicy
         ldapLinked?: boolean
+        /**
+         * Name of the LDAP server that checks this user's password, when one
+         * does. The server then refuses to store a local password for them,
+         * and ignores any they still have.
+         */
+        ldapPasswordServer?: string | null
     }
 
     let {
@@ -103,6 +109,7 @@
         username,
         credentialPolicy = $bindable(),
         ldapLinked = false,
+        ldapPasswordServer = null,
     }: Props = $props()
 
     let credentials: ExistingCredential[] = $state([])
@@ -386,9 +393,20 @@
     <h3>Credentials</h3>
     {#if canEdit}
         <div class="actions">
-            <Button size="compact" onclick={() => (creatingPassword = true)}>
-                Add password
-            </Button>
+            {#if ldapPasswordServer !== null}
+                <Tooltip
+                    text="This user signs in with their LDAP password; Warpgate stores none"
+                >
+                    <Button size="compact" disabled>Add password</Button>
+                </Tooltip>
+            {:else}
+                <Button
+                    size="compact"
+                    onclick={() => (creatingPassword = true)}
+                >
+                    Add password
+                </Button>
+            {/if}
             <Button
                 size="compact"
                 onclick={() => (editingCertificateCredential = true)}
@@ -435,7 +453,7 @@
 {/if}
 
 <Loadable promise={loadPromise}>
-    {#if credentials.length === 0}
+    {#if credentials.length === 0 && ldapPasswordServer === null}
         <EmptyState
             size="compact"
             title="No credentials"
@@ -443,11 +461,28 @@
         />
     {:else}
         <ul class="credential-list">
+            {#if ldapPasswordServer !== null}
+                <li>
+                    <div class="cred-main">
+                        <span class="cred-label">LDAP password</span>
+                        <span class="cred-detail">
+                            Checked by {ldapPasswordServer} at each login; not
+                            stored in Warpgate. Change it in the directory.
+                        </span>
+                    </div>
+                </li>
+            {/if}
             {#each credentials as credential (credential.id)}
                 <li>
                     <div class="cred-main">
                         {#if credential.kind === CredentialKind.Password}
                             <span class="cred-label">Password</span>
+                            {#if ldapPasswordServer !== null}
+                                <span class="cred-detail">
+                                    Not used: this user signs in with their
+                                    LDAP password. Safe to delete.
+                                </span>
+                            {/if}
                         {:else if credential.kind === CredentialKind.PublicKey}
                             <span class="cred-label">{credential.label}</span>
                             <span class="cred-detail wg-mono">
@@ -531,6 +566,7 @@
     <AuthPolicyEditor
         bind:value={credentialPolicy}
         existingCredentials={credentials}
+        passwordFromLdap={ldapPasswordServer !== null}
         {globalParameters}
     />
 </Loadable>

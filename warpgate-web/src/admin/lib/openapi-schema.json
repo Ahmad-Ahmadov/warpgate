@@ -2333,6 +2333,47 @@
         "operationId": "delete_user"
       }
     },
+    "/users/{id}/ldap-link": {
+      "get": {
+        "parameters": [
+          {
+            "name": "id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserLdapLink"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "get_user_ldap_link"
+      }
+    },
     "/users/{id}/ldap-link/unlink": {
       "post": {
         "parameters": [
@@ -2913,6 +2954,16 @@
           },
           "404": {
             "description": ""
+          },
+          "409": {
+            "description": "The user signs in with their directory password.",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "422": {
             "description": "",
@@ -3796,6 +3847,16 @@
           },
           "404": {
             "description": ""
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -5607,6 +5668,11 @@
           "uuid_attribute": {
             "type": "string",
             "default": ""
+          },
+          "authenticate_users": {
+            "type": "boolean",
+            "description": "Off unless asked for, so a client that predates the setting creates\nthe server it always did.",
+            "default": false
           }
         }
       },
@@ -6173,7 +6239,8 @@
           "description",
           "username_attribute",
           "ssh_key_attribute",
-          "uuid_attribute"
+          "uuid_attribute",
+          "authenticate_users"
         ],
         "properties": {
           "id": {
@@ -6225,6 +6292,10 @@
           },
           "uuid_attribute": {
             "type": "string"
+          },
+          "authenticate_users": {
+            "type": "boolean",
+            "description": "Linked users sign in with their directory password, checked by\nbinding to this server. Warpgate stores no password for them."
           }
         }
       },
@@ -9004,6 +9075,10 @@
           },
           "uuid_attribute": {
             "type": "string"
+          },
+          "authenticate_users": {
+            "type": "boolean",
+            "description": "Left as it is when omitted, so a client that predates the setting\ncannot turn it off by saving."
           }
         }
       },
@@ -9098,6 +9173,29 @@
             "items": {
               "type": "string"
             }
+          }
+        }
+      },
+      "UserLdapLink": {
+        "type": "object",
+        "title": "UserLdapLink",
+        "description": "How a user is tied to an LDAP server, for screens that may not read the\nserver itself (that needs `config_edit`).",
+        "required": [
+          "password_authentication"
+        ],
+        "properties": {
+          "server_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Absent when the user is not linked."
+          },
+          "server_name": {
+            "type": "string",
+            "description": "Absent when not linked, or when the linked server no longer exists."
+          },
+          "password_authentication": {
+            "type": "boolean",
+            "description": "The user's password is checked by binding to the server, and\nWarpgate stores none for them."
           }
         }
       },

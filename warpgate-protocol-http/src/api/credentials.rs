@@ -59,6 +59,9 @@ struct ChangePasswordRequest {
 enum ChangePasswordResponse {
     #[oai(status = 201)]
     Done(Json<PasswordState>),
+    /// The account's password belongs to the directory.
+    #[oai(status = 409)]
+    Conflict(Json<String>),
     #[oai(status = 422)]
     PolicyViolation(Json<Vec<PasswordPolicyViolation>>),
 }
@@ -72,6 +75,9 @@ pub struct CredentialsState {
     sso: Vec<ExistingSsoCredential>,
     credential_policy: UserRequireCredentialsPolicy,
     ldap_linked: bool,
+    /// The password is the directory's, checked by binding to the LDAP
+    /// server, and is changed there.
+    ldap_password: bool,
     password_policy: PasswordPolicy,
 }
 
@@ -270,6 +276,7 @@ impl Api {
             .await?;
 
         let parameters = ctx.parameters().await?;
+        let ldap_password = user.ldap_password_server(db).await?.is_some();
 
         Ok(CredentialsStateResponse::Ok(Json(CredentialsState {
             password: match password_creds.len() {
@@ -283,6 +290,7 @@ impl Api {
             sso: sso_creds.into_iter().map(Into::into).collect(),
             credential_policy: user_cfg.credential_policy.unwrap_or_default(),
             ldap_linked: user.ldap_server_id.is_some(),
+            ldap_password,
             password_policy: parameters.password_policy(),
         })))
     }
@@ -300,6 +308,15 @@ impl Api {
     ) -> Result<ChangePasswordResponse, WarpgateError> {
         let db = &ctx.services().db;
         let user = &ctx.user;
+
+        // Warpgate would never check it, and it would hold a hash of what is
+        // likely the user's directory password.
+        if user.ldap_password_server(db).await?.is_some() {
+            return Ok(ChangePasswordResponse::Conflict(Json(
+                "Your password is managed by your organization's directory. Change it there."
+                    .into(),
+            )));
+        }
 
         let parameters = ctx.parameters().await?;
         let policy = parameters.password_policy();

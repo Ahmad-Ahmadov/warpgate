@@ -2,7 +2,8 @@ use poem_openapi::param::{Path, Query};
 use poem_openapi::payload::Json;
 use poem_openapi::{ApiResponse, Object, OpenApi};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, ModelTrait, QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, EntityTrait, ModelTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, Set,
 };
 use uuid::Uuid;
 use warpgate_common::{AdminPermission, Secret, WarpgateError};
@@ -107,6 +108,9 @@ struct LdapServerResponse {
     username_attribute: LdapUsernameAttribute,
     ssh_key_attribute: String,
     uuid_attribute: String,
+    /// Linked users sign in with their directory password, checked by
+    /// binding to this server. Warpgate stores no password for them.
+    authenticate_users: bool,
 }
 
 impl From<LdapServer::Model> for LdapServerResponse {
@@ -132,6 +136,7 @@ impl From<LdapServer::Model> for LdapServerResponse {
                 .unwrap_or(LdapUsernameAttribute::Cn),
             ssh_key_attribute: model.ssh_key_attribute,
             uuid_attribute: model.uuid_attribute,
+            authenticate_users: model.authenticate_users,
         }
     }
 }
@@ -161,6 +166,10 @@ struct CreateLdapServerRequest {
     ssh_key_attribute: String,
     #[oai(default = "default_uuid_attribute")]
     uuid_attribute: String,
+    /// Off unless asked for, so a client that predates the setting creates
+    /// the server it always did.
+    #[oai(default)]
+    authenticate_users: bool,
 }
 
 const fn default_port() -> i32 {
@@ -215,6 +224,24 @@ struct UpdateLdapServerRequest {
     username_attribute: LdapUsernameAttribute,
     ssh_key_attribute: String,
     uuid_attribute: String,
+    /// Left as it is when omitted, so a client that predates the setting
+    /// cannot turn it off by saving.
+    authenticate_users: Option<bool>,
+}
+
+/// Refuses directory sign-in over a connection that would carry passwords
+/// in the clear.
+fn check_authentication_transport(
+    authenticate_users: bool,
+    tls_mode: TlsMode,
+) -> Result<(), String> {
+    if authenticate_users && matches!(tls_mode, TlsMode::Disabled) {
+        return Err(
+            "Signing users in with their directory password needs an encrypted connection. Set TLS to Preferred or Required (LDAPS or StartTLS), or turn directory sign-in off."
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 #[derive(Object)]
@@ -330,6 +357,11 @@ impl ListApi {
             )));
         }
 
+        if let Err(reason) = check_authentication_transport(body.authenticate_users, body.tls_mode)
+        {
+            return Ok(CreateLdapServerResponse::BadRequest(bad_request(reason)));
+        }
+
         let db = &admin.services().db;
 
         // Check if name already exists
@@ -392,6 +424,7 @@ impl ListApi {
             username_attribute: Set(body.username_attribute.attribute_name().into()),
             ssh_key_attribute: Set(body.ssh_key_attribute.clone()),
             uuid_attribute: Set(body.uuid_attribute.clone()),
+            authenticate_users: Set(body.authenticate_users),
         };
 
         let server = values.insert(db).await.map_err(WarpgateError::from)?;
@@ -492,6 +525,9 @@ enum DeleteLdapServerResponse {
 
     #[oai(status = 404)]
     NotFound,
+
+    #[oai(status = 409)]
+    Conflict(Json<String>),
 }
 
 pub struct DetailApi;
@@ -538,7 +574,13 @@ impl DetailApi {
             return Ok(UpdateLdapServerResponse::NotFound);
         };
 
+        let authenticate_users = body.authenticate_users.unwrap_or(server.authenticate_users);
+        if let Err(reason) = check_authentication_transport(authenticate_users, body.tls_mode) {
+            return Ok(UpdateLdapServerResponse::BadRequest(bad_request(reason)));
+        }
+
         let mut model: LdapServer::ActiveModel = server.into();
+        model.authenticate_users = Set(authenticate_users);
 
         // Update fields
         model.name = Set(body.name.clone());
@@ -602,6 +644,21 @@ impl DetailApi {
         let Some(server) = LdapServer::Entity::find_by_id(id.0).one(db).await? else {
             return Ok(DeleteLdapServerResponse::NotFound);
         };
+
+        // Users linked to a server that no longer exists go back to local
+        // passwords. That is a decision to make by turning directory sign-in
+        // off, not a side effect of deleting the server.
+        if server.authenticate_users {
+            let linked = warpgate_db_entities::User::Entity::find()
+                .filter(warpgate_db_entities::User::Column::LdapServerId.eq(server.id))
+                .count(db)
+                .await?;
+            if linked > 0 {
+                return Ok(DeleteLdapServerResponse::Conflict(Json(format!(
+                    "{linked} linked user(s) sign in with their password from this server. Turn off directory sign-in first, or unlink them."
+                ))));
+            }
+        }
 
         server.delete(db).await.map_err(WarpgateError::from)?;
 

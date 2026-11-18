@@ -222,6 +222,28 @@ enum AutoLinkUserToLdapResponse {
     BadRequest(Json<String>),
 }
 
+/// How a user is tied to an LDAP server, for screens that may not read the
+/// server itself (that needs `config_edit`).
+#[derive(Object)]
+struct UserLdapLink {
+    /// Absent when the user is not linked.
+    server_id: Option<Uuid>,
+    /// Absent when not linked, or when the linked server no longer exists.
+    server_name: Option<String>,
+    /// The user's password is checked by binding to the server, and
+    /// Warpgate stores none for them.
+    password_authentication: bool,
+}
+
+#[derive(ApiResponse)]
+enum GetUserLdapLinkResponse {
+    #[oai(status = 200)]
+    Ok(Json<UserLdapLink>),
+
+    #[oai(status = 404)]
+    NotFound,
+}
+
 pub struct DetailApi;
 
 #[OpenApi]
@@ -239,6 +261,38 @@ impl DetailApi {
         };
 
         Ok(GetUserResponse::Ok(Json(user.try_into()?)))
+    }
+
+    #[oai(
+        path = "/users/:id/ldap-link",
+        method = "get",
+        operation_id = "get_user_ldap_link"
+    )]
+    async fn api_get_user_ldap_link(
+        &self,
+        admin: AdminContext,
+        id: Path<Uuid>,
+    ) -> Result<GetUserLdapLinkResponse, WarpgateError> {
+        use warpgate_db_entities::LdapServer;
+
+        // Readable by any admin, as the user itself is.
+        let db = &admin.services().db;
+
+        let Some(user) = User::Entity::find_by_id(id.0).one(db).await? else {
+            return Ok(GetUserLdapLinkResponse::NotFound);
+        };
+
+        let server = match user.ldap_server_id {
+            Some(server_id) => LdapServer::Entity::find_by_id(server_id).one(db).await?,
+            None => None,
+        };
+
+        Ok(GetUserLdapLinkResponse::Ok(Json(UserLdapLink {
+            server_id: user.ldap_server_id,
+            server_name: server.as_ref().map(|s| s.name.clone()),
+            // As `User::Model::ldap_password_server` decides it.
+            password_authentication: server.is_some_and(|s| s.authenticate_users),
+        })))
     }
 
     #[oai(

@@ -40,6 +40,9 @@ enum CreatePasswordCredentialResponse {
     Created(Json<ExistingPasswordCredential>),
     #[oai(status = 404)]
     NotFound,
+    /// The user signs in with their directory password.
+    #[oai(status = 409)]
+    Conflict(Json<String>),
     #[oai(status = 422)]
     PolicyViolation(Json<Vec<PasswordPolicyViolation>>),
 }
@@ -88,6 +91,19 @@ impl ListApi {
 
         let db = &admin.services().db;
 
+        let Some(user) = User::Entity::find_by_id(*user_id).one(db).await? else {
+            return Ok(CreatePasswordCredentialResponse::NotFound);
+        };
+
+        // It would never be checked, and a directory password typed in here
+        // would be one Warpgate then holds a hash of.
+        if let Some(server) = user.ldap_password_server(db).await? {
+            return Ok(CreatePasswordCredentialResponse::Conflict(Json(format!(
+                "{} signs in with their password from the LDAP server {}; Warpgate does not store a password for them.",
+                user.username, server.name
+            ))));
+        }
+
         let parameters = admin.parameters().await?;
         let policy = parameters.password_policy();
         let violations = validate_password(body.password.expose_secret(), &policy);
@@ -107,10 +123,6 @@ impl ListApi {
         .insert(db)
         .await
         .map_err(WarpgateError::from)?;
-
-        let Some(user) = User::Entity::find_by_id(*user_id).one(db).await? else {
-            return Ok(CreatePasswordCredentialResponse::NotFound);
-        };
 
         AuditEvent::CredentialCreated {
             credential_type: "password".to_string(),

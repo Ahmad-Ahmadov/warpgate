@@ -43,6 +43,7 @@
         api,
         type Role,
         type User,
+        type UserLdapLink,
         type UserRoleAssignmentResponse,
     } from 'admin/lib/api'
     import { adminPermissions } from 'admin/lib/store'
@@ -77,6 +78,19 @@
 
     let error: string | null = $state(null)
     let user: User | undefined = $state()
+    let ldapLink = $state<UserLdapLink | null>(null)
+
+    // The server whose bind checks this user's password, or null when a
+    // local password is what they sign in with.
+    const ldapPasswordServer = $derived(
+        ldapLink?.passwordAuthentication
+            ? (ldapLink.serverName ?? 'the LDAP server')
+            : null,
+    )
+
+    async function loadLdapLink() {
+        ldapLink = await api.getUserLdapLink({ id: params.id })
+    }
     let allRoles: Role[] = $state([])
     let userRoles: UserRoleAssignmentResponse[] = $state([])
     let roleIsAllowed: Record<string, boolean> = $state({})
@@ -137,6 +151,7 @@
         const loaded = await api.getUser({ id: params.id })
         loaded.credentialPolicy ??= {}
         user = loaded
+        await loadLdapLink()
 
         allRoles = await api.getRoles()
         userRoles = await api.getUserRoles(loaded)
@@ -298,6 +313,7 @@
     async function unlinkFromLdap() {
         try {
             user = await api.unlinkUserFromLdap({ id: params.id })
+            await loadLdapLink()
             error = null
         } catch (err) {
             error = await stringifyError(err)
@@ -307,6 +323,7 @@
     async function autoLinkToLdap() {
         try {
             user = await api.autoLinkUserToLdap({ id: params.id })
+            await loadLdapLink()
             error = null
         } catch (err) {
             error = await stringifyError(err)
@@ -337,6 +354,9 @@
                 <div class="head-meta">
                     {#if u.ldapServerId}
                         <Badge tone="primary">LDAP linked</Badge>
+                        {#if ldapPasswordServer !== null}
+                            <Badge>Signs in with LDAP password</Badge>
+                        {/if}
                     {:else}
                         <Badge>Local account</Badge>
                     {/if}
@@ -381,6 +401,7 @@
                                 username={u.username}
                                 bind:credentialPolicy={u.credentialPolicy}
                                 ldapLinked={!!u.ldapServerId}
+                                {ldapPasswordServer}
                             />
                         {/if}
                     </div>

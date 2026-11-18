@@ -7,6 +7,7 @@ use sea_orm::entity::prelude::*;
 use sea_orm::sea_query::{Func, IntoCondition};
 use serde::Serialize;
 use uuid::Uuid;
+use warpgate_common::auth::CredentialKind;
 use warpgate_common::{User, UserDetails, WarpgateError};
 
 use crate::{
@@ -151,6 +152,33 @@ impl Entity {
     }
 }
 
+impl Model {
+    /// The LDAP server that checks this user's password, if one does.
+    ///
+    /// That is the server the user is linked to, when it has
+    /// `authenticate_users` on. Such a user's password is checked only by
+    /// binding to that server — whether or not the server is currently
+    /// enabled or reachable — and never against local password credentials,
+    /// which would let a password the directory has since disabled, locked or
+    /// changed keep working. Warpgate stores no password for these users.
+    ///
+    /// A user linked to a server that no longer exists has nothing to bind
+    /// to and keeps local passwords, as before; deleting a server that
+    /// authenticates its linked users is refused for that reason.
+    pub async fn ldap_password_server<C: ConnectionTrait>(
+        &self,
+        db: &C,
+    ) -> Result<Option<crate::LdapServer::Model>, DbErr> {
+        let Some(server_id) = self.ldap_server_id else {
+            return Ok(None);
+        };
+        Ok(crate::LdapServer::Entity::find_by_id(server_id)
+            .one(db)
+            .await?
+            .filter(|server| server.authenticate_users))
+    }
+}
+
 /// Parse a user's allowed source ranges.
 ///
 /// The column is read on every login (through `list_users`), so one entry that does not parse
@@ -242,12 +270,21 @@ impl Model {
     }
 
     pub async fn require_otp_in_policy(self, db: &DatabaseConnection) -> Result<(), WarpgateError> {
+        let password_from_ldap = self.ldap_password_server(db).await?.is_some();
         let details = self.load_details(db).await?;
+        let mut existing_kinds: Vec<CredentialKind> = details
+            .credentials
+            .iter()
+            .map(warpgate_common::UserAuthCredential::kind)
+            .collect();
+        if password_from_ldap {
+            existing_kinds.push(CredentialKind::Password);
+        }
         let credential_policy = details
             .inner
             .credential_policy
             .unwrap_or_default()
-            .upgrade_to_otp(&details.credentials);
+            .upgrade_to_otp(&existing_kinds);
         ActiveModel {
             id: Set(details.inner.id),
             credential_policy: Set(serde_json::to_value(Some(credential_policy))?),

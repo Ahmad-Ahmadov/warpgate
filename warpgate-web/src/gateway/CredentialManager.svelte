@@ -192,37 +192,48 @@
             </div>
 
             <ul class="creds">
-                <li>
-                    <span class="cred-label">
-                        {#if c.password === PasswordState.Unset}
-                            Your account has no password set
-                        {:else if c.password === PasswordState.Set}
-                            Password set
-                        {:else}
-                            Multiple passwords set
-                        {/if}
-                    </span>
-                    <Button
-                        variant="ghost"
-                        size="compact"
-                        onclick={() => (changingPassword = true)}
-                    >
-                        {#if c.password === PasswordState.Unset}
-                            Set password
-                        {:else if c.password === PasswordState.Set}
-                            Change
-                        {:else}
-                            Reset password
-                        {/if}
-                    </Button>
-                </li>
+                {#if c.ldapPassword}
+                    <!-- Checked by binding to the directory at each login;
+                         Warpgate stores none and refuses to set one. -->
+                    <li>
+                        <span class="cred-label">
+                            You sign in with your directory (LDAP) password.
+                            Change it with your organization's usual tools.
+                        </span>
+                    </li>
+                {:else}
+                    <li>
+                        <span class="cred-label">
+                            {#if c.password === PasswordState.Unset}
+                                Your account has no password set
+                            {:else if c.password === PasswordState.Set}
+                                Password set
+                            {:else}
+                                Multiple passwords set
+                            {/if}
+                        </span>
+                        <Button
+                            variant="ghost"
+                            size="compact"
+                            onclick={() => (changingPassword = true)}
+                        >
+                            {#if c.password === PasswordState.Unset}
+                                Set password
+                            {:else if c.password === PasswordState.Set}
+                                Change
+                            {:else}
+                                Reset password
+                            {/if}
+                        </Button>
+                    </li>
+                {/if}
             </ul>
 
             <!--
               FIXED: was `c.publicKeys.length === 0`, a copy-paste from the
               public-key block. See the file header.
             -->
-            {#if c.password === PasswordState.Unset && Object.values(c.credentialPolicy).some(l => l?.includes(CredentialKind.Password))}
+            {#if !c.ldapPassword && c.password === PasswordState.Unset && Object.values(c.credentialPolicy).some(l => l?.includes(CredentialKind.Password))}
                 <Callout tone="warning" title="You need a password">
                     Your credential policy requires a password for
                     authentication. Without one you will not be able to sign in.
