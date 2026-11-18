@@ -1,4 +1,29 @@
 <script lang="ts">
+    /**
+     * A long form split into `Section`s, with links to each that follow the
+     * section in view.
+     *
+     * The links take one of two shapes, chosen by the width this form gets
+     * rather than the viewport's — a container query, because the sidebar
+     * can be expanded or collapsed:
+     *
+     *   - **strip** (the target screen's 48rem column, laptops): a row of links
+     *     that sticks under the app's top bar. When the links do not fit it
+     *     scrolls sideways inside itself, never the page; the scrollbar is
+     *     hidden, the edges fade to show there is more, and the current
+     *     section is kept in view.
+     *   - **list** (from 56rem, e.g. Parameters on a desktop): a vertical list
+     *     beside the form, sticky under the top bar.
+     *
+     * Both stick at `--wg-topbar-height`, under the top bar. The top bar is
+     * sticky at 0 as well, and the strip used to stick there too and paint
+     * over it.
+     *
+     * `Section` takes its `scroll-margin-top` from
+     * `--wg-section-scroll-offset`, which this component sets for each shape.
+     * The scroll spy reads that same value back, so a section scrolled to is
+     * the section highlighted.
+     */
     import { onMount, type Snippet } from 'svelte'
 
     interface Props {
@@ -8,190 +33,322 @@
 
     const props: Props = $props()
 
-    interface Section {
+    interface SectionEntry {
         id: string
         title: string
-        element: HTMLElement | null
+        element: HTMLElement
     }
 
-    let sections: Section[] = $state([])
+    let sections: SectionEntry[] = $state.raw([])
     let activeSection = $state<string | null>(null)
-    let showSectionLinks = $state(false)
-    let containerElement: HTMLElement | null = $state(null)
-    let tabsElement: HTMLElement | null = $state(null)
+    let contentElement: HTMLElement | null = $state(null)
+    let listElement: HTMLElement | null = $state(null)
+    let fadeStart = $state(false)
+    let fadeEnd = $state(false)
 
-    function updateActiveSectionFromScroll() {
-        if (!containerElement || !tabsElement) {
+    // A click scrolls smoothly past other sections. Until that scroll
+    // settles, the clicked section stays the highlighted one.
+    let pinned = false
+    let pinTimer: ReturnType<typeof setTimeout> | undefined
+    const PIN_SETTLE_MS = 200
+
+    function pinUntilScrollSettles() {
+        pinned = true
+        clearTimeout(pinTimer)
+        pinTimer = setTimeout(() => {
+            pinned = false
+        }, PIN_SETTLE_MS)
+    }
+
+    function prefersReducedMotion(): boolean {
+        return (
+            window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ??
+            false
+        )
+    }
+
+    function updateActiveSection() {
+        const first = sections[0]
+        if (!first) {
             return
         }
 
-        showSectionLinks = tabsElement.getBoundingClientRect().top <= 0
+        // Where a section's top comes to rest when scrolled to: just under the
+        // top bar and, in the strip shape, the strip.
+        const line =
+            Number.parseFloat(
+                getComputedStyle(first.element).scrollMarginTop,
+            ) || 0
 
-        const tabsBottomInViewport = showSectionLinks
-            ? tabsElement.getBoundingClientRect().bottom
-            : 0
-        let closestSection: Section | null = null
-        let closestDistance = Infinity
-
-        sections.forEach(section => {
-            if (!section.element) {
-                return
+        let current = first
+        for (const section of sections) {
+            if (section.element.getBoundingClientRect().top - line > 4) {
+                break
             }
+            current = section
+        }
 
-            const rect = section.element.getBoundingClientRect()
-            // Distance from section top to the bottom of the sticky tabs
-            const distanceFromTabs = rect.top - tabsBottomInViewport
+        // The last sections can be too short to ever reach the line. Once the
+        // page is scrolled to its end, the last of them is the current one.
+        const scroller = document.scrollingElement ?? document.documentElement
+        const atEnd =
+            scroller.scrollTop > 0 &&
+            scroller.scrollTop + window.innerHeight >= scroller.scrollHeight - 2
+        if (atEnd) {
+            current = sections[sections.length - 1] ?? current
+        }
 
-            // Find the section closest to (just below) the sticky tabs
-            if (
-                rect.top < window.innerHeight &&
-                distanceFromTabs >= -100 &&
-                distanceFromTabs < closestDistance
-            ) {
-                closestDistance = distanceFromTabs
-                closestSection = section
-            }
-        })
+        activeSection = current.id
+    }
 
-        // If nothing found, use the last section that has scrolled past the tabs
-        if (!closestSection) {
-            for (let i = sections.length - 1; i >= 0; i--) {
-                const section = sections[i]
-                if (!section) {
-                    continue
-                }
-                if (section.element) {
-                    const rect = section.element.getBoundingClientRect()
-                    if (rect.top < tabsBottomInViewport) {
-                        closestSection = section
-                        break
-                    }
-                }
+    function updateFades() {
+        const list = listElement
+        if (!list) {
+            return
+        }
+        const overflow = list.scrollWidth - list.clientWidth
+        fadeStart = overflow > 1 && list.scrollLeft > 1
+        fadeEnd = overflow > 1 && list.scrollLeft < overflow - 1
+    }
+
+    /** Scrolls the list itself (never the page) to show the current link. */
+    function revealActiveLink() {
+        const list = listElement
+        const link = list?.querySelector<HTMLElement>(
+            '[aria-current="location"]',
+        )
+        if (!list || !link) {
+            return
+        }
+        // Clear of the faded edge.
+        const margin = 32
+        const behavior = prefersReducedMotion() ? 'auto' : 'smooth'
+
+        if (list.scrollWidth > list.clientWidth) {
+            const start = link.offsetLeft - margin
+            const end =
+                link.offsetLeft + link.offsetWidth + margin - list.clientWidth
+            if (list.scrollLeft > start) {
+                list.scrollTo({ left: start, behavior })
+            } else if (list.scrollLeft < end) {
+                list.scrollTo({ left: end, behavior })
             }
         }
 
-        if (closestSection && closestSection.id !== activeSection) {
-            activeSection = closestSection.id
+        if (list.scrollHeight > list.clientHeight) {
+            const start = link.offsetTop - margin
+            const end =
+                link.offsetTop + link.offsetHeight + margin - list.clientHeight
+            if (list.scrollTop > start) {
+                list.scrollTo({ top: start, behavior })
+            } else if (list.scrollTop < end) {
+                list.scrollTo({ top: end, behavior })
+            }
         }
     }
 
+    $effect(() => {
+        if (activeSection) {
+            revealActiveLink()
+        }
+    })
+
     onMount(() => {
-        // Find all section elements
-        const sectionElements = containerElement?.querySelectorAll(
-            '[data-section]',
-        ) as NodeListOf<HTMLElement>
-        if (sectionElements) {
-            sections = Array.from(sectionElements).map(el => ({
-                // biome-ignore lint/style/noNonNullAssertion: x
-                id: el.dataset.section!,
-                // biome-ignore lint/style/noNonNullAssertion: x
-                title: el.dataset.sectionTitle!,
-                element: el,
-            }))
-            const firstSection = sections[0]
-            if (firstSection) {
-                activeSection = firstSection.id
+        sections = Array.from(
+            contentElement?.querySelectorAll<HTMLElement>('[data-section]') ??
+                [],
+        ).map(element => ({
+            id: element.dataset.section ?? '',
+            title: element.dataset.sectionTitle ?? '',
+            element,
+        }))
+        activeSection = sections[0]?.id ?? null
+
+        let frame = 0
+        const schedule = () => {
+            if (frame) {
+                return
             }
+            frame = requestAnimationFrame(() => {
+                frame = 0
+                if (!pinned) {
+                    updateActiveSection()
+                }
+                updateFades()
+            })
         }
 
-        // Scroll event listener for responsive section tracking
-        const handleScroll = () => {
-            updateActiveSectionFromScroll()
+        const onScroll = () => {
+            if (pinned) {
+                pinUntilScrollSettles()
+                return
+            }
+            schedule()
         }
 
-        window.addEventListener('scroll', handleScroll, { passive: true })
-        window.addEventListener('resize', handleScroll)
+        window.addEventListener('scroll', onScroll, { passive: true })
+        // Covers the window, the sidebar collapsing and the switch between
+        // the strip and the list, none of which is a window resize alone.
+        const resizeObserver = new ResizeObserver(schedule)
+        if (contentElement) {
+            resizeObserver.observe(contentElement)
+        }
+        if (listElement) {
+            resizeObserver.observe(listElement)
+        }
 
-        // Initial update
-        updateActiveSectionFromScroll()
+        schedule()
 
         return () => {
-            window.removeEventListener('scroll', handleScroll)
-            window.removeEventListener('resize', handleScroll)
+            window.removeEventListener('scroll', onScroll)
+            resizeObserver.disconnect()
+            cancelAnimationFrame(frame)
+            clearTimeout(pinTimer)
         }
     })
 
     function scrollToSection(sectionId: string) {
-        const headingElement = document.getElementById(`${sectionId}-heading`)
-        if (headingElement) {
-            activeSection = sectionId
-            headingElement.scrollIntoView({
-                behavior: 'smooth',
-                block: 'start',
-            })
+        const section = sections.find(s => s.id === sectionId)
+        if (!section) {
+            return
         }
+        activeSection = sectionId
+        pinUntilScrollSettles()
+        section.element.scrollIntoView({
+            behavior: prefersReducedMotion() ? 'auto' : 'smooth',
+            block: 'start',
+        })
     }
 </script>
 
-<div class="sectioned-form-container {props.class ?? ''}">
-    {#if sections.length > 0}
-        <div
-            class="sectioned-form-tabs-slot {showSectionLinks ? 'is-visible' : 'is-hidden'}"
+<div class="sectioned-form {props.class ?? ''}">
+    <div class="sectioned-form-layout">
+        <nav
+            class="sectioned-form-nav"
+            aria-label="Sections"
+            hidden={sections.length === 0}
         >
-            <nav class="sectioned-form-tabs" bind:this={tabsElement}>
-                <div class="section-tabs">
-                    {#each sections as section (section.id)}
-                        <a
-                            href={`#${section.id}-heading`}
-                            class="section-tab {activeSection === section.id ? 'active' : ''}"
-                            onclick={(event) => {
-                                event.preventDefault()
-                                scrollToSection(section.id)
-                            }}
-                        >
-                            {section.title}
-                        </a>
-                    {/each}
-                </div>
-            </nav>
-        </div>
-    {/if}
+            <div
+                class="section-tabs"
+                class:fade-start={fadeStart}
+                class:fade-end={fadeEnd}
+                bind:this={listElement}
+                onscroll={updateFades}
+            >
+                {#each sections as section (section.id)}
+                    <a
+                        href={`#${section.id}-heading`}
+                        class="section-tab"
+                        class:active={activeSection === section.id}
+                        aria-current={activeSection === section.id
+                            ? 'location'
+                            : undefined}
+                        onclick={event => {
+                            // The app routes on the hash, so the link must
+                            // not reach the address bar.
+                            event.preventDefault()
+                            scrollToSection(section.id)
+                        }}
+                    >
+                        {section.title}
+                    </a>
+                {/each}
+            </div>
+        </nav>
 
-    <!-- Content -->
-    <div class="sectioned-form-content" bind:this={containerElement}>
-        {@render props.children?.()}
+        <div class="sectioned-form-content" bind:this={contentElement}>
+            {@render props.children?.()}
+        </div>
     </div>
 </div>
 
 <style>
-    .sectioned-form-container {
-        display: flex;
-        flex-direction: column;
+    .sectioned-form {
+        container: sectioned-form / inline-size;
     }
 
-    .sectioned-form-tabs-slot {
+    /* ── strip: the default, for narrow forms ─────────────────────────── */
+
+    .sectioned-form-layout {
+        /* The strip: a compact link plus the list's padding and the rule. */
+        --sectioned-form-strip-height: calc(
+            var(--wg-control-height-compact) +
+            2 *
+            var(--wg-space-sm) +
+            var(--wg-border-width)
+        );
+        /* Read by Section's scroll-margin-top and by the scroll spy. */
+        --wg-section-scroll-offset: calc(
+            var(--wg-topbar-height) +
+            var(--sectioned-form-strip-height) +
+            var(--wg-space-lg)
+        );
+
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas:
+            "nav"
+            "content";
+    }
+
+    .sectioned-form-nav {
+        grid-area: nav;
         position: sticky;
-        top: 0;
-        z-index: 10;
-        height: 60px;
-        margin-bottom: -60px;
-        transition: opacity var(--wg-duration-fast) var(--wg-easing);
-    }
-
-    .sectioned-form-tabs-slot.is-hidden {
-        opacity: 0;
-        pointer-events: none;
-    }
-
-    .sectioned-form-tabs-slot.is-visible {
-        opacity: 1;
-        pointer-events: auto;
-    }
-
-    .sectioned-form-tabs {
-        border-bottom: var(--wg-border-width) solid var(--wg-border);
+        top: var(--wg-topbar-height);
+        /* Below the top bar (10) where the two meet, above the form. */
+        z-index: 9;
+        margin-bottom: var(--wg-space-xl);
         background: var(--wg-surface);
-        transition: opacity var(--wg-duration-fast) var(--wg-easing);
+        border-bottom: var(--wg-border-width) solid var(--wg-border);
+    }
 
-        flex-wrap: nowrap;
-        white-space: nowrap;
+    .sectioned-form-nav[hidden] {
+        display: none;
     }
 
     .section-tabs {
+        /* The offset parent revealActiveLink measures links against. */
+        position: relative;
         display: flex;
         gap: var(--wg-space-sm);
-        padding: var(--wg-space-sm);
+        /* Inline padding only so the first and last links' focus rings are
+           not clipped by the scroll box. */
+        padding: var(--wg-space-sm) var(--wg-space-xs);
         overflow-x: auto;
+        overflow-y: hidden;
+        overscroll-behavior-x: contain;
+        scrollbar-width: none;
+    }
+
+    .section-tabs::-webkit-scrollbar {
+        display: none;
+    }
+
+    /* Links scrolled out of view, on either side, fade into the edge. */
+    .section-tabs.fade-start {
+        mask-image: linear-gradient(
+            to right,
+            transparent,
+            #000 var(--wg-space-2xl)
+        );
+    }
+
+    .section-tabs.fade-end {
+        mask-image: linear-gradient(
+            to left,
+            transparent,
+            #000 var(--wg-space-2xl)
+        );
+    }
+
+    .section-tabs.fade-start.fade-end {
+        mask-image: linear-gradient(
+            to right,
+            transparent,
+            #000 var(--wg-space-2xl),
+            #000 calc(100% - var(--wg-space-2xl)),
+            transparent
+        );
     }
 
     .section-tab {
@@ -224,6 +381,59 @@
     }
 
     .sectioned-form-content {
-        flex: 1;
+        grid-area: content;
+        min-width: 0;
+    }
+
+    /* ── list: beside the form, once there is room for both ────────────── */
+
+    /* 12rem of list, the 2rem gap, and at least 42rem of form. */
+    @container sectioned-form (min-width: 56rem) {
+        .sectioned-form-layout {
+            --wg-section-scroll-offset: calc(
+                var(--wg-topbar-height) +
+                var(--wg-space-xl)
+            );
+
+            grid-template-columns: 12rem minmax(0, 48rem);
+            grid-template-areas: "nav content";
+            column-gap: var(--wg-space-2xl);
+            align-items: start;
+        }
+
+        .sectioned-form-nav {
+            top: calc(var(--wg-topbar-height) + var(--wg-space-xl));
+            margin-bottom: 0;
+            background: none;
+            border-bottom: 0;
+        }
+
+        .section-tabs {
+            flex-direction: column;
+            gap: var(--wg-space-xs);
+            /* A long form on a short window scrolls its list, not past it. */
+            max-height: calc(
+                100vh -
+                var(--wg-topbar-height) -
+                2 *
+                var(--wg-space-xl)
+            );
+            padding: var(--wg-space-xs);
+            overflow-x: hidden;
+            overflow-y: auto;
+        }
+
+        .section-tabs,
+        .section-tabs.fade-start,
+        .section-tabs.fade-end {
+            mask-image: none;
+        }
+
+        .section-tab {
+            height: auto;
+            min-height: var(--wg-control-height-compact);
+            padding-block: var(--wg-space-xs);
+            white-space: normal;
+        }
     }
 </style>

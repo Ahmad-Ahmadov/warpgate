@@ -208,8 +208,8 @@
     }
 </script>
 
-<div class="container-max-md">
-    <div class="page-summary-bar">
+<div class="parameters">
+    <div class="wg-page-head">
         <h1>global parameters</h1>
     </div>
 
@@ -1303,9 +1303,42 @@
 </div>
 
 <style>
+    /* Room for SectionedForm's section list beside a 48rem form: 12rem, a
+       2rem gap, 48rem. Below its 56rem switch point the list becomes a strip
+       above the form. Left-aligned like every other screen; this used to be
+       a centred 48rem column (`container-max-md`), which left a wide empty
+       margin on the left of large screens. */
+    .parameters {
+        max-width: 62rem;
+    }
+
     /* The save-error callout. This screen had no <style> block at all, which
        is why the class resolved to nothing. */
     .notice {
         margin-bottom: var(--wg-space-lg);
+    }
+
+    /*
+     * Each section, and each subsection's body, is a flat run of controls
+     * with nothing spacing them: two selects in a row touched. Space them as
+     * .wg-field-stack does. A description (HelpText) stays close under the
+     * control it describes and carries the space after itself, and a run of
+     * checkboxes reads as one group.
+     */
+    .parameters :global(.sectioned-form-section > :not(h4)),
+    .parameters :global(.subsection > p > *) {
+        margin-bottom: var(--wg-space-lg);
+    }
+
+    .parameters :global(.sectioned-form-section > :has(+ .help-text)),
+    .parameters :global(.subsection > p > :has(+ .help-text)) {
+        margin-bottom: 0;
+    }
+
+    .parameters
+        :global(.sectioned-form-section > .wg-check-wrap:has(+ .wg-check-wrap)),
+    .parameters
+        :global(.subsection > p > .wg-check-wrap:has(+ .wg-check-wrap)) {
+        margin-bottom: var(--wg-space-sm);
     }
 </style>

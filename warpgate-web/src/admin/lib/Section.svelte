@@ -27,8 +27,13 @@
 
 <style>
     section {
-        /* Clears the sticky top bar plus the section-tab strip */
-        scroll-margin-top: calc(var(--wg-topbar-height) + var(--wg-space-2xl));
+        /* Clears the sticky top bar and, in its strip shape, SectionedForm's
+           links. SectionedForm sets the offset for whichever shape it is in
+           and its scroll spy reads this value back. */
+        scroll-margin-top: var(
+            --wg-section-scroll-offset,
+            calc(var(--wg-topbar-height) + var(--wg-space-2xl))
+        );
     }
 
     .sectioned-form-section {

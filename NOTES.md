@@ -2438,3 +2438,53 @@ clients regenerated from them.
   `vite build` passes.
 - **Not run:** anything against a real directory. The e2e suite has no LDAP
   server, and its LDAP endpoints short-circuit under `WARPGATE_UNDER_TEST`.
+
+## Parameters: a strip that sat on the top bar, and a centred column
+
+Three causes. None of them is in the shell, which already keeps its main
+column from widening the page (`min-width: 0` on `.wg-shell-main` and `main`).
+
+1. **Two sticky elements on one line.** The top bar is
+   `position: sticky; top: 0; z-index: 10`. SectionedForm's link strip was
+   the same, and comes later in the DOM, so once scrolled it painted over
+   the middle of the top bar. It also appeared only after its own top
+   reached 0, which is the moment it covered the bar. It now sticks at
+   `--wg-topbar-height`, below the bar, with z-index 9, and is always
+   visible. That also fixes the target screen, the other SectionedForm user.
+2. **The strip's own scrollbar.** Twelve sections never fit a 48rem column,
+   so the strip showed a native horizontal scrollbar with arrow buttons. It
+   still scrolls, but only inside itself. The scrollbar is hidden, the edges
+   fade where there is more, and the current section is scrolled into view
+   within the strip without moving the page.
+3. **A legacy wrapper.** Parameters used `container-max-md`, a 48rem column
+   centred in the canvas. Every redesigned screen left-aligns, so this one
+   sat in the middle of a wide screen behind a large empty margin. It is now
+   left-aligned at 62rem. SectionedForm switches by **container query**, not
+   media query, because the sidebar can collapse. From 56rem it is a sticky
+   12rem list of sections beside a 48rem form (the target screen's
+   form + docs-column shape). Below that it is the strip. The target
+   screen's form column is capped at 48rem, so it always gets the strip.
+
+Section offsets have one source. SectionedForm sets
+`--wg-section-scroll-offset` for its current shape. `Section` uses it as
+`scroll-margin-top`, and the scroll spy reads that computed value back as its
+line. Before, the offset (top bar + 2rem) was shorter than the top bar plus
+the strip, so a section jumped to could land under the strip. A click now
+pins the highlight until the smooth scroll settles, and reduced motion gets an
+instant scroll.
+
+Spacing: each section was a flat run of controls with no gap, so two selects
+in a row touched. Parameters now spaces them by `--wg-space-lg`, as
+`.wg-field-stack` does. A `HelpText` sits `--wg-space-sm` under the control it
+describes, and consecutive checkboxes are `--wg-space-sm` apart.
+
+Not changed: the top bar and sidebar. Below roughly 700px the 240px sidebar
+plus the top bar's fixed-width controls can still exceed the viewport. That is
+DESIGN.md's planned <768px drawer, not this page.
+
+Validation: `svelte-check` reports 0 errors and 0 warnings. Biome is clean on
+both new files. `vite build` passes, and the compiled CSS contains the
+container query and the spacing rules. The remaining Biome formatter notes on
+`Parameters.svelte` are in markup this change did not touch, and HEAD has
+them too. Not looked at in a browser: per the standing rule, the app is not
+run on this machine.
