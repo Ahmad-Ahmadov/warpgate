@@ -3,7 +3,6 @@ use std::io;
 use ironrdp_acceptor::DesktopSize;
 use ironrdp_core::{Encode as _, EncodeResult, cast_int, cast_length, other_err};
 use ironrdp_graphics::color_conversion::to_64x64_ycbcr_tile;
-use ironrdp_graphics::rfx_encode_component;
 use ironrdp_graphics::rlgr::RlgrError;
 use ironrdp_pdu::WriteCursor;
 use ironrdp_pdu::codecs::rfx::{
@@ -12,6 +11,7 @@ use ironrdp_pdu::codecs::rfx::{
 };
 use ironrdp_pdu::rdp::capability_sets::EntropyBits;
 
+use super::rfx_component::encode_component;
 use crate::BitmapUpdate;
 
 #[derive(Debug, Clone)]
@@ -209,11 +209,14 @@ impl<'a> UpdateEncoder<'a> {
         let (y_data, buf) = buf.split_at_mut(4096);
         let (cb_data, cr_data) = buf.split_at_mut(4096);
 
-        let len = rfx_encode_component(y, y_data, &self.quant, self.entropy_algorithm)?;
+        // Warpgate: `encode_component` writes what `ironrdp_graphics::rfx_encode_component`
+        // would, faster; see its module.
+        let temp = &mut [0i16; 4096];
+        let len = encode_component(y, temp, y_data, &self.quant, self.entropy_algorithm)?;
         let y_data = &y_data[..len];
-        let len = rfx_encode_component(cb, cb_data, &self.quant, self.entropy_algorithm)?;
+        let len = encode_component(cb, temp, cb_data, &self.quant, self.entropy_algorithm)?;
         let cb_data = &cb_data[..len];
-        let len = rfx_encode_component(cr, cr_data, &self.quant, self.entropy_algorithm)?;
+        let len = encode_component(cr, temp, cr_data, &self.quant, self.entropy_algorithm)?;
         let cr_data = &cr_data[..len];
 
         Ok(EncodedTile {

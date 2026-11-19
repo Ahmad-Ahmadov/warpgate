@@ -60,9 +60,10 @@ use warpgate_desktop_auth::{
 };
 
 /// Depth of the feed into the viewer-facing RDP server. Bounded so a slow viewer
-/// backpressures `frame_bridge` (and through it the target) rather than letting delta
-/// frames queue without limit; kept small so the target paces close to the live edge.
-const SERVER_INPUT_CAPACITY: usize = 16;
+/// backpressures `frame_bridge`, and through it the target client, which then folds the
+/// updates the viewer has no room for into later ones. Kept small: every frame queued here
+/// is one the viewer sees late, and can be a whole-desktop image.
+const SERVER_INPUT_CAPACITY: usize = 4;
 
 /// Size of each direction of the in-memory duplex carrying raw RDP bytes between the
 /// viewer socket and the RDP server.

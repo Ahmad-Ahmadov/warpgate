@@ -32,6 +32,13 @@ pub const PROTOCOL_NAME: Protocol = Protocol::Rdp;
 
 pub use warpgate_desktop_ui::DEFAULT_SIZE;
 
+/// Depth of the target client's event channel. Small, because a slot is the client's only
+/// signal that the viewer side wants more: while the channel is full, the client keeps
+/// reading the target and merges what changes into what it sends next (see
+/// `client::damage`), so a deeper queue would only hold older pixels, and more memory —
+/// each event can be a whole-desktop image.
+const EVENT_CHANNEL_CAPACITY: usize = 2;
+
 /// The native RDP server endpoint. Standard RDP clients (mstsc/FreeRDP) connect
 /// directly to Warpgate's RDP port; per connection it brokers between the viewer-facing
 /// RDP server and a target-facing client (see [`server`]).
@@ -98,7 +105,7 @@ pub fn connect_with_keyboard_layout(
     let target_session_id = admitted.id();
     let (user_info, target) = admitted.into_approved().into_parts();
     let (target, options) = target.into_parts();
-    let (event_tx, event_rx) = channel::<DesktopEvent>(1024);
+    let (event_tx, event_rx) = channel::<DesktopEvent>(EVENT_CHANNEL_CAPACITY);
     let (input_tx, input_rx) = channel::<DesktopInput>(DESKTOP_INPUT_CHANNEL_CAPACITY);
     let (abort_tx, abort_rx) = unbounded_channel::<()>();
 

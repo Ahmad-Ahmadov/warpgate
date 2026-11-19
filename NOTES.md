@@ -2732,3 +2732,72 @@ changed for it. The investigation found:
 - The server advertises Refresh Rect but does not repaint on one (noted in
   #2681). mstsc relies on it after Suppress Output, for example when
   restored from minimized.
+
+## RDP performance: frames that queued, and the tile coder
+
+### What was wrong
+
+- **Updates queued instead of merging.** The target client copied every changed
+  rectangle into its own buffer and queued it for the viewer: up to 1024 events
+  to the frame bridge, 16 into the RDP server, 256 more in front of IronRDP's
+  encoder. When the target changed the screen faster than the encoder or the
+  link kept up (scrolling, video, dragging a window), those queues filled. The
+  viewer then saw the desktop as it had been some hundreds of updates earlier,
+  and each queued update could be a whole-desktop image (8 MB at 1080p). The
+  client loop also waited on every send, so while the queues were full it
+  stopped forwarding the viewer's keyboard and mouse.
+- **The RemoteFX tile coder was slow.** Every tile component went through
+  IronRDP's `rfx_encode_component`. Its forward DWT walks the tile a column at a
+  time with a bounds check per sample, and its RLGR coder writes every code
+  through a `bitvec` range store.
+- **A minimised mstsc still cost full encode time.** mstsc's Suppress Output
+  was recorded by IronRDP but ignored by Warpgate.
+
+### What changed
+
+- `client/damage.rs`: the client records *where* the desktop changed (up to 16
+  merged regions). It sends the framebuffer's current pixels for them when the
+  next stage has a free slot. It never waits on graphics, so target reads, frame
+  acknowledgements and viewer input keep flowing. The pointer shape is kept
+  latest-only the same way.
+- Queue depths: client events 1024 → 2, server feed 16 → 4, display queue
+  256 → 2. At most about ten updates are now between the target and the encoder.
+- `vendor/ironrdp-server/src/encoder/rfx_component.rs`: a row-wise forward DWT
+  and an accumulator-based RLGR coder, byte-identical to IronRDP's (see
+  `vendor/ironrdp-server/PATCHES.md`).
+- `server/rdp.rs`: once the target is connected, a viewer that has asked for no
+  output for a second is sent nothing until it asks again. The client keeps the
+  desktop current meanwhile. Warpgate's own sign-in, second-factor and approval
+  screens are never held, and neither is an activation's first frame.
+
+### Not changed
+
+- **H.264 to mstsc.** The server snapshot does not advertise the graphics
+  pipeline (IronRDP#2470) and has no AVC encoder; adding one is a new codec
+  dependency.
+- **Lossless to mstsc.** The snapshot's only lossless path is raw surface bits,
+  or legacy bitmaps that reject widths that are not a multiple of 4. It needs
+  IronRDP#2411's RDP 6.0 bitmaps.
+- **Refresh Rect** still does not repaint. The encoder's diff against what it
+  last sent would drop a repaint of unchanged pixels anyway.
+- **RemoteFX quantization** is already the finest standard table.
+
+### To run on the build server
+
+```sh
+cargo test -p warpgate-protocol-rdp
+cargo test -p ironrdp-server --lib rfx_component
+cargo cranky -p warpgate-protocol-rdp --all-features
+```
+
+Then compare against the previous image at 1920x1080 and 2560x1440:
+
+- scroll a long page;
+- drag a window;
+- play a video;
+- type while the screen is busy;
+- minimise and restore mstsc;
+- run two sessions at once.
+
+`RUST_LOG=ironrdp_server=warn` shows IronRDP's `Encoding bitmap took N ms`
+warnings, for any encode over 10 ms.

@@ -26,10 +26,24 @@ are never re-armed, so every later frame is rejected (FreeRDP: `rfx_process_mess
 incomplete header blocks processing`) and the viewer stays black for the life of the
 connection while input still works; see warp-tech/warpgate#2606.
 
-`warpgate.patch` reads the size without consuming it and clears it only once a message
-carrying the headers has been built. It also drops a `* 2` from the adjacent buffer-resize
-`debug!`, which reported twice the size actually allocated. Upstream fixed the same bug
+`warpgate.patch` reads the size without consuming it, so every message carries the headers
+(the `.take()` removed in its `encoder/mod.rs` hunk). Upstream fixed the same bug
 differently in #2274 (take before the loop, buffer reused), which is past the snapshot.
+
+## A faster RemoteFX tile coder
+
+Every 64x64 tile of every frame goes through `ironrdp_graphics::rfx_encode_component` three
+times (Y, Cb, Cr). Two of its four steps dominate: the forward DWT's vertical pass walks the
+tile a column at a time, with a bounds check and a branch per sample, and RLGR writes each
+code through a `bitvec` range `fill`/`store_be`, several per coefficient.
+`src/encoder/rfx_component.rs` replaces both and keeps IronRDP's quantization and sub-band
+reconstruction. The vertical pass works on whole rows, which the compiler vectorises. The
+RLGR coder packs bits in a 64-bit accumulator and writes whole bytes. The arithmetic and the
+output are the same, byte for byte, and its tests compare the DWT, the RLGR coder (both
+modes, including the too-small-buffer error) and the whole component against IronRDP's on
+flat, gradient, edge, noise and sparse inputs and the i16 extremes. Run them with
+`cargo test -p ironrdp-server --lib rfx_component` (the crate sets `test = false`, so they
+only run when the library is named).
 
 ## Manifest
 

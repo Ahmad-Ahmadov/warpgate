@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -37,6 +38,21 @@ use super::protocol::{AuthVerdict, Event, Input, Refusal};
 use crate::desktop_size::{MAX_DESKTOP_DIM, bound_desktop_size};
 #[cfg(test)]
 use crate::desktop_size::{MAX_FRAME_BYTES, MIN_DESKTOP_DIM};
+
+/// Depth of the queue between Warpgate's frames and IronRDP's encoder. One update waiting
+/// while another is encoded keeps the encoder busy; anything deeper only makes the viewer
+/// see the desktop later, since the target client merges what does not fit (see
+/// `client::damage`).
+const DISPLAY_QUEUE_CAPACITY: usize = 2;
+
+/// How long the viewer must have asked for no output (mstsc does when minimised) before
+/// updates are held back. IronRDP's `DisplayContext::display_suppressed` documents why:
+/// mstsc also sends that request while its connection is still being set up, and some
+/// clients flap it under load.
+const SUPPRESS_SETTLE: Duration = Duration::from_secs(1);
+
+/// How often held-back updates check whether the viewer wants output again.
+const SUPPRESS_POLL: Duration = Duration::from_millis(100);
 
 /// Run the RDP server on a dedicated thread, resolving to its result.
 ///
@@ -110,7 +126,7 @@ where
 
     let tls = build_tls_acceptor(&cert_pem, &key_pem)?;
 
-    let (frame_tx, frame_rx) = mpsc::channel::<DisplayUpdate>(256);
+    let (frame_tx, frame_rx) = mpsc::channel::<DisplayUpdate>(DISPLAY_QUEUE_CAPACITY);
     let size = Arc::new(Mutex::new(DesktopSize {
         width: size.0,
         height: size.1,
@@ -118,11 +134,13 @@ where
 
     let clipboard = ViewerClipboard::new(out_tx.clone());
     let progress = Arc::new(Progress::default());
+    let target_connected = Arc::new(AtomicBool::new(false));
 
     let display = DisplayHandler {
         size: Arc::clone(&size),
         initial_size_negotiated: false,
         updates: Arc::new(Mutex::new(frame_rx)),
+        target_connected: Arc::clone(&target_connected),
         out: out_tx.clone(),
     };
     let input = InputHandler {
@@ -161,6 +179,7 @@ where
             frame_tx,
             DisplayRouteState {
                 size,
+                target_connected,
                 out: out_tx.clone(),
             },
             clipboard,
@@ -285,6 +304,8 @@ fn build_tls_acceptor(cert_pem: &str, key_pem: &str) -> Result<TlsAcceptor> {
 /// Shared display state used while routing Warpgate framebuffer messages.
 struct DisplayRouteState {
     size: Arc<Mutex<DesktopSize>>,
+    /// Set on [`Input::TargetConnected`]; see [`DisplayHandler::target_connected`].
+    target_connected: Arc<AtomicBool>,
     out: mpsc::UnboundedSender<Event>,
 }
 
@@ -354,6 +375,7 @@ async fn route_input(
                 }
             }
             Input::Clipboard(text) => clipboard.offer(text),
+            Input::TargetConnected => display.target_connected.store(true, Ordering::Relaxed),
             Input::Shutdown => break,
             Input::Disconnect(refusal) => {
                 debug!(?refusal, "Ending the viewer's session");
@@ -479,6 +501,11 @@ struct DisplayHandler {
     // deactivation-reactivation (e.g. an mstsc / MS Remote Desktop resize), so a
     // one-shot receiver would fail the second connection with "already taken".
     updates: Arc<Mutex<mpsc::Receiver<DisplayUpdate>>>,
+    /// Whether the frames are the target's desktop yet, rather than Warpgate's sign-in,
+    /// second-factor or approval screens. Only the target's are held back for a minimised
+    /// viewer: those screens' painter waits on every frame it sends, and the sign-in they
+    /// drive has to carry on while the viewer is minimised.
+    target_connected: Arc<AtomicBool>,
     out: mpsc::UnboundedSender<Event>,
 }
 
@@ -522,13 +549,15 @@ impl RdpServerDisplay for DisplayHandler {
 
     async fn updates(
         &mut self,
-        _ctx: DisplayContext,
+        ctx: DisplayContext,
     ) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         // Hand out a fresh view over the shared receiver. Only one is active at a time
         // (the previous is dropped when its client loop ends before reactivation).
-        Ok(Box::new(DisplayUpdatesReceiver {
-            rx: self.updates.clone(),
-        }))
+        Ok(Box::new(DisplayUpdatesReceiver::new(
+            self.updates.clone(),
+            ctx.display_suppressed,
+            self.target_connected.clone(),
+        )))
     }
 
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
@@ -550,16 +579,70 @@ impl RdpServerDisplay for DisplayHandler {
 
 struct DisplayUpdatesReceiver {
     rx: Arc<Mutex<mpsc::Receiver<DisplayUpdate>>>,
+    /// Set while the viewer has asked for no output, as mstsc does when minimised.
+    suppressed: Arc<AtomicBool>,
+    /// Since when `suppressed` has been set without a break.
+    suppressed_since: Option<tokio::time::Instant>,
+    /// Whether this activation has delivered a frame yet. Until it has, a request for no
+    /// output is ignored: mstsc sends one before its surface is ready, and holding the first
+    /// frame back would leave it frozen.
+    delivered: bool,
+    /// See [`DisplayHandler::target_connected`].
+    target_connected: Arc<AtomicBool>,
+}
+
+impl DisplayUpdatesReceiver {
+    const fn new(
+        rx: Arc<Mutex<mpsc::Receiver<DisplayUpdate>>>,
+        suppressed: Arc<AtomicBool>,
+        target_connected: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            rx,
+            suppressed,
+            suppressed_since: None,
+            delivered: false,
+            target_connected,
+        }
+    }
+
+    /// Wait while the viewer has steadily asked for no output. Nothing is encoded or sent
+    /// meanwhile; the target client keeps the desktop current and sends what changed once
+    /// the viewer is back.
+    async fn hold_while_suppressed(&mut self) {
+        loop {
+            if !self.delivered
+                || !self.target_connected.load(Ordering::Relaxed)
+                || !self.suppressed.load(Ordering::Relaxed)
+            {
+                self.suppressed_since = None;
+                return;
+            }
+            let since = *self
+                .suppressed_since
+                .get_or_insert_with(tokio::time::Instant::now);
+            if since.elapsed() < SUPPRESS_SETTLE {
+                return;
+            }
+            tokio::time::sleep(SUPPRESS_POLL).await;
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for DisplayUpdatesReceiver {
     async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
-        // `mpsc::Receiver::recv` is cancellation-safe, as this trait requires; the guard
-        // is released on cancel and no message is lost. `Resize` and the frames that follow
-        // it share this one ordered channel, so the encoder is always resized before it is
-        // handed a frame at the new size.
-        Ok(self.rx.lock().await.recv().await)
+        // Waiting out a suppression consumes nothing, and `mpsc::Receiver::recv` is
+        // cancellation-safe, so this stays cancellation-safe as the trait requires; the
+        // guard is released on cancel and no message is lost. `Resize` and the frames that
+        // follow it share this one ordered channel, so the encoder is always resized before
+        // it is handed a frame at the new size.
+        self.hold_while_suppressed().await;
+        let update = self.rx.lock().await.recv().await;
+        if matches!(update, Some(DisplayUpdate::Bitmap(_))) {
+            self.delivered = true;
+        }
+        Ok(update)
     }
 }
 
@@ -842,6 +925,7 @@ mod desktop_size_tests {
             size: Arc::new(Mutex::new(committed)),
             initial_size_negotiated,
             updates: Arc::new(Mutex::new(rx)),
+            target_connected: Arc::default(),
             out,
         };
         (display, events)
@@ -1034,6 +1118,120 @@ mod outcome_tests {
             code(Refusal::TimedOut),
             ProtocolIndependentCode::LogonTimeout
         );
+    }
+}
+
+#[cfg(test)]
+mod suppress_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use ironrdp_server::{DisplayUpdate, RdpServerDisplayUpdates as _};
+    use tokio::sync::{Mutex, mpsc};
+
+    use super::{DisplayUpdatesReceiver, SUPPRESS_SETTLE, frame_to_update};
+
+    fn frame() -> DisplayUpdate {
+        frame_to_update(0, 0, 1, 1, Bytes::from_static(&[0, 0, 0, 255])).unwrap()
+    }
+
+    /// A receiver whose frames are the target's desktop.
+    fn receiver() -> (
+        mpsc::Sender<DisplayUpdate>,
+        Arc<AtomicBool>,
+        DisplayUpdatesReceiver,
+    ) {
+        let (tx, rx) = mpsc::channel(4);
+        let suppressed = Arc::new(AtomicBool::new(false));
+        let updates = DisplayUpdatesReceiver::new(
+            Arc::new(Mutex::new(rx)),
+            suppressed.clone(),
+            Arc::new(AtomicBool::new(true)),
+        );
+        (tx, suppressed, updates)
+    }
+
+    /// Warpgate's own screens go out to a minimised viewer: the sign-in and its second
+    /// factor carry on meanwhile, and their painter waits on every frame it sends.
+    #[tokio::test(start_paused = true)]
+    async fn warpgates_own_screens_are_never_held_back() {
+        let (tx, rx) = mpsc::channel(4);
+        let suppressed = Arc::new(AtomicBool::new(false));
+        let mut updates = DisplayUpdatesReceiver::new(
+            Arc::new(Mutex::new(rx)),
+            suppressed.clone(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        tx.send(frame()).await.unwrap();
+        updates.next_update().await.unwrap();
+
+        suppressed.store(true, Ordering::Relaxed);
+        tokio::time::sleep(SUPPRESS_SETTLE * 2).await;
+        for _ in 0..3 {
+            tx.send(frame()).await.unwrap();
+            assert!(matches!(updates.next_update().await, Ok(Some(_))));
+            tokio::time::sleep(SUPPRESS_SETTLE).await;
+        }
+    }
+
+    /// mstsc asks for no output while it is still connecting; its first frame goes out
+    /// regardless, or it would stay frozen.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_frame_is_never_held_back() {
+        let (tx, suppressed, mut updates) = receiver();
+        suppressed.store(true, Ordering::Relaxed);
+        tokio::time::sleep(SUPPRESS_SETTLE * 2).await;
+
+        tx.send(frame()).await.unwrap();
+        assert!(matches!(
+            updates.next_update().await,
+            Ok(Some(DisplayUpdate::Bitmap(_)))
+        ));
+    }
+
+    /// A viewer minimised for a while is sent nothing until it is back, and then gets what
+    /// waited.
+    #[tokio::test(start_paused = true)]
+    async fn a_minimised_viewer_is_sent_nothing_until_it_is_back() {
+        let (tx, suppressed, mut updates) = receiver();
+        tx.send(frame()).await.unwrap();
+        updates.next_update().await.unwrap();
+
+        suppressed.store(true, Ordering::Relaxed);
+        // Not yet: the request could be a flap.
+        tx.send(frame()).await.unwrap();
+        assert!(matches!(updates.next_update().await, Ok(Some(_))));
+
+        tokio::time::sleep(SUPPRESS_SETTLE).await;
+        tx.send(frame()).await.unwrap();
+        let held = tokio::time::timeout(Duration::from_secs(10), updates.next_update()).await;
+        assert!(held.is_err(), "an update went out to a minimised viewer");
+
+        suppressed.store(false, Ordering::Relaxed);
+        assert!(matches!(
+            updates.next_update().await,
+            Ok(Some(DisplayUpdate::Bitmap(_)))
+        ));
+    }
+
+    /// A request for no output that is withdrawn within the settling time holds nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_flapping_request_holds_nothing_back() {
+        let (tx, suppressed, mut updates) = receiver();
+        tx.send(frame()).await.unwrap();
+        updates.next_update().await.unwrap();
+
+        for _ in 0..5 {
+            suppressed.store(true, Ordering::Relaxed);
+            tx.send(frame()).await.unwrap();
+            assert!(matches!(updates.next_update().await, Ok(Some(_))));
+            suppressed.store(false, Ordering::Relaxed);
+            tx.send(frame()).await.unwrap();
+            assert!(matches!(updates.next_update().await, Ok(Some(_))));
+            tokio::time::sleep(SUPPRESS_SETTLE / 2).await;
+        }
     }
 }
 

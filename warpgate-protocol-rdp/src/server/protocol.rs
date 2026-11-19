@@ -42,6 +42,10 @@ pub enum Input {
     CursorDefault,
     CursorHidden,
     Clipboard(String),
+    /// The target is connected: the frames that follow are its desktop rather than
+    /// Warpgate's own screens, and may wait while the viewer is minimised. Warpgate's
+    /// screens never do, since the sign-in and its second factor must go on meanwhile.
+    TargetConnected,
     Shutdown,
     /// End the session and tell the viewer why. For a refusal after the viewer's session
     /// has started — on the sign-in screen, at a second factor, at an administrator's

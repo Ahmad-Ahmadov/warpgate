@@ -4,6 +4,7 @@
 //! translates both directions into the shared [`DesktopEvent`]/[`DesktopInput`] vocabulary,
 //! so the web-desktop manager and the native RDP server front end both work unchanged.
 
+mod damage;
 mod input;
 mod logon;
 mod tls;
@@ -47,6 +48,7 @@ use warpgate_core::{
     DesktopInput, DesktopRect, DesktopState, check_desktop_size, within_deadline,
 };
 
+use self::damage::Damage;
 pub(crate) use self::logon::LogonWatcher;
 use crate::client::input::InputHold;
 use crate::clipboard::{Clipboard, ClipboardSink, TextClipboard};
@@ -200,6 +202,7 @@ async fn active_loop(
     // graphics reset, and the viewer re-sends its size right after connecting.
     let mut requested_size = (u32::from(image.width()), u32::from(image.height()));
     let mut input_hold = InputHold::new(clipboard.acks(), CLIPBOARD_ACK_TIMEOUT);
+    let mut backlog = ViewerBacklog::default();
     let mut reported_size = None;
     if report_size(image, &mut reported_size, None, event_tx, abort_rx)
         .await
@@ -288,6 +291,20 @@ async fn active_loop(
                 }
                 continue;
             }
+            // Ahead of reading the target, so whenever the viewer side has room it gets the
+            // desktop as it is now. While it has none, the target is still read — its frame
+            // acknowledgements and input keep flowing — and what it changes waits in the
+            // backlog, merged with whatever already waits there.
+            permit = event_tx.reserve(), if !backlog.is_empty() => {
+                let Ok(permit) = permit else {
+                    // The viewer side has gone.
+                    return Ok(());
+                };
+                if let Some(event) = backlog.next_event(image) {
+                    permit.send(event);
+                }
+                continue;
+            }
             pdu = framed.read_pdu() => {
                 let (action, payload) = pdu.context("reading PDU")?;
                 let received_at = framed.last_read_at();
@@ -318,6 +335,7 @@ async fn active_loop(
             image,
             &mut reported_size,
             outputs,
+            &mut backlog,
             event_tx,
             abort_rx,
         )
@@ -352,6 +370,8 @@ async fn active_loop(
             // (overlap kept, new margin black) so it isn't blank until the full refresh lands.
             let keyframe = encode_resized_keyframe(image, size);
             *image = DecodedImage::new(PixelFormat::RgbA32, size.width, size.height);
+            // The keyframe covers the whole new desktop; what was waiting was for the old one.
+            backlog.damage.clear();
             if report_size(image, &mut reported_size, keyframe, event_tx, abort_rx)
                 .await
                 .is_err()
@@ -562,18 +582,43 @@ async fn request_full_redraw(
     Ok(())
 }
 
+/// What the target changed that the viewer has not been sent yet: its latest pointer shape
+/// and the changed regions of the desktop. Only the newest state of either is worth
+/// sending, so neither queues behind updates it supersedes, and the pixels for a region are
+/// read from the framebuffer when it is sent, not when it changed.
+#[derive(Default)]
+struct ViewerBacklog {
+    pointer: Option<DesktopEvent>,
+    damage: Damage,
+}
+
+impl ViewerBacklog {
+    const fn is_empty(&self) -> bool {
+        self.pointer.is_none() && self.damage.is_empty()
+    }
+
+    /// The next event to send, the pointer first: it is small, and the one the user is
+    /// watching.
+    fn next_event(&mut self, image: &DecodedImage) -> Option<DesktopEvent> {
+        if let Some(pointer) = self.pointer.take() {
+            return Some(pointer);
+        }
+        std::iter::from_fn(|| self.damage.pop()).find_map(|region| encode_region(image, &region))
+    }
+}
+
 /// Handle a batch of active-stage outputs. Returns `true` if the session should terminate.
 ///
 /// Protocol responses (crucially, the RDP *frame acknowledgements* that gate the server's
-/// flow control) are written and flushed **first**, before the framebuffer tiles are
-/// emitted. Emitting a tile can block on channel backpressure when anything downstream is
-/// momentarily slow; if the ack sat behind that, the server would stop sending and the
-/// frame rate would collapse to a few fps while everything sits idle.
+/// flow control) are written first. Graphics and pointer updates only go into `backlog`,
+/// which `active_loop` sends from when the viewer side has room, so a slow viewer never
+/// holds up an acknowledgement or the viewer's input.
 async fn process_outputs(
     framed: &mut Framed,
     image: &DecodedImage,
     reported_size: &mut Option<(u16, u16)>,
     outputs: Vec<ActiveStageOutput>,
+    backlog: &mut ViewerBacklog,
     event_tx: &Sender<DesktopEvent>,
     abort_rx: &mut UnboundedReceiver<()>,
 ) -> Result<bool, Aborted> {
@@ -591,21 +636,29 @@ async fn process_outputs(
     }
 
     // A Graphics Pipeline `ResetGraphics` resizes `image` in place, and the next update
-    // covers the whole new surface, so the viewer only needs the new size first.
+    // covers the whole new surface, so the viewer only needs the new size first. Regions
+    // still waiting were for the old surface, which the viewer discards.
+    let previous_size = *reported_size;
     report_size(image, reported_size, None, event_tx, abort_rx).await?;
+    if *reported_size != previous_size {
+        backlog.damage.clear();
+    }
 
     for out in outputs {
-        let event = match out {
-            ActiveStageOutput::GraphicsUpdate(region) => encode_region(image, &region),
-            ActiveStageOutput::PointerBitmap(pointer) => encode_pointer(&pointer),
-            ActiveStageOutput::PointerDefault => Some(DesktopEvent::CursorDefault),
-            ActiveStageOutput::PointerHidden => Some(DesktopEvent::CursorHidden),
+        match out {
+            ActiveStageOutput::GraphicsUpdate(region) => backlog.damage.add(&region),
+            ActiveStageOutput::PointerBitmap(pointer) => {
+                if let Some(event) = encode_pointer(&pointer) {
+                    backlog.pointer = Some(event);
+                }
+            }
+            ActiveStageOutput::PointerDefault => {
+                backlog.pointer = Some(DesktopEvent::CursorDefault);
+            }
+            ActiveStageOutput::PointerHidden => backlog.pointer = Some(DesktopEvent::CursorHidden),
             // The viewer owns the pointer position; warping it to wherever the target last
             // put its own would fight the user's mouse.
-            _ => None,
-        };
-        if let Some(event) = event {
-            send_event(event_tx, abort_rx, event).await?;
+            _ => {}
         }
     }
     Ok(terminate)

@@ -16,8 +16,9 @@ use super::protocol::Input as ServerInput;
 /// Bridge target-side desktop events to the viewer-facing RDP server. Every framebuffer
 /// update is a delta rectangle, so none may be dropped — a lost tile leaves that region
 /// stale until it next changes. `server_in` is bounded, so a slow viewer applies
-/// backpressure here, which propagates to the target via IronRDP's frame acknowledgements
-/// (the target paces to the slowest consumer instead of us discarding pixels).
+/// backpressure here, which reaches the target client: it keeps reading the target and
+/// sends the viewer the desktop as it is once there is room, rather than every state the
+/// target went through.
 ///
 /// Recording runs on its own task so its (serialising) `write_event` never gates live frame
 /// delivery — `DesktopEvent` clones are cheap (`RawImage` holds ref-counted `Bytes`). The
@@ -43,6 +44,9 @@ async fn frame_bridge(
         tx
     });
 
+    if server_in.send(ServerInput::TargetConnected).await.is_err() {
+        return;
+    }
     while let Some(event) = event_rx.recv().await {
         if let Some(record_tx) = &record_tx {
             // Best-effort: recording must never stall the live path, so drop under overload.

@@ -28,6 +28,7 @@ mod pointer_mask;
 #[cfg(feature = "qoiz")]
 pub(crate) mod qoiz;
 pub(crate) mod rfx;
+mod rfx_component;
 
 pub(crate) use fast_path::*;
 use ironrdp_graphics::rdp6::BitmapEncodeError;
