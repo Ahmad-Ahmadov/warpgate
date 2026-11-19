@@ -5,30 +5,35 @@
 //! Warpgate owns the listening socket, the session, authentication and recording; this
 //! module owns only the RDP server protocol and its TLS.
 
+use std::io;
 use std::net::SocketAddr;
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use ironrdp_displaycontrol::pdu::{DisplayControlMonitorLayout, MonitorLayoutEntry};
+use ironrdp_pdu::gcc::KeyboardType;
+use ironrdp_pdu::input::fast_path::SynchronizeFlags;
+use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
 use ironrdp_server::{
-    BitmapUpdate, CredentialDecision, CredentialValidationError, CredentialValidator, Credentials,
-    DesktopSize, DisplayContext, DisplayUpdate, KeyboardEvent, MouseButton, MouseEvent,
-    PixelFormat, RGBAPointer, RdpServer, RdpServerDisplay, RdpServerDisplayUpdates,
-    RdpServerInputHandler, ServerResult,
+    BitmapUpdate, ConnectionHandler, ConnectionInfo, CredentialDecision, CredentialValidationError,
+    CredentialValidator, Credentials, DesktopSize, DisplayContext, DisplayUpdate,
+    ErrorInfoDisconnectHandle, KeyboardEvent, MouseButton, MouseEvent, PixelFormat, RGBAPointer,
+    RdpServer, RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler, ServerResult,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig as TlsServerConfig;
-use tracing::{Instrument as _, Span, debug, warn};
+use tracing::{Instrument as _, Span, debug, info, warn};
 use warpgate_core::{DesktopInput, Scancode};
 #[cfg(test)]
 use warpgate_desktop_ui::DEFAULT_SIZE;
 
 use super::clipboard::ViewerClipboard;
-use super::protocol::{AuthVerdict, Event, Input};
+use super::protocol::{AuthVerdict, Event, Input, Refusal};
 use crate::desktop_size::{MAX_DESKTOP_DIM, bound_desktop_size};
 #[cfg(test)]
 use crate::desktop_size::{MAX_FRAME_BYTES, MIN_DESKTOP_DIM};
@@ -39,6 +44,9 @@ use crate::desktop_size::{MAX_FRAME_BYTES, MIN_DESKTOP_DIM};
 /// `Send` and cannot join the multi-threaded runtime. It gets a current-thread runtime of
 /// its own instead; everything it exchanges with the session (the duplex transport and the
 /// two channels) is `Send`, so only the state machine itself stays pinned here.
+///
+/// `keyboard_layout` receives the keyboard layout the viewer announces, once its session is
+/// activated, for the target connection.
 pub fn run_on_thread<S>(
     stream: S,
     cert_pem: String,
@@ -46,6 +54,7 @@ pub fn run_on_thread<S>(
     size: (u16, u16),
     out_tx: mpsc::UnboundedSender<Event>,
     in_rx: mpsc::Receiver<Input>,
+    keyboard_layout: Arc<AtomicU32>,
 ) -> oneshot::Receiver<Result<()>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
@@ -65,8 +74,18 @@ where
                 return;
             }
         };
-        let result =
-            runtime.block_on(run(stream, cert_pem, key_pem, size, out_tx, in_rx).instrument(span));
+        let result = runtime.block_on(
+            run(
+                stream,
+                cert_pem,
+                key_pem,
+                size,
+                out_tx,
+                in_rx,
+                keyboard_layout,
+            )
+            .instrument(span),
+        );
         let _ = done_tx.send(result);
     });
     done_rx
@@ -80,6 +99,7 @@ async fn run<S>(
     size: (u16, u16),
     out_tx: mpsc::UnboundedSender<Event>,
     in_rx: mpsc::Receiver<Input>,
+    keyboard_layout: Arc<AtomicU32>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
@@ -97,22 +117,10 @@ where
     }));
 
     let clipboard = ViewerClipboard::new(out_tx.clone());
-
-    let router = tokio::spawn(
-        route_input(
-            in_rx,
-            frame_tx,
-            DisplayRouteState {
-                size: Arc::clone(&size),
-                out: out_tx.clone(),
-            },
-            clipboard.clone(),
-        )
-        .in_current_span(),
-    );
+    let progress = Arc::new(Progress::default());
 
     let display = DisplayHandler {
-        size,
+        size: Arc::clone(&size),
         initial_size_negotiated: false,
         updates: Arc::new(Mutex::new(frame_rx)),
         out: out_tx.clone(),
@@ -125,6 +133,7 @@ where
     };
     let validator: Arc<dyn CredentialValidator> = Arc::new(Validator {
         out: out_tx.clone(),
+        progress: Arc::clone(&progress),
     });
 
     let mut server = RdpServer::builder()
@@ -142,17 +151,112 @@ where
             height: MAX_DESKTOP_DIM,
         }))
         .with_credential_validator(Some(validator))
-        .with_cliprdr_factory(Some(Box::new(clipboard)))
+        .with_cliprdr_factory(Some(Box::new(clipboard.clone())))
+        .with_connection_handler(Some(Box::new(ViewerConnection { keyboard_layout })))
         .build();
 
-    if let Err(error) = server.run_connection(stream).await {
-        // A session-level error (e.g. viewer disconnect) is not a failure of the gateway:
-        // report it and shut down cleanly.
-        warn!(error = %format!("{error:#}"), "RDP session ended with error");
-    }
+    let router = tokio::spawn(
+        route_input(
+            in_rx,
+            frame_tx,
+            DisplayRouteState {
+                size,
+                out: out_tx.clone(),
+            },
+            clipboard,
+            server.error_info_disconnect_handle(),
+        )
+        .in_current_span(),
+    );
 
+    let result = server.run_connection(stream).await;
     router.abort();
+
+    // However the session ends, it is not a failure of the gateway: report it and shut
+    // down cleanly. What is worth a warning is a session that failed, rather than one the
+    // viewer closed or Warpgate refused.
+    match result {
+        Ok(()) => debug!("Viewer connection closed"),
+        // The control loop has logged why it refused the credentials.
+        Err(error) if progress.refused.load(Ordering::Relaxed) => debug!(
+            error = %format!("{error:#}"),
+            "Viewer connection closed after its credentials were refused"
+        ),
+        // Before its logon info, as when mstsc's user declines its certificate warning
+        // or the client gives up on the negotiation.
+        Err(error) if is_hang_up(&error) && !progress.logon_info.load(Ordering::Relaxed) => {
+            info!(
+                error = %format!("{error:#}"),
+                "Viewer disconnected during the connection handshake, before sending its logon info"
+            );
+        }
+        // How every session ends that the viewer closes: mstsc, for one, closes the
+        // connection without a TLS close_notify.
+        Err(error) if is_hang_up(&error) => {
+            info!(error = %format!("{error:#}"), "Viewer disconnected");
+        }
+        Err(error) => warn!(error = %format!("{error:#}"), "RDP session ended with error"),
+    }
     Ok(())
+}
+
+/// How far the viewer's connection got, for telling why it ended.
+#[derive(Default)]
+struct Progress {
+    /// The viewer completed the handshake and sent its Client Info PDU.
+    logon_info: AtomicBool,
+    /// Warpgate refused its credentials.
+    refused: AtomicBool,
+}
+
+/// Whether `error` is the viewer's connection going away, rather than anything failing.
+fn is_hang_up(error: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(error), |error| error.source()).any(|error| {
+        error.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+            )
+        })
+    })
+}
+
+/// The Set Error Info code (MS-RDPBCGR 2.2.5.1.1) a refusal reaches the viewer as.
+const fn refusal_error_info(refusal: Refusal) -> ErrorInfo {
+    ErrorInfo::ProtocolIndependentCode(match refusal {
+        // As the RDP server refuses credentials from the Client Info PDU.
+        Refusal::Denied => ProtocolIndependentCode::ServerInsufficientPrivileges,
+        Refusal::NotApproved => ProtocolIndependentCode::ServerDeniedConnection,
+        Refusal::TimedOut => ProtocolIndependentCode::LogonTimeout,
+    })
+}
+
+/// Logs what the viewer announced once its session is activated, and keeps its keyboard
+/// layout for the target connection.
+struct ViewerConnection {
+    keyboard_layout: Arc<AtomicU32>,
+}
+
+impl ConnectionHandler for ViewerConnection {
+    fn on_connection_info(&mut self, info: &ConnectionInfo) {
+        info!(
+            keyboard_layout = %format!("{:#010x}", info.keyboard_layout),
+            keyboard_type = info.keyboard_type.0,
+            monitors = info.client_monitors.len(),
+            "Viewer session activated"
+        );
+        // The target is told the viewer's layout, as a direct connection would tell it, so
+        // that keystrokes, which reach it as scancodes, type what the viewer's keycaps say.
+        // Only for the standard keyboard type the target connection declares: a Japanese or
+        // Korean layout needs its own keyboard type and subtype to go with it.
+        if info.keyboard_type == KeyboardType::IBM_ENHANCED {
+            self.keyboard_layout
+                .store(info.keyboard_layout, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Build a rustls `TlsAcceptor` from PEM cert + key.
@@ -184,13 +288,14 @@ struct DisplayRouteState {
     out: mpsc::UnboundedSender<Event>,
 }
 
-/// Route Warpgate's messages to the display backend (framebuffer updates) and the
-/// credential validator (auth decisions).
+/// Route Warpgate's messages to the display backend (framebuffer updates), the viewer's
+/// clipboard, and the server itself (ending the session).
 async fn route_input(
     mut rx: mpsc::Receiver<Input>,
     frame_tx: mpsc::Sender<DisplayUpdate>,
     display: DisplayRouteState,
     clipboard: ViewerClipboard,
+    disconnect: ErrorInfoDisconnectHandle,
 ) {
     while let Some(msg) = rx.recv().await {
         match msg {
@@ -250,6 +355,19 @@ async fn route_input(
             }
             Input::Clipboard(text) => clipboard.offer(text),
             Input::Shutdown => break,
+            Input::Disconnect(refusal) => {
+                debug!(?refusal, "Ending the viewer's session");
+                if disconnect.disconnect(refusal_error_info(refusal)).is_ok() {
+                    // Closing the display feed, as returning would, ends the session too,
+                    // and that would race the event carrying the reason: half the time the
+                    // viewer would not hear it. So the feed stays open, and whatever still
+                    // arrives is dropped, until the server has sent the reason and ended
+                    // the session, which aborts this task.
+                    while rx.recv().await.is_some() {}
+                    std::future::pending::<()>().await;
+                }
+                break;
+            }
         }
     }
 }
@@ -449,6 +567,7 @@ impl RdpServerDisplayUpdates for DisplayUpdatesReceiver {
 /// verdict on a per-request reply channel.
 struct Validator {
     out: mpsc::UnboundedSender<Event>,
+    progress: Arc<Progress>,
 }
 
 #[async_trait::async_trait]
@@ -457,6 +576,20 @@ impl CredentialValidator for Validator {
         &self,
         credentials: &Credentials,
     ) -> Result<CredentialDecision, CredentialValidationError> {
+        self.progress.logon_info.store(true, Ordering::Relaxed);
+        // The handshake is through: the X.224 negotiation (TLS, the only security this
+        // listener offers), the TLS handshake, the MCS connection and the Client Info PDU.
+        // Whether a password came with it decides between signing the viewer in with it and
+        // asking for it on the sign-in screen. The credentials themselves are never logged.
+        info!(
+            password_supplied = !credentials.password.is_empty(),
+            domain_supplied = credentials
+                .domain
+                .as_deref()
+                .is_some_and(|domain| !domain.is_empty()),
+            "Viewer completed the TLS handshake and sent its logon info"
+        );
+
         let (reply, verdict) = oneshot::channel();
         if self
             .out
@@ -468,12 +601,16 @@ impl CredentialValidator for Validator {
             .is_err()
         {
             // Warpgate hung up before we could ask.
+            self.progress.refused.store(true, Ordering::Relaxed);
             return Ok(CredentialDecision::Reject);
         }
         match verdict.await {
             Ok(AuthVerdict::StartSession) => Ok(CredentialDecision::Accept),
             // Explicit denial, or the control loop dropped the reply without answering.
-            Ok(AuthVerdict::Deny) | Err(_) => Ok(CredentialDecision::Reject),
+            Ok(AuthVerdict::Deny) | Err(_) => {
+                self.progress.refused.store(true, Ordering::Relaxed);
+                Ok(CredentialDecision::Reject)
+            }
         }
     }
 }
@@ -529,8 +666,14 @@ impl RdpServerInputHandler for InputHandler {
             KeyboardEvent::UnicodeReleased(unit) => {
                 self.send_key(Some(u32::from(unit)), None, false);
             }
-            // Lock-key (caps/num/scroll) sync state; not propagated to the target.
-            KeyboardEvent::Synchronize(_) => {}
+            // Lock-key state. Not propagated to the target, which keeps its own; the
+            // sign-in screen reads it, to type what the keycaps say.
+            KeyboardEvent::Synchronize(flags) => {
+                let _ = self.out.send(Event::KeyboardSync {
+                    caps_lock: flags.contains(SynchronizeFlags::CAPS_LOCK),
+                    num_lock: flags.contains(SynchronizeFlags::NUM_LOCK),
+                });
+            }
         }
     }
 
@@ -837,6 +980,60 @@ mod cursor_tests {
             ),
             DisplayUpdate::RGBAPointer(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use std::io;
+
+    use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+    use ironrdp_server::{ServerError, ServerErrorExt as _};
+
+    use super::{Refusal, is_hang_up, refusal_error_info};
+
+    /// The error mstsc's ordinary disconnect produces is told from a session that failed,
+    /// however deep in the error chain the I/O error sits.
+    #[test]
+    fn a_viewer_hanging_up_is_not_a_failure() {
+        let no_close_notify = ServerError::io(
+            "read frame",
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "peer closed connection without sending TLS close_notify",
+            ),
+        );
+        assert!(is_hang_up(&no_close_notify));
+        assert!(is_hang_up(&ServerError::io(
+            "write",
+            io::ErrorKind::ConnectionReset.into()
+        )));
+
+        assert!(!is_hang_up(&ServerError::reason("decode", "invalid PDU")));
+        assert!(!is_hang_up(&ServerError::io(
+            "tls",
+            io::Error::new(io::ErrorKind::InvalidData, "bad certificate")
+        )));
+    }
+
+    #[test]
+    fn each_refusal_tells_the_viewer_why() {
+        let code = |refusal| match refusal_error_info(refusal) {
+            ErrorInfo::ProtocolIndependentCode(code) => code,
+            other => panic!("unexpected error info {other:?}"),
+        };
+        assert_eq!(
+            code(Refusal::Denied),
+            ProtocolIndependentCode::ServerInsufficientPrivileges
+        );
+        assert_eq!(
+            code(Refusal::NotApproved),
+            ProtocolIndependentCode::ServerDeniedConnection
+        );
+        assert_eq!(
+            code(Refusal::TimedOut),
+            ProtocolIndependentCode::LogonTimeout
+        );
     }
 }
 

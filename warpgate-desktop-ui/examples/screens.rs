@@ -3,7 +3,8 @@ use std::error::Error;
 
 use minifb::{Key, KeyRepeat, Window, WindowOptions};
 use warpgate_desktop_ui::{
-    AuthPrompt, SCREEN_H, SCREEN_W, Screen, render_authentication, render_connecting,
+    AuthPrompt, SCREEN_H, SCREEN_W, Screen, SignInField, SignInNotice, SignInPrompt,
+    render_authentication, render_connecting, render_sign_in,
 };
 
 fn screen(n: u8, tick: u64) -> Result<Vec<u8>, Infallible> {
@@ -33,6 +34,24 @@ fn screen(n: u8, tick: u64) -> Result<Vec<u8>, Infallible> {
                 security_key: "1234".into(),
             },
         ),
+        6 => render_sign_in(
+            screen,
+            &SignInPrompt {
+                username: "",
+                password_len: 0,
+                focus: SignInField::Username,
+                notice: None,
+            },
+        ),
+        7 => render_sign_in(
+            screen,
+            &SignInPrompt {
+                username: "alice:windows-server",
+                password_len: 9,
+                focus: SignInField::Password,
+                notice: Some(SignInNotice::Error("The username or password is incorrect")),
+            },
+        ),
         _ => render_connecting(screen, tick),
     }
 }
@@ -40,7 +59,7 @@ fn screen(n: u8, tick: u64) -> Result<Vec<u8>, Infallible> {
 fn main() -> Result<(), Box<dyn Error>> {
     let (w, h) = (usize::from(SCREEN_W), usize::from(SCREEN_H));
     let mut window = Window::new(
-        "Warpgate hold screen — keys 1-5 switch, Esc quits",
+        "Warpgate hold screen — keys 1-7 switch, Esc quits",
         w,
         h,
         WindowOptions::default(),
@@ -53,6 +72,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         (Key::Key3, 3),
         (Key::Key4, 4),
         (Key::Key5, 5),
+        (Key::Key6, 6),
+        (Key::Key7, 7),
     ];
 
     let mut current = 1u8;

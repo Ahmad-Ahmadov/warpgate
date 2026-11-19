@@ -20,7 +20,7 @@ use warpgate_desktop_ui as ui;
 use super::protocol::{Event as ServerEvent, Input as ServerInput};
 
 /// How often the holding screen repaints (spinner animation cadence).
-const HOLD_RENDER_INTERVAL: Duration = Duration::from_millis(100);
+pub(super) const HOLD_RENDER_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Render a holding screen to the viewer and collect the interactive second factor — a
 /// TOTP typed on the viewer's keyboard, or an out-of-band web approval — until the auth
@@ -196,9 +196,9 @@ pub(super) async fn run_banner_screen(
 
 /// Paints the full-screen hold-screen UI to the RDP viewer, owning the spinner tick and
 /// keeping the RDP server's desktop in step with the negotiated size. `paint` takes a UI
-/// render function (`ui::render_*`) so the prompt and "Connecting" screens go through one
-/// code path.
-struct HoldPainter {
+/// render function (`ui::render_*`) so the prompt, sign-in and "Connecting" screens go
+/// through one code path.
+pub(super) struct HoldPainter {
     tick: u64,
     screen: ui::Screen,
     /// The size the RDP server was last told to run at.
@@ -206,7 +206,7 @@ struct HoldPainter {
 }
 
 impl HoldPainter {
-    const fn new(screen: ui::Screen) -> Self {
+    pub(super) const fn new(screen: ui::Screen) -> Self {
         Self {
             tick: 0,
             screen,
@@ -214,7 +214,7 @@ impl HoldPainter {
         }
     }
 
-    const fn set_screen(&mut self, screen: ui::Screen) {
+    pub(super) const fn set_screen(&mut self, screen: ui::Screen) {
         self.screen = screen;
     }
 
@@ -226,7 +226,7 @@ impl HoldPainter {
     /// granted as-is (a size the server already runs at is ignored by it). This happens here
     /// rather than where the resize event is read because the input reader is polled inside
     /// the driver's `select!` and can be dropped mid-await, whereas `paint` runs to completion.
-    async fn paint(
+    pub(super) async fn paint(
         &mut self,
         server_in_tx: &Sender<ServerInput>,
         render_frame: impl FnOnce(ui::Screen, u64) -> Result<Vec<u8>, Infallible>,

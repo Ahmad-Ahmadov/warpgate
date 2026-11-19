@@ -505,6 +505,13 @@
 {#if targetKind === TargetKind.Rdp}
     <CopyableTextArea label="RDP endpoint" value={protocolEndpoint('rdp')} />
     <CopyableTextArea label="RDP username" value={commonSelectorUsername} />
+    {#if !ticketSecret}
+        <InfoBox class="mt-3">
+            The password is your Warpgate password. Remote Desktop Connection
+            (mstsc) asks for it on Warpgate's sign-in screen unless you have
+            saved it in the client.
+        </InfoBox>
+    {/if}
 {/if}
 
 {#if targetKind === TargetKind.Vnc}

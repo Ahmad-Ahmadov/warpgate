@@ -81,9 +81,11 @@ impl ClipboardSink for ClientClipboardSink {
 }
 
 /// Connect to `options` and pump the session until it ends or is aborted.
+#[expect(clippy::too_many_arguments)]
 pub async fn run(
     options: TargetRdpOptions,
     (width, height): (u16, u16),
+    keyboard_layout: u32,
     event_tx: Sender<DesktopEvent>,
     input_rx: Receiver<DesktopInput>,
     mut abort_rx: UnboundedReceiver<()>,
@@ -107,6 +109,7 @@ pub async fn run(
         password.expose_secret(),
         width as u16,
         height as u16,
+        keyboard_layout,
     );
 
     let (clipboard_tx, clipboard_rx) = unbounded_channel();
@@ -794,7 +797,7 @@ pub(crate) fn test_connector_config(username: &str, password: &str) -> connector
         interactive_logon: false,
         tls_security: warpgate_common::RdpTlsSecurity::default(),
     };
-    let mut config = build_config(&options, password, 1024, 768);
+    let mut config = build_config(&options, password, 1024, 768, 0);
     config.enable_credssp = false;
     config
 }
@@ -807,6 +810,7 @@ fn build_config(
     password: &str,
     width: u16,
     height: u16,
+    keyboard_layout: u32,
 ) -> connector::Config {
     let codec_overrides: &[&str] = match options.compression {
         RdpTargetCompression::RemoteFX | RdpTargetCompression::GraphicsPipeline => &[],
@@ -822,7 +826,9 @@ fn build_config(
         enable_credssp: true,
         keyboard_type: KeyboardType::IBM_ENHANCED,
         keyboard_subtype: 0,
-        keyboard_layout: 0,
+        // The viewer's layout when it is a native RDP client, so its scancodes type what
+        // its keycaps say; otherwise 0, the target's default.
+        keyboard_layout,
         keyboard_functional_keys_count: 12,
         ime_file_name: String::new(),
         dig_product_id: String::new(),

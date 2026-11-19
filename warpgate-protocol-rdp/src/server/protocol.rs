@@ -8,9 +8,11 @@ use warpgate_core::DesktopInput;
 /// Warpgate's verdict on a viewer's credentials, returned through the
 /// [`Event::AuthRequest`] reply channel.
 pub enum AuthVerdict {
-    /// The password check passed — let the RDP session start. Target authorization and any
-    /// second factor may still be pending (collected on the hold screen); this only unblocks
-    /// the NLA so the session can proceed to that point, and must not be read as "authorized".
+    /// Let the RDP session start: the password check passed, or the viewer sent no password
+    /// and is to sign in on Warpgate's sign-in screen. Any second factor and the target's
+    /// authorization — and, without a password, the sign-in itself — are still to come over
+    /// the session; this only lets the connection sequence finish, and must not be read as
+    /// "authorized".
     StartSession,
     /// Reject the credential; the session does not start.
     Deny,
@@ -41,6 +43,23 @@ pub enum Input {
     CursorHidden,
     Clipboard(String),
     Shutdown,
+    /// End the session and tell the viewer why. For a refusal after the viewer's session
+    /// has started — on the sign-in screen, at a second factor, at an administrator's
+    /// approval — where a plain close would reach it as a dropped connection (mstsc: a
+    /// network error) rather than as a refusal.
+    Disconnect(Refusal),
+}
+
+/// Why Warpgate ends a viewer's session itself. The viewer is sent the matching Set Error
+/// Info PDU (MS-RDPBCGR 2.2.5.1.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// Sign-in or the second factor failed, or the user may not use the target.
+    Denied,
+    /// An administrator did not approve the session.
+    NotApproved,
+    /// The viewer did not sign in in time.
+    TimedOut,
 }
 
 /// RDP server → Warpgate: viewer credentials and input. The viewer's domain is discarded —
@@ -73,4 +92,11 @@ pub enum Event {
         height: u16,
     },
     Input(DesktopInput),
+    /// The viewer's lock keys, from its Synchronize event: mstsc sends one when the session
+    /// starts and whenever its window regains focus. Only the sign-in screen reads it, to
+    /// type what the keycaps say; the target keeps its own lock state.
+    KeyboardSync {
+        caps_lock: bool,
+        num_lock: bool,
+    },
 }

@@ -13,12 +13,14 @@
 //! Warpgate authenticates them with the same [`AuthSelector`] flow used by the native VNC
 //! server, connects to the resolved target, and bridges target framebuffer events back to
 //! the viewer while recording them — so native RDP records exactly like the in-browser
-//! path.
+//! path. A viewer that sends no password, as mstsc does without a saved credential, signs
+//! in on Warpgate's own sign-in screen instead (the `sign_in` module).
 
 use std::io;
 use std::net::SocketAddr;
 use std::pin::pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -46,12 +48,15 @@ mod clipboard;
 mod hold_screen;
 mod protocol;
 mod rdp;
+mod sign_in;
 
 use bridge::connect_backend;
 use hold_screen::{hold_while, run_banner_screen, run_hold_screen};
-use protocol::{AuthVerdict, Event as ServerEvent, Input as ServerInput};
+use protocol::{AuthVerdict, Event as ServerEvent, Input as ServerInput, Refusal};
+use sign_in::{SignInScreen, SignInStep, Submission, needs_sign_in};
 use warpgate_desktop_auth::{
-    AdmissionHold, DesktopAuthOutcome, admit_desktop_session, authenticate, finalize_user_auth,
+    AdmissionHold, DesktopAuthOutcome, InteractiveAuth, admit_desktop_session, authenticate,
+    finalize_user_auth,
 };
 
 /// Depth of the feed into the viewer-facing RDP server. Bounded so a slow viewer
@@ -180,6 +185,9 @@ async fn handle_connection(
     // stream is not, so the server runs against an in-memory duplex and we relay the raw
     // (TLS) RDP bytes across.
     let (server_side, relay_side) = tokio::io::duplex(RELAY_BUFFER_BYTES);
+    // The viewer's keyboard layout, set once its session is activated, which is before the
+    // capability exchange reports the size the target is dialed at.
+    let keyboard_layout = Arc::new(AtomicU32::new(0));
     let rdp_done = rdp::run_on_thread(
         server_side,
         cert_pem,
@@ -187,6 +195,7 @@ async fn handle_connection(
         (DEFAULT_SCREEN_W, DEFAULT_SCREEN_H),
         server_out_tx,
         server_in_rx,
+        Arc::clone(&keyboard_layout),
     );
 
     drive_session(
@@ -196,6 +205,7 @@ async fn handle_connection(
             remote_address,
             server_out_rx,
             server_in_tx,
+            keyboard_layout,
         ),
         rdp_done,
         relay(viewer, relay_side),
@@ -293,11 +303,19 @@ async fn control_loop(
     remote_address: SocketAddr,
     mut events: UnboundedReceiver<ServerEvent>,
     server_in_tx: Sender<ServerInput>,
+    keyboard_layout: Arc<AtomicU32>,
 ) -> Result<()> {
+    let viewer = Viewer {
+        services: &services,
+        server_handle: &server_handle,
+        server_in_tx: &server_in_tx,
+        remote_address,
+        keyboard_layout: &keyboard_layout,
+    };
     let mut backend: Option<BackendBridge> = None;
     // Authorized target awaiting the first `Size` event before we dial it. The RDP
-    // sequence delivers the viewer's credentials (CredSSP) *before* its desktop size
-    // (capability exchange), so we hold the authorized target here and dial once the
+    // sequence delivers the viewer's credentials (Client Info PDU) *before* its desktop
+    // size (capability exchange), so we hold the authorized target here and dial once the
     // negotiated resolution arrives — otherwise the target would be dialed at the
     // pre-negotiation default and the whole session would run at that size.
     let mut pending_dial: Option<PendingDial> = None;
@@ -334,142 +352,54 @@ async fn control_loop(
                     // duplicate request by dropping its reply rather than answering twice.
                     continue;
                 }
-                match authenticate::<TargetRdpOptions>(
-                    &services,
-                    &server_handle,
+                match admit(
+                    &viewer,
                     &username,
                     password,
-                    remote_address,
+                    reply,
+                    &mut events,
+                    &mut screen,
                 )
-                .await
+                .await?
                 {
-                    Ok(DesktopAuthOutcome::Authorized { authorization }) => {
-                        // Accept the NLA so the capability exchange proceeds and reports
-                        // the viewer's desktop size; defer the target dial to that `Size`.
-                        if reply.send(AuthVerdict::StartSession).is_err() {
-                            break;
-                        }
+                    // The RDP server refuses the connection, which ends this loop.
+                    Admission::Refused => continue,
+                    Admission::Ended => break,
+                    Admission::DialOnSize(authorization) => {
                         pending_dial = Some(authorization);
-                        // The banner screen consumes the viewer's `Size` event while it waits,
-                        // so dial here once it's dismissed rather than waiting for a `Size`
-                        // that has already been delivered.
-                        match acknowledge_banner(&services, &mut events, &server_in_tx, &mut screen)
-                            .await?
-                        {
-                            BannerOutcome::NotShown => (),
-                            BannerOutcome::Acknowledged => {
-                                if !dial_if_pending(
-                                    &mut backend,
-                                    &mut pending_dial,
-                                    &services,
-                                    &server_handle,
-                                    &server_in_tx,
-                                    remote_address,
-                                    &mut events,
-                                    &mut screen,
-                                )
-                                .await?
-                                {
-                                    break;
-                                }
-                            }
-                            BannerOutcome::Disconnected => break,
-                        }
+                        continue;
                     }
-                    Ok(DesktopAuthOutcome::NeedsInteractive(interactive)) => {
-                        // Accept the NLA so the RDP session starts, then collect the second
-                        // factor (TOTP / web approval) on a Warpgate-rendered holding screen
-                        // before connecting to the target.
-                        if reply.send(AuthVerdict::StartSession).is_err() {
-                            break;
-                        }
-                        match run_hold_screen(
-                            &services,
-                            &interactive,
+                    Admission::DialNow {
+                        authorization,
+                        clipboard,
+                    } => {
+                        pending_dial = Some(authorization);
+                        if !dial_if_pending(
+                            &mut backend,
+                            &mut pending_dial,
+                            &viewer,
                             &mut events,
-                            &server_in_tx,
                             &mut screen,
                         )
-                        .await
+                        .await?
                         {
-                            Ok(Some(identity)) => {
-                                match finalize_user_auth::<TargetRdpOptions>(
-                                    &services,
-                                    &identity,
-                                    &interactive.target_name,
-                                )
-                                .await
-                                {
-                                    Ok(authorization) => {
-                                        // `screen` was updated by `run_hold_screen` as the
-                                        // viewer negotiated its size during the 2FA prompt.
-                                        pending_dial = Some(authorization);
-                                        if matches!(
-                                            acknowledge_banner(
-                                                &services,
-                                                &mut events,
-                                                &server_in_tx,
-                                                &mut screen,
-                                            )
-                                            .await?,
-                                            BannerOutcome::Disconnected
-                                        ) {
-                                            break;
-                                        }
-                                        if !dial_if_pending(
-                                            &mut backend,
-                                            &mut pending_dial,
-                                            &services,
-                                            &server_handle,
-                                            &server_in_tx,
-                                            remote_address,
-                                            &mut events,
-                                            &mut screen,
-                                        )
-                                        .await?
-                                        {
-                                            break;
-                                        }
-                                    }
-                                    Err(error) => {
-                                        warn!(%error, "Authorization failed after second factor");
-                                        let _ = server_in_tx.send(ServerInput::Shutdown).await;
-                                        break;
-                                    }
-                                }
-                            }
-                            Ok(None) => {
-                                warn!("Interactive authentication failed");
-                                let _ = server_in_tx.send(ServerInput::Shutdown).await;
-                                break;
-                            }
-                            Err(error) => {
-                                warn!(%error, "Holding-screen error");
-                                let _ = server_in_tx.send(ServerInput::Shutdown).await;
-                                break;
-                            }
+                            break;
+                        }
+                        // The viewer's clipboard text, which a screen took on its way to the
+                        // target: recorded and forwarded below like any other input.
+                        match clipboard {
+                            Some(text) => DesktopInput::Clipboard(text),
+                            None => continue,
                         }
                     }
-                    Ok(DesktopAuthOutcome::Failed) => {
-                        warn!("Authentication failed");
-                        let _ = reply.send(AuthVerdict::Deny);
-                    }
-                    Err(error) => {
-                        warn!(%error, "Authentication error");
-                        let _ = reply.send(AuthVerdict::Deny);
-                    }
                 }
-                continue;
             }
             ServerEvent::Size { width, height } => {
                 screen = warpgate_desktop_ui::Screen { width, height };
                 if !dial_if_pending(
                     &mut backend,
                     &mut pending_dial,
-                    &services,
-                    &server_handle,
-                    &server_in_tx,
-                    remote_address,
+                    &viewer,
                     &mut events,
                     &mut screen,
                 )
@@ -516,6 +446,8 @@ async fn control_loop(
                 }
                 continue;
             }
+            // Lock-key state matters to the sign-in screen only.
+            ServerEvent::KeyboardSync { .. } => continue,
             // Viewer input: record it for audit (like native VNC) then forward to the
             // target. `break` once the target client is gone (send fails).
             ServerEvent::Input(input) => input,
@@ -529,10 +461,7 @@ async fn control_loop(
         if !dial_if_pending(
             &mut backend,
             &mut pending_dial,
-            &services,
-            &server_handle,
-            &server_in_tx,
-            remote_address,
+            &viewer,
             &mut events,
             &mut screen,
         )
@@ -541,7 +470,7 @@ async fn control_loop(
             break;
         }
 
-        // Reached only for the viewer-input variants above.
+        // Reached only for viewer input.
         let Some(backend) = &backend else {
             continue;
         };
@@ -559,6 +488,223 @@ async fn control_loop(
         backend.shutdown();
     }
     Ok(())
+}
+
+/// What dialing the target and refusing the viewer take, fixed for the connection.
+struct Viewer<'a> {
+    services: &'a Services,
+    server_handle: &'a Arc<tokio::sync::Mutex<WarpgateServerHandle>>,
+    server_in_tx: &'a Sender<ServerInput>,
+    remote_address: SocketAddr,
+    /// The keyboard layout the viewer announced, for the target. `0`, the target's own
+    /// default, until the viewer's session is activated.
+    keyboard_layout: &'a AtomicU32,
+}
+
+impl Viewer<'_> {
+    /// End the viewer's session, telling it why.
+    async fn refuse(&self, refusal: Refusal) {
+        let _ = self
+            .server_in_tx
+            .send(ServerInput::Disconnect(refusal))
+            .await;
+    }
+}
+
+/// How the viewer's credentials were settled.
+enum Admission {
+    /// Its Client Info credentials were refused, so the RDP server refuses the connection.
+    Refused,
+    /// The session is over: the viewer left, or was refused (and told why) after its
+    /// session had started.
+    Ended,
+    /// Authorized during the handshake, before the capability exchange has reported the
+    /// viewer's size: the target is dialed at that size once it arrives.
+    DialOnSize(PendingDial),
+    /// Authorized after a screen, which took the viewer's size meanwhile: dial now.
+    DialNow {
+        authorization: PendingDial,
+        /// The viewer's clipboard text, if the sign-in screen took it, for the target.
+        clipboard: Option<String>,
+    },
+}
+
+/// Settle the viewer's credentials: check the ones its Client Info PDU carried or, without
+/// a password, ask for them on the sign-in screen; then collect any second factor and show
+/// the login banner.
+async fn admit(
+    viewer: &Viewer<'_>,
+    username: &str,
+    password: String,
+    reply: oneshot::Sender<AuthVerdict>,
+    events: &mut UnboundedReceiver<ServerEvent>,
+    screen: &mut warpgate_desktop_ui::Screen,
+) -> Result<Admission> {
+    // Every screen takes the viewer's `Size` event while it waits, so after one the target
+    // is dialed right away rather than on a `Size` that has come and gone.
+    let signing_in = needs_sign_in(username, &password);
+    let mut screen_shown = signing_in;
+
+    let (outcome, clipboard) = if signing_in {
+        // mstsc connects like this whenever it holds no saved credential: over TLS-only
+        // security it asks for nothing and expects the server to sign the user in on
+        // screen. Let the connection sequence finish, so there is a screen to do that on.
+        info!("The viewer sent no password; asking for one on the sign-in screen");
+        if reply.send(AuthVerdict::StartSession).is_err() {
+            return Ok(Admission::Ended);
+        }
+        let Some(signed_in) = sign_in(viewer, username, events, screen).await? else {
+            return Ok(Admission::Ended);
+        };
+        signed_in
+    } else {
+        match authenticate::<TargetRdpOptions>(
+            viewer.services,
+            viewer.server_handle,
+            username,
+            password,
+            viewer.remote_address,
+        )
+        .await
+        {
+            Ok(DesktopAuthOutcome::Failed) => {
+                warn!("Authentication failed");
+                let _ = reply.send(AuthVerdict::Deny);
+                return Ok(Admission::Refused);
+            }
+            Err(error) => {
+                warn!(%error, "Authentication error");
+                let _ = reply.send(AuthVerdict::Deny);
+                return Ok(Admission::Refused);
+            }
+            Ok(outcome) => {
+                // Accept the credentials so the connection sequence finishes; a second
+                // factor and the target's approval are collected over the session.
+                if reply.send(AuthVerdict::StartSession).is_err() {
+                    return Ok(Admission::Ended);
+                }
+                (outcome, None)
+            }
+        }
+    };
+
+    let authorization = match outcome {
+        DesktopAuthOutcome::Authorized { authorization } => authorization,
+        DesktopAuthOutcome::NeedsInteractive(interactive) => {
+            screen_shown = true;
+            let Some(authorization) = second_factor(viewer, &interactive, events, screen).await
+            else {
+                return Ok(Admission::Ended);
+            };
+            authorization
+        }
+        // Refused above for credentials from the Client Info PDU, and `sign_in` returns
+        // only a successful outcome.
+        DesktopAuthOutcome::Failed => {
+            viewer.refuse(Refusal::Denied).await;
+            return Ok(Admission::Ended);
+        }
+    };
+
+    Ok(
+        match acknowledge_banner(viewer.services, events, viewer.server_in_tx, screen).await? {
+            BannerOutcome::Disconnected => Admission::Ended,
+            BannerOutcome::NotShown if !screen_shown => Admission::DialOnSize(authorization),
+            BannerOutcome::NotShown | BannerOutcome::Acknowledged => Admission::DialNow {
+                authorization,
+                clipboard,
+            },
+        },
+    )
+}
+
+/// Show the sign-in screen until the viewer signs in. Each submission is checked exactly as
+/// a password from the Client Info PDU is, lockout and failed-attempt accounting included.
+///
+/// `None` once the session is over: the viewer left, or was refused (and told why) after
+/// [`sign_in::MAX_SIGN_IN_ATTEMPTS`] refused attempts or [`sign_in::SIGN_IN_TIMEOUT`]. With
+/// the outcome comes the viewer's clipboard text, if it sent any, for the target.
+async fn sign_in(
+    viewer: &Viewer<'_>,
+    username: &str,
+    events: &mut UnboundedReceiver<ServerEvent>,
+    screen: &mut warpgate_desktop_ui::Screen,
+) -> Result<Option<(DesktopAuthOutcome<TargetRdpOptions>, Option<String>)>> {
+    let mut form = SignInScreen::new(username, *screen);
+    loop {
+        let Submission { username, password } = match form
+            .next_submission(events, viewer.server_in_tx, screen)
+            .await?
+        {
+            SignInStep::Submitted(submission) => submission,
+            SignInStep::Disconnected => return Ok(None),
+            SignInStep::TimedOut => {
+                warn!("The viewer did not sign in in time");
+                viewer.refuse(Refusal::TimedOut).await;
+                return Ok(None);
+            }
+        };
+        form.show_checking(viewer.server_in_tx).await?;
+        match authenticate::<TargetRdpOptions>(
+            viewer.services,
+            viewer.server_handle,
+            &username,
+            password,
+            viewer.remote_address,
+        )
+        .await
+        {
+            Ok(DesktopAuthOutcome::Failed) => warn!("Authentication failed"),
+            Ok(outcome) => return Ok(Some((outcome, form.into_clipboard()))),
+            // A wrong target, or the check itself failing. The viewer is told the same as
+            // for a wrong password, see `sign_in::REFUSED`.
+            Err(error) => warn!(%error, "Authentication error"),
+        }
+        if !form.refused() {
+            warn!("Too many failed sign-in attempts");
+            viewer.refuse(Refusal::Denied).await;
+            return Ok(None);
+        }
+    }
+}
+
+/// Collect the second factor (TOTP / web approval) on a Warpgate-rendered holding screen,
+/// then authorize the target. `None` once the session is over: the viewer left, or was
+/// refused (and told why).
+async fn second_factor(
+    viewer: &Viewer<'_>,
+    interactive: &InteractiveAuth,
+    events: &mut UnboundedReceiver<ServerEvent>,
+    screen: &mut warpgate_desktop_ui::Screen,
+) -> Option<PendingDial> {
+    // `screen` is kept up to date by `run_hold_screen` as the viewer negotiates its size
+    // during the prompt.
+    match run_hold_screen(
+        viewer.services,
+        interactive,
+        events,
+        viewer.server_in_tx,
+        screen,
+    )
+    .await
+    {
+        Ok(Some(identity)) => {
+            match finalize_user_auth::<TargetRdpOptions>(
+                viewer.services,
+                &identity,
+                &interactive.target_name,
+            )
+            .await
+            {
+                Ok(authorization) => return Some(authorization),
+                Err(error) => warn!(%error, "Authorization failed after second factor"),
+            }
+        }
+        Ok(None) => warn!("Interactive authentication failed"),
+        Err(error) => warn!(%error, "Holding-screen error"),
+    }
+    viewer.refuse(Refusal::Denied).await;
+    None
 }
 
 /// An authorized target held until the viewer's negotiated size is known.
@@ -601,10 +747,7 @@ async fn acknowledge_banner(
 async fn dial_if_pending(
     backend: &mut Option<BackendBridge>,
     pending: &mut Option<PendingDial>,
-    services: &Services,
-    server_handle: &Arc<tokio::sync::Mutex<WarpgateServerHandle>>,
-    server_in_tx: &Sender<ServerInput>,
-    remote_address: SocketAddr,
+    viewer: &Viewer<'_>,
     events: &mut UnboundedReceiver<ServerEvent>,
     screen: &mut warpgate_desktop_ui::Screen,
 ) -> Result<bool> {
@@ -613,14 +756,16 @@ async fn dial_if_pending(
     {
         let hold = AdmissionHold::default();
         let admitting = admit_desktop_session(
-            services,
-            server_handle,
+            viewer.services,
+            viewer.server_handle,
             authorization,
-            Some(remote_address.ip()),
+            Some(viewer.remote_address.ip()),
             &hold,
         );
-        let Some(admitted) =
-            hold_while(admitting, events, server_in_tx, screen, || hold.frame()).await?
+        let Some(admitted) = hold_while(admitting, events, viewer.server_in_tx, screen, || {
+            hold.frame()
+        })
+        .await?
         else {
             // The viewer went away mid-hold. Dropping the hold released what it
             // was holding: the request row is closed and any ticket use
@@ -632,12 +777,21 @@ async fn dial_if_pending(
             Ok(admitted) => admitted,
             Err(WarpgateError::SessionNotApproved) => {
                 warn!("Session was not approved by an administrator");
-                let _ = server_in_tx.send(ServerInput::Shutdown).await;
+                viewer.refuse(Refusal::NotApproved).await;
                 return Ok(false);
             }
             Err(error) => return Err(error.into()),
         };
-        *backend = Some(connect_backend(services, server_in_tx, admitted, *screen).await?);
+        *backend = Some(
+            connect_backend(
+                viewer.services,
+                viewer.server_in_tx,
+                admitted,
+                *screen,
+                viewer.keyboard_layout.load(Ordering::Relaxed),
+            )
+            .await?,
+        );
     }
     Ok(true)
 }
@@ -799,6 +953,7 @@ mod relay_tests {
 mod rejection_tests {
     use std::io;
     use std::pin::Pin;
+    use std::sync::atomic::AtomicU32;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use std::time::Duration;
@@ -817,7 +972,7 @@ mod rejection_tests {
     use tokio::time::timeout;
     use warpgate_common::RdpTlsSecurity;
 
-    use super::protocol::{AuthVerdict, Event};
+    use super::protocol::{AuthVerdict, Event, Input, Refusal};
     use super::rdp::run_on_thread;
     use crate::client::{test_connector_config, upgrade_tls};
 
@@ -865,15 +1020,15 @@ mod rejection_tests {
         }
     }
 
-    /// The TPKT frames at the start of `bytes`, up to the first that is not one.
-    fn tpkt_frames(mut bytes: &[u8]) -> Vec<&[u8]> {
+    /// The RDP frames at the start of `bytes`, slow-path (TPKT) and fast-path alike, up to
+    /// the first that is incomplete or unreadable.
+    fn rdp_frames(mut bytes: &[u8]) -> Vec<&[u8]> {
         let mut frames = Vec::new();
-        while bytes.len() >= 4 && bytes[0] == 3 {
-            let len = usize::from(u16::from_be_bytes([bytes[2], bytes[3]]));
-            if len < 4 || len > bytes.len() {
+        while let Ok(Some(info)) = ironrdp_pdu::find_size(bytes) {
+            if info.length == 0 || info.length > bytes.len() {
                 break;
             }
-            let (frame, rest) = bytes.split_at(len);
+            let (frame, rest) = bytes.split_at(info.length);
             frames.push(frame);
             bytes = rest;
         }
@@ -882,7 +1037,7 @@ mod rejection_tests {
 
     /// Every Set Error Info PDU in `bytes` that a client's I/O-channel parser accepts.
     fn error_infos(bytes: &[u8]) -> Vec<ErrorInfo> {
-        tpkt_frames(bytes)
+        rdp_frames(bytes)
             .into_iter()
             .filter_map(|frame| {
                 let indication = decode_send_data_indication(frame).ok()?;
@@ -956,7 +1111,15 @@ mod rejection_tests {
         // every credential down, as it does a wrong password.
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
         let (_in_tx, in_rx) = mpsc::channel(16);
-        let server_done = run_on_thread(server_tcp, cert_pem, key_pem, (1024, 768), out_tx, in_rx);
+        let server_done = run_on_thread(
+            server_tcp,
+            cert_pem,
+            key_pem,
+            (1024, 768),
+            out_tx,
+            in_rx,
+            Arc::new(AtomicU32::new(0)),
+        );
         let control = tokio::spawn(async move {
             let mut asked = 0;
             while let Some(event) = out_rx.recv().await {
@@ -1034,6 +1197,120 @@ mod rejection_tests {
                 )]
             ),
             "expected one readable refusal from the server, found {refusals:?} in {} bytes",
+            seen.len()
+        );
+    }
+
+    /// mstsc without a saved credential sends no password. The connection must not be
+    /// refused for that during the handshake: the viewer gets a session, where Warpgate's
+    /// sign-in screen asks for the password. And a refusal that comes over that session, as
+    /// after the last wrong attempt, reaches the viewer as a reason it can read, not as a
+    /// dropped connection (which mstsc reports as a network error).
+    #[tokio::test]
+    async fn a_viewer_without_a_password_gets_a_session_and_hears_why_it_ends() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.signing_key.serialize_pem();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_tcp = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server_tcp, _) = listener.accept().await.unwrap();
+
+        // Warpgate's side: the real server state machine, and a control loop that does what
+        // the real one does with an empty password, starting the session for the sign-in
+        // screen, and then refuses the viewer, as after its last wrong attempt.
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let (in_tx, in_rx) = mpsc::channel(16);
+        let server_done = run_on_thread(
+            server_tcp,
+            cert_pem,
+            key_pem,
+            (1024, 768),
+            out_tx,
+            in_rx,
+            Arc::new(AtomicU32::new(0)),
+        );
+        let control = tokio::spawn(async move {
+            let mut passwords = Vec::new();
+            while let Some(event) = out_rx.recv().await {
+                if let Event::AuthRequest {
+                    password, reply, ..
+                } = event
+                {
+                    passwords.push(password);
+                    let _ = reply.send(AuthVerdict::StartSession);
+                    let _ = in_tx.send(Input::Disconnect(Refusal::Denied)).await;
+                }
+            }
+            passwords
+        });
+
+        // The viewer's side, over TLS only as mstsc reaches this listener, with an empty
+        // password as mstsc sends when it holds no saved credential.
+        let client_addr = client_tcp.local_addr().unwrap();
+        let mut framed = TokioFramed::new(client_tcp);
+        let mut connector =
+            connector::ClientConnector::new(test_connector_config("alice:target", ""), client_addr);
+        let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector)
+            .await
+            .unwrap();
+        let (tls, server_public_key) = upgrade_tls(
+            framed.into_inner_no_leftover(),
+            "localhost".to_owned(),
+            false,
+            RdpTlsSecurity::Tls12,
+        )
+        .await
+        .unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut framed = TokioFramed::new(Recorder {
+            inner: tls,
+            seen: Arc::clone(&seen),
+        });
+        let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+        let outcome = timeout(
+            DEADLINE,
+            ironrdp_tokio::connect_finalize(
+                upgraded,
+                connector,
+                &mut framed,
+                &mut ReqwestNetworkClient::new(),
+                "localhost".into(),
+                server_public_key,
+                None,
+            ),
+        )
+        .await
+        .expect("the handshake hung instead of ending");
+        assert!(
+            outcome
+                .and_then(connector::ConnectionOutcome::into_connected)
+                .is_ok(),
+            "a viewer without a password must get a session, for the sign-in screen"
+        );
+
+        // Then read what the server sends until it closes the connection.
+        let _ = timeout(DEADLINE, async { while framed.read_pdu().await.is_ok() {} }).await;
+        drop(framed);
+
+        let passwords = timeout(DEADLINE, control).await.unwrap().unwrap();
+        assert_eq!(
+            passwords,
+            [String::new()],
+            "the server asks Warpgate about the credentials once"
+        );
+        let _ = timeout(DEADLINE, server_done).await;
+
+        let seen = seen.lock().unwrap().clone();
+        let refusals = error_infos(&seen);
+        assert_eq!(
+            refusals,
+            [ErrorInfo::ProtocolIndependentCode(
+                ProtocolIndependentCode::ServerInsufficientPrivileges
+            )],
+            "expected the refusal's reason, found {refusals:?} in {} bytes",
             seen.len()
         );
     }

@@ -139,7 +139,9 @@ export const protocolInfo: Partial<Record<TargetKind, string>> = {
 ## Warpgate ↔ client
 
 * The client connects over TLS, without NLA: the username (\`user:target\`) and password arrive in the RDP logon info and are checked once the connection is established.
+* A client that sends no password (mstsc without a saved credential) gets Warpgate's sign-in screen instead, where the password is checked the same way: three attempts per connection, each counted towards lockout.
 * Authentication always starts with a password, other credentials (OTP / web approval) are then collected over a visual UI.
+* The target is told the client's keyboard layout, so keys type what they say on the client's keyboard.
 
 ## RDP protocol
 

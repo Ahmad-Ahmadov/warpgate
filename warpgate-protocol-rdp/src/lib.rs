@@ -82,6 +82,19 @@ pub fn connect(
     size: (u16, u16),
     secrets: Arc<dyn SecretResolver>,
 ) -> Result<DesktopClientHandles, WarpgateError> {
+    connect_with_keyboard_layout(admitted, size, secrets, 0)
+}
+
+/// [`connect`], telling the target the viewer's keyboard layout: a Windows KLID such as
+/// `0x0000_0409`, or `0` for the target's own default. A native RDP viewer sends keys as
+/// scancodes, which the target turns into characters with this layout, so a viewer whose
+/// layout the target is told types what its keycaps say, as over a direct connection.
+pub fn connect_with_keyboard_layout(
+    admitted: AdmittedTarget<TargetRdpOptions>,
+    size: (u16, u16),
+    secrets: Arc<dyn SecretResolver>,
+    keyboard_layout: u32,
+) -> Result<DesktopClientHandles, WarpgateError> {
     let target_session_id = admitted.id();
     let (user_info, target) = admitted.into_approved().into_parts();
     let (target, options) = target.into_parts();
@@ -111,6 +124,7 @@ pub fn connect(
             if let Err(error) = client::run(
                 options,
                 size,
+                keyboard_layout,
                 event_tx.clone(),
                 input_rx,
                 abort_rx,

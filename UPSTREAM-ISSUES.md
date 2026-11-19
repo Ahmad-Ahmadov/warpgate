@@ -5,8 +5,9 @@ up for reporting upstream. **None of these are changed in this fork** — each i
 a behaviour change rather than a presentation one, and the redesign is
 presentation-only.
 
-Entries 10 and 11 are the exception: backend defects found while syncing with
-upstream v0.30.0, which are fixed in this fork and say so.
+Entries 10 to 12 are the exception: backend defects, which are fixed in this
+fork and say so. Entries 10 and 11 were found while syncing with upstream
+v0.30.0, and entry 12 while making mstsc work.
 
 Each entry is written to be pasted into an issue with minimal editing.
 
@@ -599,3 +600,59 @@ falls through to the environment. With neither set, setup stops with its
 existing "you must supply the admin password" error. A whitespace-only password
 is still a password (it is a deliberate value, and policy is not setup's job).
 Covered by seven unit tests in `setup.rs`.
+
+## 12. Native RDP: mstsc without a saved credential can never sign in
+
+**Where:** `warpgate-protocol-rdp/src/server/mod.rs` (`control_loop`, the
+`AuthRequest` arm) and `rdp.rs` (`Validator`).
+
+**Changed in this fork.** Upstream: warp-tech/warpgate#2623, also mentioned in
+#2585.
+
+### What happens
+
+Connect with `mstsc.exe` and a user name of `user:target`, with "Allow me to
+save credentials" unticked. mstsc never asks for a password. Warpgate logs
+`Authentication failed ... reason=invalid credential`, and mstsc reports
+"Because of a protocol error, this session will be disconnected" (0xd06) or
+that the session ended because of network problems (0x904). Ticking "Allow
+me to save credentials" works around it, which is how #2623 was closed.
+
+Every such attempt is also recorded as a failed login against the user and the
+client's address. A user who retries a few times can lock themselves out
+without ever having typed a password.
+
+### Why
+
+The listener negotiates TLS-only security (`PROTOCOL_SSL`): NLA cannot work,
+because CredSSP needs every user's password in advance to verify the client's
+NTLM response. So the password has to come in the Client Info PDU. FreeRDP
+always sends it there. mstsc sends it only when it holds a saved credential.
+Against any server that does not negotiate NLA, it otherwise asks for nothing
+and leaves the server to sign the user in on screen, as Windows' logon screen
+does. Warpgate has no such screen and treats the empty password as a wrong one.
+
+### Fix (in this fork)
+
+When the Client Info PDU carries no password, and the username is not a
+ticket, Warpgate:
+
+1. Lets the RDP connection through.
+2. Draws its own sign-in form, with the username prefilled.
+3. Checks what is typed with the same `authenticate` call, so policy, lockout
+   and failed-attempt accounting all apply.
+4. Continues to the second factor, the banner and the target.
+
+The form allows three attempts and three minutes. It is repainted only when it
+changes, because it is reachable without authentication. Refusals that happen
+after the session has started now send a Set Error Info PDU through IronRDP's
+`ErrorInfoDisconnectHandle`. That covers the sign-in form, the second factor
+and admin approval. Before, the connection simply closed, which mstsc reports
+as a network error. A wrong password in the Client Info PDU is refused during
+the handshake as before.
+
+Covered by unit tests in `server/sign_in.rs`. A protocol test,
+`a_viewer_without_a_password_gets_a_session_and_hears_why_it_ends`, runs an
+IronRDP client with an empty password over TLS only against the real server
+state machine. Not yet run end to end with mstsc: see "Checking it with
+mstsc" in NOTES.md.

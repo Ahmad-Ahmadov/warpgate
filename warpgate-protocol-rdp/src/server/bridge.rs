@@ -93,13 +93,19 @@ async fn frame_bridge(
 }
 
 /// Connect to the target and start bridging its framebuffer, once auth is complete.
+/// `keyboard_layout` is the viewer's (a Windows KLID), or `0` for the target's default.
 pub(super) async fn connect_backend(
     services: &Services,
     server_in_tx: &Sender<ServerInput>,
     admitted: AdmittedTarget<TargetRdpOptions>,
     screen: warpgate_desktop_ui::Screen,
+    keyboard_layout: u32,
 ) -> Result<BackendBridge> {
-    info!(target=%admitted.target().name, "Authorized");
+    info!(
+        target = %admitted.target().name,
+        keyboard_layout = %format!("{keyboard_layout:#010x}"),
+        "Authorized"
+    );
 
     let recorder = warpgate_desktop_auth::start_recording(services, &admitted.id(), "rdp")
         .await
@@ -110,10 +116,11 @@ pub(super) async fn connect_backend(
         input_tx,
         abort_tx,
         logon_state,
-    } = crate::connect(
+    } = crate::connect_with_keyboard_layout(
         admitted,
         (screen.width, screen.height),
         services.secret_backends.clone(),
+        keyboard_layout,
     )?;
     if let Some(recorder) = &recorder {
         recorder.track_logon_state(logon_state);

@@ -2488,3 +2488,247 @@ container query and the spacing rules. The remaining Biome formatter notes on
 `Parameters.svelte` are in markup this change did not touch, and HEAD has
 them too. Not looked at in a browser: per the standing rule, the app is not
 run on this machine.
+
+## Native RDP: mstsc had no way to send its password
+
+### What failed
+
+RDP worked from MobaXterm but not from Remote Desktop Connection (mstsc). Two
+upstream reports describe the two ways mstsc fails through this listener:
+
+- **No password reaches Warpgate** (warp-tech/warpgate#2623, and a mention in
+  #2585). mstsc never asks for a password, Warpgate logs `Authentication
+  failed ... reason=invalid credential`, and mstsc reports a protocol error
+  (0xd06) or a network error (0x904). It works only after ticking "Allow me
+  to save credentials".
+- **A black screen after a successful sign-in** (warp-tech/warpgate#2681).
+  IronRDP's server sent RemoteFX in a Set Surface Bits command, which mstsc
+  draws as black. IronRDP fixed this in Devolutions/IronRDP#2229 (Stream
+  Surface Bits for RemoteFX, tested against mstsc on Windows 10 22H2), and that
+  code reached this tree with upstream #2871 (`pick_remotefx_codec`,
+  `RemoteFxCodec::surface_bits_command` in `vendor/ironrdp-server`). Nothing
+  further was changed for it.
+
+The first is this fork's problem to fix. The listener negotiates TLS-only
+security (`PROTOCOL_SSL`), not NLA, so credentials come from the Client Info
+PDU. FreeRDP-based clients such as MobaXterm always put the password there.
+mstsc does so only when it holds a saved credential. Otherwise, as against any
+server that does not negotiate NLA, it asks for nothing and expects the server
+to sign the user in on screen, as Windows' own logon screen does. Warpgate had
+no such screen: it treated the empty password as a wrong one, refused the
+connection, and recorded a failed attempt against the user and the address. So
+every plain mstsc connection also counted towards lockout.
+
+The negotiation itself was checked and is correct. mstsc requests
+`SSL | HYBRID | HYBRID_EX`, the acceptor selects `SSL`, and a client offering
+neither gets a well-formed `SSL_REQUIRED_BY_SERVER`. TLS was not the problem:
+the #2681 capture shows mstsc completing TLS 1.2 (ECDHE-ECDSA, AES-256-GCM)
+against this listener.
+
+### Why not NLA
+
+NLA would make mstsc prompt, but it cannot work for a gateway like this one.
+CredSSP authenticates the client with NTLM or Kerberos before the password is
+delegated. Checking the NTLM response, and deriving the key that decrypts the
+delegated password, needs the user's password (or its NT hash) in advance.
+IronRDP's CredSSP server therefore takes one fixed credential
+(`ironrdp-acceptor`'s `CredentialsProxyImpl`). Warpgate keeps Argon2 hashes,
+signs LDAP users in with a bind, and must never store LDAP passwords. Storing
+NT hashes would mean keeping a password equivalent for every user. Kerberos
+would need an SPN and keytab per deployment and domain-joined clients. For the
+same reason, mstsc's Restricted Admin and Remote Credential Guard modes
+(`/restrictedAdmin`, `/remoteGuard`), which require NLA, cannot be supported.
+mstsc refuses to connect in those modes.
+
+### What changed
+
+**A sign-in screen** (`server/sign_in.rs`, drawn by
+`warpgate_desktop_ui::render_sign_in`):
+
+- **When it appears:** for a viewer whose Client Info PDU carries no password
+  and whose username is not a ticket. The RDP connection is let through
+  (`AuthVerdict::StartSession`) and Warpgate draws a username and password form.
+  The username field holds what the client sent.
+- **How credentials are checked:** with the same `authenticate` call as a
+  password from the Client Info PDU, so the auth policy, lockout, IP blocking
+  and failed-attempt accounting all apply. A second factor follows on the
+  existing hold screen, then the banner, then the target.
+- **Limits:**
+  - Three refused attempts per connection, after which the viewer is refused
+    with a reason.
+  - 180 seconds in all.
+  - Every refusal shows one message. A wrong password and a wrong target name
+    fail at different stages of the check, but only after the password has
+    been checked, so different messages would confirm a password to anyone
+    who pairs it with a made-up target.
+- **Keyboard:**
+  - Scancodes are read as a US English keyboard (the screen says so), with
+    Shift, Caps Lock and Num Lock. Lock state comes from the client's
+    Synchronize event.
+  - Unicode input (IME, on-screen keyboard) is taken as is.
+  - Ctrl+V and Shift+Insert paste the client's clipboard text, for password
+    managers.
+  - Tab, Up/Down and clicks move between fields; Escape clears a field.
+  - A `DOMAIN\` prefix is dropped, since mstsc and FreeRDP drop it into the
+    Client Info domain field, which Warpgate ignores.
+- **Cost:** the form is visible before anyone has signed in, to anyone who can
+  reach the port. It is therefore painted only when it changes, at most once
+  per 100 ms, and idles at no cost. The 2FA hold screen's 10 fps animation is
+  acceptable only because that screen comes after a valid password.
+- **What stays private:**
+  - Nothing typed on the form is recorded; recording starts when the target is
+    dialed.
+  - The client's clipboard text is passed on to the target afterwards, as it
+    would have been without the form, unless it was pasted into the form.
+    Pasted text is most likely the password.
+
+A wrong password from the Client Info PDU is still refused during the handshake,
+as before, so MobaXterm and other FreeRDP clients behave exactly as they did.
+The only change for them is that an empty password now opens the form instead
+of failing.
+
+**Reasons for refusals after the session has started.** These used to close
+the connection with nothing sent, which mstsc reports as a network error. Now
+`ServerInput::Disconnect` sends a Set Error Info PDU through IronRDP's
+`ErrorInfoDisconnectHandle` first:
+
+| Refusal | Error info |
+|---|---|
+| Sign-in or second factor failed, or the target is not authorized | `ERRINFO_SERVER_INSUFFICIENT_PRIVILEGES` (as for refused Client Info credentials) |
+| Administrator did not approve | `ERRINFO_SERVER_DENIED_CONNECTION` |
+| Sign-in timed out | `ERRINFO_LOGON_TIMEOUT` |
+
+The router keeps the display feed open after sending one. Closing it ends the
+session too, and the two would race, losing the reason half the time.
+
+**The client's keyboard layout reaches the target.** The target connection used
+to declare layout 0, so the target typed the client's scancodes with its own
+default layout. A German or Azerbaijani mstsc user got US characters, unlike
+over a direct connection. The layout from the client's Client Core Data is now
+passed on (`connect_with_keyboard_layout`). This happens only for the standard
+IBM-enhanced keyboard type the target connection declares, because a Japanese
+or Korean layout needs its keyboard type and subtype too. The web client still
+sends 0.
+
+**Diagnostics.** New log lines, at info level unless noted, all inside the
+session's span. None of them contains a credential.
+
+- `Viewer completed the TLS handshake and sent its logon info`, with
+  `password_supplied` and `domain_supplied`. It marks the point where X.224
+  negotiation, TLS, MCS and the Client Info PDU are all through.
+- `The viewer sent no password; asking for one on the sign-in screen`.
+- `Viewer session activated`, with the client's `keyboard_layout`,
+  `keyboard_type` and `monitors`. The capability exchange is done.
+- The end of the connection, classified:
+  - `Viewer disconnected during the connection handshake, before sending its
+    logon info`. Typical when mstsc's user declines its certificate warning.
+  - `Viewer disconnected`, for an ordinary close. mstsc closes without a TLS
+    close_notify, which used to be logged as a warning on every session.
+  - Debug level after refused credentials.
+  - The warning `RDP session ended with error` now means a real failure.
+- `Authorized` now carries the keyboard layout sent to the target.
+
+For a deeper trace of one problem connection, set
+`RUST_LOG=audit=info,warpgate=debug,ironrdp_acceptor=debug,ironrdp_server=info`
+for the gateway. The default holds IronRDP at warn and `ironrdp_server` at
+error. IronRDP's debug output prints the X.224 request and the server's
+choice. Its `Credentials` `Debug` impl omits the password.
+
+The portal's connection instructions and the admin protocol notes for RDP
+targets now say how mstsc signs in.
+
+### Tests
+
+New tests:
+
+- `server::sign_in`, 25 unit tests:
+  - US scancodes with Shift, Caps Lock and Num Lock; chords and the nav
+    cluster type nothing; Unicode input.
+  - Form validation; the domain prefix; tickets; field limits; paste and the
+    clipboard hand-over.
+  - Clicks; sizes tracked; disconnect; timeout under paused time; attempts.
+  - That an idle form is painted once.
+- `server::rdp::outcome_tests`: hang-up classification and the refusal codes.
+- `rejection_tests::a_viewer_without_a_password_gets_a_session_and_hears_why_it_ends`:
+  the real server state machine and Warpgate's own IronRDP client over TLS
+  only, with an empty password, as mstsc sends.
+  - The connection must complete, where it used to be refused.
+  - A refusal sent over the session must arrive as a readable Set Error Info
+    PDU.
+  - The frame parser now uses `ironrdp_pdu::find_size`, so the fast-path
+    frames after activation do not stop it.
+- `warpgate-desktop-ui`: hit-testing matches the drawn fields at three sizes,
+  and the form renders on a 200x200 desktop.
+
+**None of it has been compiled or run.** This machine cannot link Rust, and
+Docker is off limits here. rustfmt parses and formats every changed file
+cleanly. `svelte-check` (0 errors, 1,130 files), Biome (the changed content
+is clean; the rest is CRLF noise the HEAD version shows too) and
+`vite build` pass for the web changes. On a machine with the toolchain:
+
+```
+cargo test -p warpgate-protocol-rdp -p warpgate-desktop-ui
+cargo cranky -p warpgate-protocol-rdp -p warpgate-desktop-ui --all-features
+cargo run -p warpgate-desktop-ui --example screens   # keys 6 and 7: the sign-in form
+```
+
+The image build compiles the code (`cargo build --features
+mysql,postgres,rdp-openssl-tls`) but runs no tests.
+
+### Checking it with mstsc
+
+Each case starts from a fresh mstsc with "Allow me to save credentials"
+unticked and no saved credential for the host (Windows Credential Manager,
+`TERMSRV/<host>`), unless it says otherwise.
+
+| # | Do | Expect |
+|---|---|---|
+| 1 | Connect with user name `user:target` | Certificate warning if the cert is self-signed, then the sign-in form with the username filled in. The right password reaches the target. Log: `password_supplied=false`, the sign-in line, `Viewer session activated`, `Authorized` |
+| 2 | As 1, wrong password three times | The form says sign-in failed twice. Then mstsc reports insufficient privileges, not a network error, and three failed attempts are recorded |
+| 3 | As 1, leave the form for over 3 minutes | mstsc reports the logon time limit |
+| 4 | As 1 with a domain account and `CORP\user:target`, then a UPN user `user@corp.example:target` | Both sign in |
+| 5 | Copy the password, connect, press Ctrl+V and Enter | Signs in; the target's clipboard does not get the password |
+| 6 | "Allow me to save credentials", right password saved | No form; straight to the target, as before |
+| 7 | Saved, wrong password | Refused during the handshake (insufficient privileges), as before |
+| 8 | User with TOTP | Form, then the one-time password screen, then the target |
+| 9 | Target that requires approval; deny it | mstsc reports the server denied the connection |
+| 10 | German or Azerbaijani keyboard layout | The target types what the keycaps say (in Notepad); the log shows that layout's KLID |
+| 11 | MobaXterm, unchanged settings | Works as before; a wrong password is still refused at once |
+| 12 | Close the mstsc window mid-session | Logged at info as `Viewer disconnected`, not as a warning |
+| 13 | Black-screen check (#2681): a full session with RemoteFX | Picture, not black |
+
+### Not changed, and why
+
+- **NLA toward clients** (see above), and therefore Restricted Admin and
+  Remote Credential Guard.
+- **The target's own end reason.** When the target ends the session (logoff,
+  say), the target-side client keeps only the reason's description string
+  (`GracefulDisconnectReason::Other`). The viewer still gets a plain close,
+  which mstsc reports as a network error. Passing the code on needs a change
+  to the shared `DesktopEvent`, which this work did not risk without a
+  compiler.
+- **Keyboard layouts on the sign-in form.** Anything other than US English
+  would need per-layout tables. Unicode input and pasting work for any
+  character.
+
+### Connection quality: findings, not yet changed
+
+The quality half of the request came without its details, so nothing was
+changed for it. The investigation found:
+
+- mstsc gets RemoteFX, already at the finest standard quantization (IronRDP's
+  default `Quant`: 6 for LL3 up to 9 for HH1, MS-RDPRFX's own table). Turning
+  quantization won't sharpen it; only a lossless path would.
+- With RemoteFX off, this IronRDP snapshot sends raw 32-bit surface bits,
+  about 8 MB per 1080p frame. IronRDP#2411 (merged 2026-11-15, after the
+  snapshot) sends RDP 6.0 bitmaps instead. That is the prerequisite for a
+  lossless option toward the viewer, the counterpart of the target-side
+  "lossless" setting.
+- The negotiation response does not advertise the graphics pipeline
+  (IronRDP#2470 is open), so mstsc never uses H.264/AVC toward Warpgate.
+- #2681's log shows `Encoding bitmap took 158 ms` at 1786x920. Encoding is
+  the likely latency cost on large desktops, and worth measuring before any
+  tuning.
+- The server advertises Refresh Rect but does not repaint on one (noted in
+  #2681). mstsc relies on it after Suppress Output, for example when
+  restored from minimized.
