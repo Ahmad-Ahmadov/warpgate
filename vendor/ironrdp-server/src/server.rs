@@ -62,7 +62,7 @@ use crate::autodetect::{AutoDetectHandles, AutoDetectManager, AutoDetectOutcome}
 use crate::clipboard::CliprdrServerFactory;
 use crate::display::{DisplayContext, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates};
 use crate::echo::{EchoDvcBridge, EchoServerHandle, EchoServerMessage, build_echo_request};
-use crate::encoder::{RemoteFxCodec, UpdateEncoder, UpdateEncoderCodecs};
+use crate::encoder::{DISPLAY_TARGET, RemoteFxCodec, UpdateEncoder, UpdateEncoderCodecs};
 use crate::error::{ServerError, ServerErrorExt as _, ServerErrorKind, ServerResult};
 #[cfg(feature = "egfx")]
 use crate::gfx::{EgfxServerMessage, GfxContext, GfxServerFactory, GfxServerHandle};
@@ -3646,6 +3646,9 @@ impl RdpServer {
         Ok(RunState::Continue)
     }
 
+    /// Warpgate: the fast-path PDUs of an update are gathered into writes of up to
+    /// [`DISPLAY_WRITE_BYTES`], rather than written, and flushed through TLS, one PDU of at most
+    /// 16 KB at a time; `stats` is told how long encoding and writing took.
     async fn dispatch_display_update(
         update: DisplayUpdate,
         writer: &mut impl FramedWrite,
@@ -3653,6 +3656,7 @@ impl RdpServer {
         io_channel_id: u16,
         buffer: &mut Vec<u8>,
         mut encoder: UpdateEncoder,
+        stats: &mut DisplayStats,
     ) -> ServerResult<(RunState, UpdateEncoder)> {
         if let DisplayUpdate::Resize(desktop_size) = update {
             debug!(?desktop_size, "Display resize");
@@ -3661,6 +3665,13 @@ impl RdpServer {
             return Ok((RunState::DeactivationReactivation { desktop_size }, encoder));
         }
 
+        let bitmap = matches!(update, DisplayUpdate::Bitmap(_));
+        let started = Instant::now();
+        let mut writing = Duration::ZERO;
+        let mut written = 0;
+        // The bytes at the start of `buffer` still to be written.
+        let mut pending = 0;
+
         let mut encoder_iter = encoder.update(update);
         loop {
             let Some(fragmenter) = encoder_iter.next().await else {
@@ -3668,18 +3679,28 @@ impl RdpServer {
             };
 
             let mut fragmenter = fragmenter?;
-            if fragmenter.size_hint() > buffer.len() {
-                buffer.resize(fragmenter.size_hint(), 0);
-            }
-
-            while let Some(len) = fragmenter.next(buffer) {
-                writer
-                    .write_all(&buffer[..len])
-                    .await
-                    .map_err(|e| ServerError::io("failed to write display update", e))?;
+            loop {
+                let end = pending + fragmenter.size_hint();
+                if end > buffer.len() {
+                    buffer.resize(end, 0);
+                }
+                let Some(len) = fragmenter.next(&mut buffer[pending..end]) else {
+                    break;
+                };
+                pending += len;
+                if pending >= DISPLAY_WRITE_BYTES {
+                    writing += write_display(writer, &buffer[..pending]).await?;
+                    written += pending;
+                    pending = 0;
+                }
             }
         }
+        if pending > 0 {
+            writing += write_display(writer, &buffer[..pending]).await?;
+            written += pending;
+        }
 
+        stats.record(bitmap, started.elapsed().saturating_sub(writing), writing, written);
         Ok((RunState::Continue, encoder))
     }
 
@@ -4800,6 +4821,7 @@ impl RdpServer {
 
         let dispatch_display = async move {
             let mut buffer = vec![0u8; 4096];
+            let mut stats = DisplayStats::default();
 
             loop {
                 match display_updates.next_update().await {
@@ -4811,6 +4833,7 @@ impl RdpServer {
                             io_channel_id,
                             &mut buffer,
                             encoder,
+                            &mut stats,
                         )
                         .await?
                         {
@@ -6086,6 +6109,93 @@ fn encode_share_data_pdu(
         user_data,
     };
     encode_vec(&X224(mcs_pdu)).map_err(ServerError::encode)
+}
+
+/// Warpgate: how many bytes of display updates go to the writer at once. Every write is flushed
+/// through TLS, so writing each fast-path PDU (at most 16 KB) on its own cost a flush, a lock of
+/// the shared writer and a wakeup of the transport per PDU. Kept small, because the writer stays
+/// locked for a whole write: `dispatch_events` waits for it holding the connection lock, and
+/// input waits for that.
+const DISPLAY_WRITE_BYTES: usize = 64 * 1024;
+
+/// Write `data`, returning how long that took: the time the display path waited on the viewer's
+/// connection.
+async fn write_display(writer: &mut impl FramedWrite, data: &[u8]) -> ServerResult<Duration> {
+    let started = Instant::now();
+    writer
+        .write_all(data)
+        .await
+        .map_err(|e| ServerError::io("failed to write display update", e))?;
+    Ok(started.elapsed())
+}
+
+/// Warpgate: how the display updates of one connection fared, reported under
+/// [`DISPLAY_TARGET`]: each update at trace level, and a summary every
+/// [`DisplayStats::PERIOD`] at debug level. "Encode" is everything but the writing: the diff
+/// against the last frame, the encoding and the framebuffer update. "Write" is the time spent
+/// waiting on the viewer's connection, which grows when the network or the viewer is the
+/// bottleneck.
+#[derive(Default)]
+struct DisplayStats {
+    since: Option<Instant>,
+    bitmaps: u32,
+    others: u32,
+    bytes: u64,
+    encode: Duration,
+    encode_max: Duration,
+    write: Duration,
+    write_max: Duration,
+}
+
+impl DisplayStats {
+    const PERIOD: Duration = Duration::from_secs(10);
+
+    fn record(&mut self, bitmap: bool, encode: Duration, write: Duration, bytes: usize) {
+        let now = Instant::now();
+        let since = *self.since.get_or_insert(now);
+        if bitmap {
+            self.bitmaps += 1;
+        } else {
+            self.others += 1;
+        }
+        self.bytes += u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.encode += encode;
+        self.encode_max = self.encode_max.max(encode);
+        self.write += write;
+        self.write_max = self.write_max.max(write);
+        let us = |duration: Duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+        trace!(
+            target: DISPLAY_TARGET,
+            bitmap,
+            encode_us = us(encode),
+            write_us = us(write),
+            bytes,
+            "Display update"
+        );
+
+        let elapsed = now.saturating_duration_since(since);
+        if elapsed < Self::PERIOD {
+            return;
+        }
+        let updates = self.bitmaps + self.others;
+        let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
+        debug!(
+            target: DISPLAY_TARGET,
+            seconds = elapsed.as_secs(),
+            bitmap_updates = self.bitmaps,
+            other_updates = self.others,
+            kbit_per_s = self.bytes as f64 * 8.0 / 1000.0 / elapsed.as_secs_f64(),
+            encode_ms_avg = ms(self.encode) / f64::from(updates.max(1)),
+            encode_ms_max = ms(self.encode_max),
+            write_ms_avg = ms(self.write) / f64::from(updates.max(1)),
+            write_ms_max = ms(self.write_max),
+            "Display updates"
+        );
+        *self = Self {
+            since: Some(now),
+            ..Self::default()
+        };
+    }
 }
 
 async fn deactivate_all(io_channel_id: u16, user_channel_id: u16, writer: &mut impl FramedWrite) -> ServerResult<()> {
@@ -7597,5 +7707,120 @@ mod cliprdr_timeout_tests {
             .await
             .unwrap();
         assert!(writer.0.is_empty());
+    }
+}
+
+/// Warpgate: display updates reach the writer in a few large writes, unchanged.
+#[cfg(test)]
+mod display_write_tests {
+    use core::num::{NonZeroU16, NonZeroUsize};
+
+    use super::*;
+    use crate::{BitmapUpdate, PixelFormat};
+
+    /// Keeps each write apart.
+    #[derive(Default)]
+    struct Writes(Vec<Vec<u8>>);
+
+    impl FramedWrite for Writes {
+        type WriteAllFut<'write>
+            = core::future::Ready<std::io::Result<()>>
+        where
+            Self: 'write;
+
+        fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Self::WriteAllFut<'a> {
+            self.0.push(buf.to_vec());
+            core::future::ready(Ok(()))
+        }
+    }
+
+    const DESKTOP: DesktopSize = DesktopSize {
+        width: 640,
+        height: 384,
+    };
+
+    /// No codec in common, so lossless bitmaps: noise makes them large.
+    fn encoder() -> UpdateEncoder {
+        UpdateEncoder::new(
+            DESKTOP,
+            CmdFlags::SET_SURFACE_BITS,
+            UpdateEncoderCodecs::new(),
+            8 * 1024 * 1024,
+            25,
+            LargePointerSupportFlags::empty(),
+        )
+        .unwrap()
+    }
+
+    fn noise() -> DisplayUpdate {
+        let (width, height) = (usize::from(DESKTOP.width), usize::from(DESKTOP.height));
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let data: Vec<u8> = (0..width * height * 4)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect();
+        DisplayUpdate::Bitmap(BitmapUpdate {
+            x: 0,
+            y: 0,
+            width: NonZeroU16::new(DESKTOP.width).unwrap(),
+            height: NonZeroU16::new(DESKTOP.height).unwrap(),
+            format: PixelFormat::BgrA32,
+            data: data.into(),
+            stride: NonZeroUsize::new(width * 4).unwrap(),
+        })
+    }
+
+    /// Every fast-path PDU of `update`, back to back, as an encoder in the same state sends them.
+    async fn pdus(update: DisplayUpdate) -> Vec<u8> {
+        let mut encoder = encoder();
+        let mut pdus = Vec::new();
+        let mut updates = encoder.update(update);
+        while let Some(fragmenter) = updates.next().await {
+            let mut fragmenter = fragmenter.unwrap();
+            let mut buffer = vec![0; fragmenter.size_hint()];
+            while let Some(len) = fragmenter.next(&mut buffer) {
+                pdus.extend_from_slice(&buffer[..len]);
+            }
+        }
+        pdus
+    }
+
+    async fn dispatch(update: DisplayUpdate) -> (Vec<Vec<u8>>, DisplayStats) {
+        let mut writes = Writes::default();
+        let mut stats = DisplayStats::default();
+        let (state, _) =
+            RdpServer::dispatch_display_update(update, &mut writes, 1007, 1003, &mut Vec::new(), encoder(), &mut stats)
+                .await
+                .unwrap();
+        assert!(matches!(state, RunState::Continue));
+        (writes.0, stats)
+    }
+
+    #[tokio::test]
+    async fn a_large_update_goes_out_in_a_few_large_writes() {
+        let expected = pdus(noise()).await;
+        assert!(expected.len() > 3 * DISPLAY_WRITE_BYTES, "{} bytes", expected.len());
+
+        let (writes, stats) = dispatch(noise()).await;
+        assert!(writes.concat() == expected, "the bytes written differ from the PDUs");
+        assert!(writes.len() <= expected.len().div_ceil(DISPLAY_WRITE_BYTES));
+        let (last, rest) = writes.split_last().unwrap();
+        assert!(!last.is_empty());
+        for write in rest {
+            assert!(write.len() >= DISPLAY_WRITE_BYTES, "a {} byte write", write.len());
+        }
+        assert_eq!((stats.bitmaps, stats.others), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn a_small_update_is_one_write() {
+        let expected = pdus(DisplayUpdate::DefaultPointer).await;
+        let (writes, stats) = dispatch(DisplayUpdate::DefaultPointer).await;
+        assert_eq!(writes, [expected]);
+        assert_eq!((stats.bitmaps, stats.others), (0, 1));
     }
 }

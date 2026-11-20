@@ -13,9 +13,8 @@ use ironrdp_pdu::pointer::{
 };
 use ironrdp_pdu::rdp::capability_sets::{CmdFlags, EntropyBits, LargePointerSupportFlags};
 use ironrdp_pdu::surface_commands::{ExtendedBitmapDataPdu, SurfaceBitsPdu, SurfaceCommand};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-use self::bitmap::BitmapEncoder;
 use self::rfx::RfxEncoder;
 use super::BitmapUpdate;
 use crate::error::{ServerError, ServerErrorExt as _, ServerResult, ServerResultExt as _};
@@ -33,21 +32,9 @@ mod rfx_component;
 pub(crate) use fast_path::*;
 use ironrdp_graphics::rdp6::BitmapEncodeError;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-#[repr(u8)]
-enum CodecId {
-    None = 0x0,
-}
-
-impl CodecId {
-    #[expect(
-        clippy::as_conversions,
-        reason = "guarantees discriminant layout, and as is the only way to cast enum -> primitive"
-    )]
-    fn as_u8(self) -> u8 {
-        self as u8
-    }
-}
+/// Warpgate: the tracing target of the display path's own reports, the graphics a viewer
+/// negotiated and how its updates fare, so they can be enabled apart from the rest of the crate.
+pub(crate) const DISPLAY_TARGET: &str = "ironrdp_server::graphics";
 
 #[cfg_attr(any(feature = "__test", feature = "__bench"), visibility::make(pub))]
 #[derive(Debug)]
@@ -165,19 +152,24 @@ impl UpdateEncoder {
         pointer_cache_size: u16,
         large_pointer_flags: LargePointerSupportFlags,
     ) -> ServerResult<Self> {
-        let bitmap_updater = if surface_flags.contains(CmdFlags::SET_SURFACE_BITS) {
+        let (bitmap_updater, graphics) = if surface_flags.contains(CmdFlags::SET_SURFACE_BITS) {
             match codecs {
                 #[cfg(feature = "qoiz")]
-                UpdateEncoderCodecs { qoiz: Some(id), .. } => BitmapUpdater::Qoiz(QoizHandler::new(id)?),
+                UpdateEncoderCodecs { qoiz: Some(id), .. } => {
+                    (BitmapUpdater::Qoiz(QoizHandler::new(id)?), "QOIZ".to_owned())
+                }
                 #[cfg(feature = "qoi")]
-                UpdateEncoderCodecs { qoi: Some(id), .. } => BitmapUpdater::Qoi(QoiHandler::new(id)),
+                UpdateEncoderCodecs { qoi: Some(id), .. } => (BitmapUpdater::Qoi(QoiHandler::new(id)), "QOI".to_owned()),
                 UpdateEncoderCodecs {
                     remotefx: Some((algo, id, codec)),
                     remotefx_quant,
                     ..
                 } => {
                     let command = codec.surface_bits_command(surface_flags);
-                    BitmapUpdater::RemoteFx(RemoteFxHandler::new(algo, remotefx_quant, id, desktop_size, command))
+                    (
+                        BitmapUpdater::RemoteFx(RemoteFxHandler::new(algo, remotefx_quant, id, desktop_size, command)),
+                        format!("{codec:?} ({algo:?}) in {command:?} Surface Bits"),
+                    )
                 }
                 // NSCodec is the lowest-priority codec because it predates
                 // RemoteFX and produces larger output. It's relevant mainly
@@ -189,12 +181,29 @@ impl UpdateEncoder {
                 UpdateEncoderCodecs {
                     nscodec: Some((id, cll)),
                     ..
-                } => BitmapUpdater::NsCodec(NsCodecHandler::new(id, cll)),
-                _ => BitmapUpdater::None(NoneHandler),
+                } => (BitmapUpdater::NsCodec(NsCodecHandler::new(id, cll)), "NSCodec".to_owned()),
+                // Warpgate: lossless RDP 6.0 bitmaps rather than raw surface bits, a fraction of
+                // the bytes. See `bitmap`.
+                _ => (
+                    BitmapUpdater::Bitmap(BitmapHandler),
+                    "RDP 6.0 bitmaps (lossless, no codec in common)".to_owned(),
+                ),
             }
         } else {
-            BitmapUpdater::Bitmap(BitmapHandler::new())
+            (
+                BitmapUpdater::Bitmap(BitmapHandler),
+                "RDP 6.0 bitmaps (lossless, no surface commands)".to_owned(),
+            )
         };
+        info!(
+            target: DISPLAY_TARGET,
+            %graphics,
+            width = desktop_size.width,
+            height = desktop_size.height,
+            pointer_cache_size,
+            large_pointers = ?large_pointer_flags,
+            "Viewer graphics"
+        );
 
         Ok(Self {
             desktop_size,
@@ -475,13 +484,17 @@ impl UpdateEncoder {
         }
     }
 
-    async fn bitmap(&mut self, bitmap: BitmapUpdate) -> ServerResult<UpdateFragmenter> {
+    /// Warpgate: encode every changed rectangle of one bitmap update in a single blocking task,
+    /// side by side where the codec allows it. Upstream handed the blocking pool one rectangle at
+    /// a time, and sent each before encoding the next, so an update that changed in several
+    /// places kept one core busy at a time.
+    async fn bitmaps(&mut self, bitmaps: Vec<BitmapUpdate>) -> ServerResult<Vec<UpdateFragmenter>> {
         // Move the bitmap updater to satisfy spawn_blocking 'static requirement.
         // It is restored after the blocking operation completes.
         let mut updater = self.bitmap_updater.take().expect("bitmap updater always Some");
 
         let (result, updater) = tokio::task::spawn_blocking(move || {
-            let result = time_warn!("Encoding bitmap", 10, updater.handle(&bitmap));
+            let result = time_warn!("Encoding bitmap", 10, updater.handle_all(&bitmaps));
             (result, updater)
         })
         .await
@@ -493,13 +506,37 @@ impl UpdateEncoder {
     }
 }
 
+/// The parts of `bitmap` the changed rectangles `diffs` cover, as bitmaps of their own, or `None`
+/// if one of them is not inside it.
+fn sub_bitmaps(bitmap: &BitmapUpdate, diffs: &[Rect]) -> ServerResult<Option<Vec<BitmapUpdate>>> {
+    let invalid = |reason: &'static str| ServerError::reason("bitmap diff", reason);
+    let mut subs = Vec::with_capacity(diffs.len());
+    for rect in diffs {
+        let Rect { x, y, width, height } = *rect;
+        let x = u16::try_from(x).map_err(|_| invalid("invalid `x`: out of range integral conversion"))?;
+        let y = u16::try_from(y).map_err(|_| invalid("invalid `y`: out of range integral conversion"))?;
+        let width = u16::try_from(width).map_err(|_| invalid("invalid `width`: out of range integral conversion"))?;
+        let width = NonZeroU16::new(width).ok_or_else(|| invalid("rectangle width cannot be zero"))?;
+        let height =
+            u16::try_from(height).map_err(|_| invalid("invalid `height`: out of range integral conversion"))?;
+        let height = NonZeroU16::new(height).ok_or_else(|| invalid("rectangle height cannot be zero"))?;
+        let Some(sub) = bitmap.sub(x, y, width, height) else {
+            return Ok(None);
+        };
+        subs.push(sub);
+    }
+    Ok(Some(subs))
+}
+
 #[derive(Debug, Default)]
 enum State {
     Start(DisplayUpdate),
-    BitmapDiffs {
-        diffs: Vec<Rect>,
+    /// Warpgate: every changed rectangle of `bitmap` encoded, the updates for them left to hand
+    /// out; `diffs` goes into the framebuffer once they have all been.
+    BitmapEncoded {
+        updates: std::vec::IntoIter<UpdateFragmenter>,
         bitmap: BitmapUpdate,
-        pos: usize,
+        diffs: Vec<Rect>,
     },
     #[default]
     Ended,
@@ -531,7 +568,27 @@ impl EncoderIter<'_> {
                             continue;
                         }
                         let diffs = encoder.bitmap_diffs(&bitmap);
-                        self.state = State::BitmapDiffs { diffs, bitmap, pos: 0 };
+                        let subs = match sub_bitmaps(&bitmap, &diffs) {
+                            Ok(Some(subs)) => subs,
+                            Ok(None) => {
+                                warn!("Failed to extract bitmap subregion");
+                                return None;
+                            }
+                            Err(error) => return Some(Err(error)),
+                        };
+                        let updates = if subs.is_empty() {
+                            Vec::new()
+                        } else {
+                            match encoder.bitmaps(subs).await {
+                                Ok(updates) => updates,
+                                Err(error) => return Some(Err(error)),
+                            }
+                        };
+                        self.state = State::BitmapEncoded {
+                            updates: updates.into_iter(),
+                            bitmap,
+                            diffs,
+                        };
                         continue;
                     }
                     DisplayUpdate::PointerPosition(pos) => UpdateEncoder::pointer_position(pos),
@@ -565,77 +622,18 @@ impl EncoderIter<'_> {
                     }
                     DisplayUpdate::Resize(_) => return None,
                 },
-                State::BitmapDiffs { diffs, bitmap, pos } => {
-                    let Some(rect) = diffs.get(pos) else {
+                State::BitmapEncoded {
+                    mut updates,
+                    bitmap,
+                    diffs,
+                } => {
+                    let Some(update) = updates.next() else {
                         encoder.bitmap_update_framebuffer(bitmap, &diffs);
                         self.state = State::Ended;
                         return None;
                     };
-                    let Rect { x, y, width, height } = *rect;
-
-                    let x = match u16::try_from(x) {
-                        Ok(x) => x,
-                        Err(_) => {
-                            return Some(Err(ServerError::reason(
-                                "bitmap diff",
-                                "invalid `x`: out of range integral conversion",
-                            )));
-                        }
-                    };
-                    let y = match u16::try_from(y) {
-                        Ok(y) => y,
-                        Err(_) => {
-                            return Some(Err(ServerError::reason(
-                                "bitmap diff",
-                                "invalid `y`: out of range integral conversion",
-                            )));
-                        }
-                    };
-                    let width = match u16::try_from(width) {
-                        Ok(width) => match NonZeroU16::new(width) {
-                            Some(width) => width,
-                            None => {
-                                return Some(Err(ServerError::reason(
-                                    "bitmap diff",
-                                    "rectangle width cannot be zero",
-                                )));
-                            }
-                        },
-                        Err(_) => {
-                            return Some(Err(ServerError::reason(
-                                "bitmap diff",
-                                "invalid `width`: out of range integral conversion",
-                            )));
-                        }
-                    };
-                    let height = match u16::try_from(height) {
-                        Ok(height) => match NonZeroU16::new(height) {
-                            Some(height) => height,
-                            None => {
-                                return Some(Err(ServerError::reason(
-                                    "bitmap diff",
-                                    "rectangle height cannot be zero",
-                                )));
-                            }
-                        },
-                        Err(_) => {
-                            return Some(Err(ServerError::reason(
-                                "bitmap diff",
-                                "invalid `height`: out of range integral conversion",
-                            )));
-                        }
-                    };
-
-                    let Some(sub) = bitmap.sub(x, y, width, height) else {
-                        warn!("Failed to extract bitmap subregion");
-                        return None;
-                    };
-                    self.state = State::BitmapDiffs {
-                        diffs,
-                        bitmap,
-                        pos: pos + 1,
-                    };
-                    encoder.bitmap(sub).await
+                    self.state = State::BitmapEncoded { updates, bitmap, diffs };
+                    Ok(update)
                 }
                 State::Ended => return None,
             };
@@ -647,7 +645,6 @@ impl EncoderIter<'_> {
 
 #[derive(Debug)]
 enum BitmapUpdater {
-    None(NoneHandler),
     Bitmap(BitmapHandler),
     RemoteFx(RemoteFxHandler),
     #[cfg(feature = "qoi")]
@@ -661,7 +658,6 @@ enum BitmapUpdater {
 impl BitmapUpdater {
     fn handle(&mut self, bitmap: &BitmapUpdate) -> ServerResult<UpdateFragmenter> {
         match self {
-            Self::None(up) => up.handle(bitmap),
             Self::Bitmap(up) => up.handle(bitmap),
             Self::RemoteFx(up) => up.handle(bitmap),
             #[cfg(feature = "qoi")]
@@ -673,6 +669,20 @@ impl BitmapUpdater {
         }
     }
 
+    /// Warpgate: the update for each of `bitmaps`, in order. RemoteFX and RDP 6.0 bitmaps encode
+    /// a rectangle from its pixels alone, so their rectangles are encoded side by side; the
+    /// others keep state from one rectangle to the next and go one at a time.
+    fn handle_all(&mut self, bitmaps: &[BitmapUpdate]) -> ServerResult<Vec<UpdateFragmenter>> {
+        match self {
+            Self::RemoteFx(up) => {
+                let up = &*up;
+                encode_each(bitmaps, |bitmap| up.encode(bitmap))
+            }
+            Self::Bitmap(_) => encode_each(bitmaps, BitmapHandler::encode),
+            other => bitmaps.iter().map(|bitmap| other.handle(bitmap)).collect(),
+        }
+    }
+
     fn set_desktop_size(&mut self, size: DesktopSize) {
         if let Self::RemoteFx(up) = self {
             up.set_desktop_size(size)
@@ -680,64 +690,44 @@ impl BitmapUpdater {
     }
 }
 
+/// `encode` applied to each of `bitmaps`, in parallel when the `rayon` feature is on, the results
+/// in the order of `bitmaps`.
+fn encode_each<F>(bitmaps: &[BitmapUpdate], encode: F) -> ServerResult<Vec<UpdateFragmenter>>
+where
+    F: Fn(&BitmapUpdate) -> ServerResult<UpdateFragmenter> + Sync + Send,
+{
+    #[cfg(feature = "rayon")]
+    use rayon::prelude::*;
+
+    #[cfg(feature = "rayon")]
+    let bitmaps = bitmaps.par_iter();
+    #[cfg(not(feature = "rayon"))]
+    let bitmaps = bitmaps.iter();
+
+    bitmaps.map(encode).collect()
+}
+
 trait BitmapUpdateHandler {
     fn handle(&mut self, bitmap: &BitmapUpdate) -> ServerResult<UpdateFragmenter>;
 }
 
+/// Warpgate: lossless RDP 6.0 bitmap updates, in tiles of at most 64x64; see `bitmap`.
 #[derive(Clone, Debug)]
-struct NoneHandler;
-
-impl BitmapUpdateHandler for NoneHandler {
-    fn handle(&mut self, bitmap: &BitmapUpdate) -> ServerResult<UpdateFragmenter> {
-        let stride = usize::from(bitmap.format.bytes_per_pixel()) * usize::from(bitmap.width.get());
-        let mut data = Vec::with_capacity(stride * usize::from(bitmap.height.get()));
-        for row in bitmap.data.chunks(bitmap.stride.get()).rev() {
-            data.extend_from_slice(&row[..stride]);
-        }
-        set_surface(bitmap, CodecId::None.as_u8(), &data)
-    }
-}
-
-#[derive(Clone)]
-struct BitmapHandler {
-    bitmap: BitmapEncoder,
-}
-
-impl fmt::Debug for BitmapHandler {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BitmapHandler").finish()
-    }
-}
+struct BitmapHandler;
 
 impl BitmapHandler {
-    fn new() -> Self {
-        Self {
-            bitmap: BitmapEncoder::new(),
-        }
+    fn encode(bitmap: &BitmapUpdate) -> ServerResult<UpdateFragmenter> {
+        let data = bitmap::encode(bitmap).map_err(|error| match error {
+            BitmapEncodeError::Encode(e) => ServerError::encode(e),
+            BitmapEncodeError::Rle(e) => ServerError::custom("bitmap RLE encode error", e),
+        })?;
+        Ok(UpdateFragmenter::new(UpdateCode::Bitmap, data))
     }
 }
 
 impl BitmapUpdateHandler for BitmapHandler {
     fn handle(&mut self, bitmap: &BitmapUpdate) -> ServerResult<UpdateFragmenter> {
-        let mut buffer = vec![0; bitmap.data.len() * 2]; // TODO: estimate bitmap encoded size
-        let len = loop {
-            match self.bitmap.encode(bitmap, buffer.as_mut_slice()) {
-                Err(err) => match err {
-                    BitmapEncodeError::Encode(e) => match e.kind() {
-                        ironrdp_core::EncodeErrorKind::NotEnoughBytes { .. } => {
-                            buffer.resize(buffer.len() * 2, 0);
-                            debug!("encoder buffer resized to: {}", buffer.len() * 2);
-                        }
-                        _ => return Err(ServerError::encode(e)).with_context("bitmap encode error"),
-                    },
-                    BitmapEncodeError::Rle(e) => return Err(ServerError::custom("bitmap RLE encode error", e)),
-                },
-                Ok(len) => break len,
-            }
-        };
-
-        buffer.truncate(len);
-        Ok(UpdateFragmenter::new(UpdateCode::Bitmap, buffer))
+        Self::encode(bitmap)
     }
 }
 
@@ -816,42 +806,23 @@ impl RemoteFxHandler {
     fn set_desktop_size(&mut self, size: DesktopSize) {
         self.desktop_size = Some(size);
     }
-}
 
-/// Warpgate: the most `RfxEncoder::encode` can write for `bitmap`. A tile is a 19-byte tile
-/// block and three components of at most 4096 bytes (`rfx::UpdateEncoder` gives each that
-/// much, and fails a tile that needs more), and the message's other blocks come to a little
-/// over a hundred bytes. Upstream starts from the bitmap's own length instead, which a small
-/// or thin update outgrows once padded to whole tiles, and every retry below encodes all of
-/// its tiles again.
-fn rfx_message_size_bound(bitmap: &BitmapUpdate) -> usize {
-    const TILE_MAX: usize = 19 + 3 * 4096;
-    const OTHER_BLOCKS_MAX: usize = 1024;
-
-    let tiles = usize::from(bitmap.width.get().div_ceil(64)) * usize::from(bitmap.height.get().div_ceil(64));
-    OTHER_BLOCKS_MAX + tiles * TILE_MAX
+    /// Warpgate: the message comes back from `RfxEncoder::encode` at its exact length, encoded
+    /// once; there is no output buffer to size, zero or grow and refill. Takes `&self`, so the
+    /// rectangles of an update are encoded side by side.
+    fn encode(&self, bitmap: &BitmapUpdate) -> ServerResult<UpdateFragmenter> {
+        let message = self
+            .remotefx
+            .encode(bitmap, self.desktop_size)
+            .map_err(ServerError::encode)
+            .with_context("RemoteFX encode error")?;
+        surface_bits(bitmap, self.codec_id, &message, self.command)
+    }
 }
 
 impl BitmapUpdateHandler for RemoteFxHandler {
     fn handle(&mut self, bitmap: &BitmapUpdate) -> ServerResult<UpdateFragmenter> {
-        let mut buffer = vec![0; rfx_message_size_bound(bitmap)];
-        let len = loop {
-            match self
-                .remotefx
-                .encode(bitmap, buffer.as_mut_slice(), self.desktop_size)
-            {
-                Err(e) => match e.kind() {
-                    ironrdp_core::EncodeErrorKind::NotEnoughBytes { .. } => {
-                        buffer.resize(buffer.len() * 2, 0);
-                        debug!("encoder buffer resized to: {}", buffer.len() * 2);
-                    }
-                    _ => return Err(ServerError::encode(e)).with_context("RemoteFX encode error"),
-                },
-                Ok(len) => break len,
-            }
-        };
-
-        surface_bits(bitmap, self.codec_id, &buffer[..len], self.command)
+        self.encode(bitmap)
     }
 }
 
@@ -1222,40 +1193,167 @@ mod pointer_tests {
         assert_eq!(seen(&mut encoder, rgba(32)).await, [Seen::Default]);
         assert_eq!(seen(&mut encoder, large(128)).await, [Seen::Default]);
     }
+}
 
-    /// The RemoteFX output buffer is never too small, so no update is encoded twice. Noise
-    /// codes largest; small and thin updates are the ones whose own size fell short.
-    #[test]
-    fn the_first_remotefx_buffer_is_large_enough() {
-        let mut state = 0x2545_f491_4f6c_dd1d_u64;
-        let mut noise = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state.to_le_bytes()[0]
-        };
-        for (width, height) in [(1, 1), (2, 20), (1920, 1), (1, 1080), (65, 65), (130, 3), (200, 150)] {
-            let data: Vec<u8> = (0..usize::from(width) * usize::from(height) * 4).map(|_| noise()).collect();
-            let bitmap = BitmapUpdate {
-                x: 0,
-                y: 0,
-                width: NonZeroU16::new(width).unwrap(),
-                height: NonZeroU16::new(height).unwrap(),
-                format: crate::PixelFormat::BgrA32,
-                data: data.into(),
-                stride: core::num::NonZeroUsize::new(usize::from(width) * 4).unwrap(),
-            };
-            let mut buffer = vec![0; rfx_message_size_bound(&bitmap)];
-            for entropy in [EntropyBits::Rlgr1, EntropyBits::Rlgr3] {
-                let mut rfx = RfxEncoder::new(entropy, Quant::default());
-                let desktop = DesktopSize {
-                    width: 1920,
-                    height: 1080,
-                };
-                if let Err(error) = rfx.encode(&bitmap, &mut buffer, Some(desktop)) {
-                    panic!("{width}x{height}: {error}");
+/// Warpgate: what a bitmap update turns into, now that all of its changed rectangles are encoded
+/// together.
+#[cfg(test)]
+mod update_tests {
+    use core::num::NonZeroUsize;
+
+    use ironrdp_core::{ReadCursor, decode, decode_cursor};
+    use ironrdp_graphics::rfx::MessageDecoder;
+    use ironrdp_pdu::bitmap::BitmapUpdateData;
+    use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdatePdu, Fragmentation};
+
+    use super::*;
+
+    const DESKTOP: DesktopSize = DesktopSize {
+        width: 640,
+        height: 384,
+    };
+
+    /// A desktop-sized BGRA bitmap, `pixel(x, y)` at each pixel.
+    fn desktop(pixel: impl Fn(usize, usize) -> [u8; 4]) -> BitmapUpdate {
+        let (width, height) = (usize::from(DESKTOP.width), usize::from(DESKTOP.height));
+        let mut data = Vec::with_capacity(width * height * 4);
+        for y in 0..height {
+            for x in 0..width {
+                data.extend_from_slice(&pixel(x, y));
+            }
+        }
+        BitmapUpdate {
+            x: 0,
+            y: 0,
+            width: NonZeroU16::new(DESKTOP.width).unwrap(),
+            height: NonZeroU16::new(DESKTOP.height).unwrap(),
+            format: crate::PixelFormat::BgrA32,
+            data: data.into(),
+            stride: NonZeroUsize::new(width * 4).unwrap(),
+        }
+    }
+
+    fn background(x: usize, y: usize) -> [u8; 4] {
+        [(x / 3) as u8, (y / 2) as u8, 0x40, 0xff]
+    }
+
+    /// The background, with the tiles at `changed` (in 64-pixel units) painted over.
+    fn with_changes(changed: &'static [(usize, usize)]) -> impl Fn(usize, usize) -> [u8; 4] {
+        move |x, y| {
+            if changed.contains(&(x / 64, y / 64)) {
+                [0xff - (x % 256) as u8, (x * y % 256) as u8, (y % 256) as u8, 0xff]
+            } else {
+                background(x, y)
+            }
+        }
+    }
+
+    fn encoder(surface_flags: CmdFlags, remotefx: bool) -> UpdateEncoder {
+        let mut codecs = UpdateEncoderCodecs::new();
+        if remotefx {
+            codecs.set_remotefx_codec(Some((EntropyBits::Rlgr3, 3, RemoteFxCodec::RemoteFx)));
+        }
+        UpdateEncoder::new(
+            DESKTOP,
+            surface_flags,
+            codecs,
+            8 * 1024 * 1024,
+            25,
+            LargePointerSupportFlags::empty(),
+        )
+        .unwrap()
+    }
+
+    /// Each update the client is sent for `update`: its code and its data, reassembled.
+    async fn sent(encoder: &mut UpdateEncoder, update: DisplayUpdate) -> Vec<(UpdateCode, Vec<u8>)> {
+        let mut sent = Vec::new();
+        let mut updates = encoder.update(update);
+        while let Some(fragmenter) = updates.next().await {
+            let mut fragmenter = fragmenter.unwrap();
+            let mut buffer = vec![0; fragmenter.size_hint()];
+            let mut data = Vec::new();
+            while let Some(len) = fragmenter.next(&mut buffer) {
+                let mut cursor = ReadCursor::new(&buffer[..len]);
+                let _: FastPathHeader = decode_cursor(&mut cursor).unwrap();
+                let pdu: FastPathUpdatePdu<'_> = decode_cursor(&mut cursor).unwrap();
+                data.extend_from_slice(pdu.data);
+                if matches!(pdu.fragmentation, Fragmentation::Single | Fragmentation::Last) {
+                    sent.push((pdu.update_code, core::mem::take(&mut data)));
                 }
             }
         }
+        sent
+    }
+
+    /// The destination of a surface bits command, and its RemoteFX message's tiles.
+    fn remotefx_rect(data: &[u8]) -> (ExclusiveRectangle, usize) {
+        let SurfaceCommand::StreamSurfaceBits(pdu) = decode::<SurfaceCommand<'_>>(data).unwrap() else {
+            panic!("not a stream surface bits command");
+        };
+        let message = MessageDecoder::new()
+            .parse(pdu.extended_bitmap_data.data)
+            .unwrap();
+        (pdu.destination, message.tile_count())
+    }
+
+    #[tokio::test]
+    async fn each_changed_area_is_sent_once_in_order() {
+        let mut encoder = encoder(CmdFlags::SET_SURFACE_BITS | CmdFlags::STREAM_SURFACE_BITS, true);
+        let first = sent(&mut encoder, DisplayUpdate::Bitmap(desktop(background))).await;
+        assert_eq!(first.len(), 1, "the first frame goes whole");
+
+        // Three separate places change: three surface bits commands, in the order the diff finds
+        // them, each covering exactly its tiles.
+        let changed: &'static [(usize, usize)] = &[(1, 0), (2, 0), (7, 2), (0, 5)];
+        let updates = sent(&mut encoder, DisplayUpdate::Bitmap(desktop(with_changes(changed)))).await;
+        let rects: Vec<_> = updates
+            .iter()
+            .map(|(code, data)| {
+                assert_eq!(*code, UpdateCode::SurfaceCommands);
+                remotefx_rect(data)
+            })
+            .collect();
+        let rect = |left, top, right, bottom| ExclusiveRectangle {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        assert_eq!(
+            rects,
+            [
+                (rect(64, 0, 192, 64), 2),
+                (rect(448, 128, 512, 192), 1),
+                (rect(0, 320, 64, 384), 1)
+            ]
+        );
+
+        // Nothing changed since: nothing is sent.
+        let again = sent(&mut encoder, DisplayUpdate::Bitmap(desktop(with_changes(changed)))).await;
+        assert!(again.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_client_without_a_shared_codec_gets_rdp6_bitmaps() {
+        for surface_flags in [CmdFlags::SET_SURFACE_BITS, CmdFlags::empty()] {
+            let mut encoder = encoder(surface_flags, false);
+            let updates = sent(&mut encoder, DisplayUpdate::Bitmap(desktop(background))).await;
+            assert_eq!(updates.len(), 1);
+            let (code, data) = &updates[0];
+            assert_eq!(*code, UpdateCode::Bitmap);
+            let bitmap: BitmapUpdateData<'_> = decode(data).unwrap();
+            // 640x384 in 64x64 tiles.
+            assert_eq!(bitmap.rectangles.len(), 10 * 6);
+            assert!(data.len() < 640 * 384 * 4 / 4, "{} bytes", data.len());
+        }
+    }
+
+    /// The pointer goes out unchanged, whatever went before it.
+    #[tokio::test]
+    async fn a_pointer_update_after_a_bitmap_is_still_one_update() {
+        let mut encoder = encoder(CmdFlags::SET_SURFACE_BITS | CmdFlags::STREAM_SURFACE_BITS, true);
+        sent(&mut encoder, DisplayUpdate::Bitmap(desktop(background))).await;
+        let updates = sent(&mut encoder, DisplayUpdate::DefaultPointer).await;
+        assert_eq!(updates, [(UpdateCode::DefaultPointer, Vec::new())]);
     }
 }

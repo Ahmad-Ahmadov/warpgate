@@ -64,18 +64,44 @@ size, as a Large Pointer Update if the client takes those, and as the default po
 otherwise, so a target's large cursors (a scaled display, a larger pointer size) are shown
 where the client allows and never leave a stale shape where it does not.
 
-## RemoteFX output buffer
+## RemoteFX messages at their exact size
 
-`RemoteFxHandler` sized its output buffer from the bitmap's own length and, when RemoteFX
-needed more, doubled it and encoded every tile again. Tiles are padded to 64x64, so small
-and thin updates (a caret, a one-pixel border) routinely needed more and were encoded two or
-three times over. The buffer now starts at the most a message can take
-(`rfx_message_size_bound`): 19 bytes plus three 4096-byte components per tile, which is all
-`rfx::UpdateEncoder` gives a tile, and a kilobyte for the other blocks. For a whole desktop
-that is less than the bitmap's length.
+`RemoteFxHandler` sized its output buffer from the bitmap's length and, when RemoteFX needed
+more, doubled it and encoded every tile again; `rfx::UpdateEncoder` also zeroed a scratch
+buffer of three 4096-byte components per tile for every message. A 1080p frame zeroed two
+buffers of about 6 MB each. `RfxEncoder::encode` (`src/encoder/rfx.rs`) now encodes each tile,
+in parallel, into a buffer of exactly its size, then writes the message once into a buffer of
+exactly the size its blocks add up to. Its tests rebuild the message from IronRDP's own
+`rfx_encode_component` and block encoding and compare the bytes.
 
-The pointer and RemoteFX tests are in `src/encoder/mod.rs` (`pointer_tests`) and
-`src/encoder/fast_path.rs`: `cargo test -p ironrdp-server --lib encoder`.
+## Changed rectangles encoded together
+
+`EncoderIter` encoded the changed rectangles of a bitmap update one blocking task at a time,
+and sent each before encoding the next, so an update that changed in several places used one
+core at a time. All of them now go to one blocking task (`UpdateEncoder::bitmaps`), RemoteFX
+and bitmap rectangles in parallel; they are still sent one command per rectangle, in the
+diff's order, and the framebuffer is still updated after the last.
+
+## Lossless bitmaps instead of raw surface bits
+
+A client that shares no codec with the server (RemoteFX, QOI, NSCodec) was sent raw 32-bit
+surface bits, about 8 MB for a 1080p frame. It now gets RDP 6.0 bitmap updates, as upstream's
+later #2411 does, but tiled: `src/encoder/bitmap.rs` sends tiles of at most 64x64 (FreeRDP's
+planar decoder takes no larger, upstream's #2410), each padded to a width that is a multiple of
+four (upstream's encoder failed the update otherwise) with the padding outside its destination
+rectangle, each RLE-compressed unless that comes out larger than its planes, in parallel. A
+client without surface commands, which already got bitmaps, gets the same.
+
+## Display writes and reports
+
+`dispatch_display_update` (`src/server.rs`) wrote, and flushed through TLS, each fast-path PDU
+of at most 16 KB on its own. It now gathers them into writes of up to 64 KB. Under the tracing
+target `ironrdp_server::graphics` it reports the graphics each activation negotiated (info),
+each update's encode and write time and size (trace), and a summary every 10 seconds (debug).
+
+The pointer, RemoteFX, bitmap and update tests are in `src/encoder/` and the write test in
+`src/server.rs` (`display_write_tests`): `cargo test -p ironrdp-server --lib encoder` and
+`cargo test -p ironrdp-server --lib display_write_tests`.
 
 ## Manifest
 

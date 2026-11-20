@@ -9698,6 +9698,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
+ "socket2",
  "tokio",
  "tokio-openssl",
  "tokio-rustls",

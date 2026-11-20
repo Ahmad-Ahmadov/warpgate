@@ -19,8 +19,10 @@ pub async fn init_logging(config: Option<&WarpgateConfig>, cli: &Cli) -> Result<
     if std::env::var("RUST_LOG").is_err() {
         // IronRDP warns about dropped graphics updates and protocol trouble on target
         // connections. `ironrdp_server` is held to errors because its bitmap encoder warns
-        // about every frame that takes longer than 10 ms.
-        const IRONRDP: &str = "ironrdp=warn,ironrdp_server=error";
+        // about every frame that takes longer than 10 ms, except for the one line per native
+        // RDP activation that says which graphics the viewer negotiated; its per-update
+        // timings are at debug and trace under the same target.
+        const IRONRDP: &str = "ironrdp=warn,ironrdp_server=error,ironrdp_server::graphics=info";
         let filter = match cli.debug {
             0 => format!("audit=info,warpgate=info,{IRONRDP}"),
             1 => format!("audit=info,warpgate=debug,{IRONRDP}"),

@@ -1,6 +1,6 @@
 diff -ruN ironrdp-server-1f4dee6b/src/display.rs base/ironrdp-server/src/display.rs
---- ironrdp-server-1f4dee6b/src/display.rs	2026-11-20 12:18:36.945558000 +0400
-+++ base/ironrdp-server/src/display.rs	2026-11-20 12:18:47.194566000 +0400
+--- ironrdp-server-1f4dee6b/src/display.rs	2026-11-20 16:17:04.265874800 +0400
++++ base/ironrdp-server/src/display.rs	2026-11-20 16:19:35.286865300 +0400
 @@ -31,9 +31,10 @@
      RGBAPointer(RGBAPointer),
      /// A pointer shape wider or taller than the 96x96 ceiling `RGBAPointer` can carry
@@ -15,9 +15,372 @@ diff -ruN ironrdp-server-1f4dee6b/src/display.rs base/ironrdp-server/src/display
      LargePointer(LargePointer),
      HidePointer,
      DefaultPointer,
+diff -ruN ironrdp-server-1f4dee6b/src/encoder/bitmap.rs base/ironrdp-server/src/encoder/bitmap.rs
+--- ironrdp-server-1f4dee6b/src/encoder/bitmap.rs	2026-11-20 16:17:04.566583200 +0400
++++ base/ironrdp-server/src/encoder/bitmap.rs	2026-11-20 16:19:36.111425800 +0400
+@@ -1,117 +1,266 @@
+-use core::num::NonZeroUsize;
++//! Warpgate: RDP 6.0 bitmap updates (MS-RDPBCGR 2.2.9.1.1.3.1.2), lossless, for a client that
++//! shares no bitmap codec with the server or takes no surface commands.
++//!
++//! Upstream's snapshot sent the first kind of client raw 32-bit surface bits, about 8 MB for a
++//! 1080p screen, and sent the second bitmaps as tall as a fast-path update allows, failing any
++//! whose width is not a multiple of four. Here a bitmap goes as tiles of at most 64x64, as
++//! Windows servers send them and as FreeRDP's planar decoder requires, each padded to a width
++//! that is a multiple of four. The padding repeats the last column and lies outside the tile's
++//! destination rectangle, so no client shows it. Each tile is RLE-compressed unless that comes
++//! out larger than its planes, and the tiles are encoded in parallel.
+ 
+-use ironrdp_core::{Encode as _, WriteCursor, cast_int, cast_length, invalid_field_err};
++use ironrdp_core::{Encode as _, WriteCursor, cast_length};
+ use ironrdp_graphics::image_processing::PixelFormat;
+ use ironrdp_graphics::rdp6::{
+     ABgrChannels, ARgbChannels, BgrAChannels, BitmapEncodeError, BitmapStreamEncoder, RgbAChannels,
+ };
+-use ironrdp_pdu::bitmap::{self, BitmapData, BitmapUpdateData, Compression};
++use ironrdp_pdu::bitmap::{BitmapData, BitmapUpdateData, CompressedDataHeader, Compression};
+ use ironrdp_pdu::geometry::InclusiveRectangle;
+ 
+ use crate::BitmapUpdate;
+ 
+-// PERF: we could also remove the need for this buffer
+-#[derive(Clone)]
+-pub(crate) struct BitmapEncoder {
+-    buffer: Vec<u8>,
++/// The largest tile, per side.
++pub(crate) const TILE_SIZE: u16 = 64;
++
++/// A tile's place in its bitmap: x, y, width, height.
++type TileRect = (u16, u16, u16, u16);
++
++struct EncodedTile {
++    rect: TileRect,
++    /// The width the tile is sent at, a multiple of four.
++    padded_width: u16,
++    stream: Vec<u8>,
+ }
+ 
+-impl BitmapEncoder {
+-    pub(crate) fn new() -> Self {
+-        Self {
+-            buffer: vec![0; usize::from(u16::MAX)],
+-        }
++/// The TS_UPDATE_BITMAP_DATA that paints `bitmap`.
++pub(crate) fn encode(bitmap: &BitmapUpdate) -> Result<Vec<u8>, BitmapEncodeError> {
++    #[cfg(feature = "rayon")]
++    use rayon::prelude::*;
++
++    let rects = tile_rects(bitmap.width.get(), bitmap.height.get());
++    #[cfg(feature = "rayon")]
++    let rects = rects.into_par_iter();
++    #[cfg(not(feature = "rayon"))]
++    let rects = rects.into_iter();
++    let tiles: Vec<EncodedTile> = rects.map(|rect| encode_tile(bitmap, rect)).collect::<Result<_, _>>()?;
++
++    let bits_per_pixel = u16::from(bitmap.format.bytes_per_pixel()) * 8;
++    let mut rectangles = Vec::with_capacity(tiles.len());
++    for tile in &tiles {
++        let (x, y, width, height) = tile.rect;
++        let left = bitmap.x + x;
++        let top = bitmap.y + y;
++        rectangles.push(BitmapData {
++            rectangle: InclusiveRectangle {
++                left,
++                top,
++                right: left + width - 1,
++                bottom: top + height - 1,
++            },
++            width: tile.padded_width,
++            height,
++            bits_per_pixel,
++            compression_flags: Compression::BITMAP_COMPRESSION,
++            compressed_data_header: Some(CompressedDataHeader {
++                main_body_size: cast_length!("main body size", tile.stream.len()).map_err(BitmapEncodeError::Encode)?,
++                scan_width: tile.padded_width,
++                uncompressed_size: tile.padded_width * height * u16::from(bitmap.format.bytes_per_pixel()),
++            }),
++            bitmap_data: &tile.stream,
++        });
+     }
+ 
+-    pub(crate) fn encode(&mut self, bitmap: &BitmapUpdate, output: &mut [u8]) -> Result<usize, BitmapEncodeError> {
+-        // FIXME: support non-multiple of 4 widths.
+-        //
+-        // It’s not clear how to achieve that yet, but generally, server uses multiple of 4-widths,
+-        // and client has surface capabilities, so this path is unlikely.
+-        if !bitmap.width.get().is_multiple_of(4) {
+-            return Err(BitmapEncodeError::Encode(invalid_field_err!(
+-                "bitmap",
+-                "Width must be a multiple of 4"
+-            )));
+-        }
++    let update = BitmapUpdateData { rectangles };
++    let mut output = vec![0; update.size()];
++    update
++        .encode(&mut WriteCursor::new(&mut output))
++        .map_err(BitmapEncodeError::Encode)?;
++    Ok(output)
++}
+ 
+-        let bytes_per_pixel = u16::from(bitmap.format.bytes_per_pixel());
+-        let row_len = bitmap.width.get() * bytes_per_pixel;
+-        let chunk_height = u16::MAX / row_len;
+-
+-        let mut cursor = WriteCursor::new(output);
+-        let stride = bitmap.stride.get();
+-        let chunks = bitmap.data.chunks(stride * usize::from(chunk_height));
+-
+-        let total = cast_int!("chunks length lower bound", chunks.size_hint().0).map_err(BitmapEncodeError::Encode)?;
+-        BitmapUpdateData::encode_header(total, &mut cursor).map_err(BitmapEncodeError::Encode)?;
+-
+-        for (i, chunk) in chunks.enumerate() {
+-            let height = cast_int!("bitmap height", chunk.len() / stride).map_err(BitmapEncodeError::Encode)?;
+-            let i: u16 = cast_int!("chunk idx", i).map_err(BitmapEncodeError::Encode)?;
+-            let top = bitmap.y + i * chunk_height;
+-
+-            let encoder = BitmapStreamEncoder::new(NonZeroUsize::from(bitmap.width).get(), usize::from(height));
+-
+-            let len = {
+-                let pixels = chunk
+-                    .chunks(stride)
+-                    .map(|row| &row[..usize::from(row_len)])
+-                    .rev()
+-                    .flat_map(|row| row.chunks(usize::from(bytes_per_pixel)));
+-
+-                Self::encode_iter(encoder, bitmap.format, pixels, self.buffer.as_mut_slice())?
+-            };
+-
+-            let data = BitmapData {
+-                rectangle: InclusiveRectangle {
+-                    left: bitmap.x,
+-                    top,
+-                    right: bitmap.x + bitmap.width.get() - 1,
+-                    bottom: top + height - 1,
+-                },
+-                width: u16::from(bitmap.width),
+-                height,
+-                bits_per_pixel: u16::from(bitmap.format.bytes_per_pixel()) * 8,
+-                compression_flags: Compression::BITMAP_COMPRESSION,
+-                compressed_data_header: Some(bitmap::CompressedDataHeader {
+-                    main_body_size: cast_length!("main body size", len).map_err(BitmapEncodeError::Encode)?,
+-                    scan_width: u16::from(bitmap.width),
+-                    uncompressed_size: height * row_len,
+-                }),
+-                bitmap_data: &self.buffer[..len],
+-            };
++/// The tiles that cover a `width` by `height` bitmap, row by row.
++fn tile_rects(width: u16, height: u16) -> Vec<TileRect> {
++    let step = usize::from(TILE_SIZE);
++    (0..height)
++        .step_by(step)
++        .flat_map(|y| {
++            (0..width)
++                .step_by(step)
++                .map(move |x| (x, y, TILE_SIZE.min(width - x), TILE_SIZE.min(height - y)))
++        })
++        .collect()
++}
+ 
+-            data.encode(&mut cursor).map_err(BitmapEncodeError::Encode)?;
++fn encode_tile(bitmap: &BitmapUpdate, rect: TileRect) -> Result<EncodedTile, BitmapEncodeError> {
++    let (x, y, width, height) = rect;
++    let padded_width = width.next_multiple_of(4);
++    let bpp = usize::from(bitmap.format.bytes_per_pixel());
++    let stride = bitmap.stride.get();
++    let row_len = usize::from(width) * bpp;
++
++    // Bottom-up, as a bitmap's rows go, each padded with copies of its last pixel.
++    let mut pixels = Vec::with_capacity(usize::from(padded_width) * usize::from(height) * bpp);
++    for row in (usize::from(y)..usize::from(y) + usize::from(height)).rev() {
++        let start = row * stride + usize::from(x) * bpp;
++        let line = &bitmap.data[start..start + row_len];
++        pixels.extend_from_slice(line);
++        let last = &line[row_len - bpp..];
++        for _ in width..padded_width {
++            pixels.extend_from_slice(last);
+         }
++    }
+ 
+-        Ok(cursor.pos())
++    // A header byte, the three planes, and a padding byte: the stream without RLE. RLE is kept
++    // only if it fits in that, which is all the room it gets.
++    let planes = 3 * usize::from(padded_width) * usize::from(height);
++    let mut stream = vec![0; planes + 2];
++    let mut encoder = BitmapStreamEncoder::new(usize::from(padded_width), usize::from(height));
++    let len = match encode_planes(&mut encoder, bitmap.format, &pixels, &mut stream, true) {
++        Ok(len) => len,
++        Err(_) => encode_planes(&mut encoder, bitmap.format, &pixels, &mut stream, false)?,
++    };
++    stream.truncate(len);
++
++    Ok(EncodedTile {
++        rect,
++        padded_width,
++        stream,
++    })
++}
++
++fn encode_planes(
++    encoder: &mut BitmapStreamEncoder,
++    format: PixelFormat,
++    pixels: &[u8],
++    dst: &mut [u8],
++    rle: bool,
++) -> Result<usize, BitmapEncodeError> {
++    match format {
++        PixelFormat::ARgb32 | PixelFormat::XRgb32 => encoder.encode_bitmap::<ARgbChannels>(pixels, dst, rle),
++        PixelFormat::RgbA32 | PixelFormat::RgbX32 => encoder.encode_bitmap::<RgbAChannels>(pixels, dst, rle),
++        PixelFormat::ABgr32 | PixelFormat::XBgr32 => encoder.encode_bitmap::<ABgrChannels>(pixels, dst, rle),
++        PixelFormat::BgrA32 | PixelFormat::BgrX32 => encoder.encode_bitmap::<BgrAChannels>(pixels, dst, rle),
+     }
++}
+ 
+-    fn encode_iter<'a, P>(
+-        mut encoder: BitmapStreamEncoder,
+-        format: PixelFormat,
+-        src: P,
+-        dst: &mut [u8],
+-    ) -> Result<usize, BitmapEncodeError>
+-    where
+-        P: Iterator<Item = &'a [u8]> + Clone,
+-    {
+-        let written = match format {
+-            PixelFormat::ARgb32 | PixelFormat::XRgb32 => {
+-                encoder.encode_pixels_stream::<_, ARgbChannels>(src, dst, true)?
+-            }
+-            PixelFormat::RgbA32 | PixelFormat::RgbX32 => {
+-                encoder.encode_pixels_stream::<_, RgbAChannels>(src, dst, true)?
++#[cfg(test)]
++mod tests {
++    use core::num::{NonZeroU16, NonZeroUsize};
++
++    use ironrdp_core::decode;
++    use ironrdp_graphics::rdp6::BitmapStreamDecoder;
++
++    use super::*;
++
++    /// A `width` by `height` BGRA bitmap at (`x`, `y`), from `pixel(column, row)`.
++    fn bitmap(x: u16, y: u16, width: u16, height: u16, pixel: impl Fn(usize, usize) -> [u8; 4]) -> BitmapUpdate {
++        let mut data = Vec::new();
++        for row in 0..usize::from(height) {
++            for column in 0..usize::from(width) {
++                data.extend_from_slice(&pixel(column, row));
+             }
+-            PixelFormat::ABgr32 | PixelFormat::XBgr32 => {
+-                encoder.encode_pixels_stream::<_, ABgrChannels>(src, dst, true)?
+-            }
+-            PixelFormat::BgrA32 | PixelFormat::BgrX32 => {
+-                encoder.encode_pixels_stream::<_, BgrAChannels>(src, dst, true)?
++        }
++        BitmapUpdate {
++            x,
++            y,
++            width: NonZeroU16::new(width).unwrap(),
++            height: NonZeroU16::new(height).unwrap(),
++            format: PixelFormat::BgrA32,
++            data: data.into(),
++            stride: NonZeroUsize::new(usize::from(width) * 4).unwrap(),
++        }
++    }
++
++    fn noise(column: usize, row: usize) -> [u8; 4] {
++        let mut state = (column as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (row as u64 + 7) << 32;
++        state ^= state >> 29;
++        state = state.wrapping_mul(0xbf58_476d_1ce4_e5b9);
++        state ^= state >> 32;
++        let [b, g, r, ..] = state.to_le_bytes();
++        [b, g, r, 0xff]
++    }
++
++    fn flat(_: usize, row: usize) -> [u8; 4] {
++        [0x30, 0x60, 0x90 + (row / 16) as u8, 0xff]
++    }
++
++    /// Decode what `encode` wrote and check that it paints exactly `bitmap`.
++    fn assert_paints(bitmap: &BitmapUpdate) {
++        let update_data = encode(bitmap).unwrap();
++        let update: BitmapUpdateData<'_> = decode(&update_data).unwrap();
++        let (left, top) = (usize::from(bitmap.x), usize::from(bitmap.y));
++        let (width, height) = (usize::from(bitmap.width.get()), usize::from(bitmap.height.get()));
++        let mut painted = vec![false; width * height];
++
++        for tile in &update.rectangles {
++            let rect = &tile.rectangle;
++            let tile_width = usize::from(rect.right - rect.left) + 1;
++            let tile_height = usize::from(rect.bottom - rect.top) + 1;
++            assert!(tile_width <= 64 && tile_height <= 64, "{rect:?} is larger than 64x64");
++            assert_eq!(tile.width % 4, 0, "{rect:?} is sent {} wide", tile.width);
++            assert!(usize::from(tile.width) >= tile_width && usize::from(tile.width) < tile_width + 4);
++            assert_eq!(usize::from(tile.height), tile_height);
++            assert_eq!(tile.bits_per_pixel, 32);
++            assert!(tile.compression_flags.contains(Compression::BITMAP_COMPRESSION));
++            let header = tile.compressed_data_header.as_ref().unwrap();
++            assert_eq!(usize::from(header.main_body_size), tile.bitmap_data.len());
++            assert_eq!(header.scan_width, tile.width);
++
++            let mut rgb = Vec::new();
++            BitmapStreamDecoder::default()
++                .decode_bitmap_stream_to_rgb24(tile.bitmap_data, &mut rgb, usize::from(tile.width), tile_height)
++                .unwrap();
++            assert_eq!(rgb.len(), usize::from(tile.width) * tile_height * 3);
++            let tile_left = usize::from(rect.left) - left;
++            for (bottom_up, line) in rgb.chunks_exact(usize::from(tile.width) * 3).enumerate() {
++                let row = usize::from(rect.top) - top + tile_height - 1 - bottom_up;
++                for (column, decoded) in line.chunks_exact(3).enumerate() {
++                    // The padding repeats the last column.
++                    let source_column = tile_left + column.min(tile_width - 1);
++                    let start = (row * width + source_column) * 4;
++                    let expected = [bitmap.data[start + 2], bitmap.data[start + 1], bitmap.data[start]];
++                    assert_eq!(decoded, expected, "pixel ({source_column}, {row}) of {rect:?}");
++                    if column < tile_width {
++                        let pixel = &mut painted[row * width + source_column];
++                        assert!(!*pixel, "pixel ({source_column}, {row}) is painted twice");
++                        *pixel = true;
++                    }
++                }
+             }
+-        };
++        }
++        assert!(painted.iter().all(|&painted| painted), "some pixels are not painted");
++    }
++
++    #[test]
++    fn a_bitmap_is_painted_exactly_in_tiles_of_at_most_64x64() {
++        for (width, height) in [(1, 1), (3, 5), (4, 4), (63, 2), (64, 64), (65, 70), (130, 3), (2, 130), (257, 129)] {
++            assert_paints(&bitmap(0, 0, width, height, noise));
++            assert_paints(&bitmap(17, 33, width, height, flat));
++        }
++    }
++
++    #[test]
++    fn flat_content_is_compressed_and_noise_is_never_larger_than_its_planes() {
++        let flat = encode(&bitmap(0, 0, 64, 64, flat)).unwrap();
++        let noisy = encode(&bitmap(0, 0, 64, 64, noise)).unwrap();
++        let raw = 64 * 64 * 4;
++        assert!(flat.len() < raw / 10, "{} bytes for a flat tile", flat.len());
++        // A header byte, three planes, a padding byte, and the update's own headers.
++        assert!(noisy.len() <= 3 * 64 * 64 + 2 + 64, "{} bytes for a noisy tile", noisy.len());
++    }
+ 
+-        Ok(written)
++    #[test]
++    fn tiles_cover_the_bitmap_row_by_row() {
++        assert_eq!(
++            tile_rects(130, 70),
++            [
++                (0, 0, 64, 64),
++                (64, 0, 64, 64),
++                (128, 0, 2, 64),
++                (0, 64, 64, 6),
++                (64, 64, 64, 6),
++                (128, 64, 2, 6)
++            ]
++        );
+     }
+ }
 diff -ruN ironrdp-server-1f4dee6b/src/encoder/fast_path.rs base/ironrdp-server/src/encoder/fast_path.rs
---- ironrdp-server-1f4dee6b/src/encoder/fast_path.rs	2026-11-20 12:18:36.820376200 +0400
-+++ base/ironrdp-server/src/encoder/fast_path.rs	2026-11-20 12:18:47.100892300 +0400
+--- ironrdp-server-1f4dee6b/src/encoder/fast_path.rs	2026-11-20 16:17:04.393676300 +0400
++++ base/ironrdp-server/src/encoder/fast_path.rs	2026-11-20 16:19:35.555309100 +0400
 @@ -57,6 +57,11 @@
  
      fn encode_next(&mut self, dst: &mut [u8]) -> Option<(usize, usize)> {
@@ -60,9 +423,20 @@ diff -ruN ironrdp-server-1f4dee6b/src/encoder/fast_path.rs base/ironrdp-server/s
      fn test_multi_fragment() {
          let data = vec![0u8; MAX_FASTPATH_UPDATE_SIZE * 2 + 10];
 diff -ruN ironrdp-server-1f4dee6b/src/encoder/mod.rs base/ironrdp-server/src/encoder/mod.rs
---- ironrdp-server-1f4dee6b/src/encoder/mod.rs	2026-11-20 12:18:37.154058800 +0400
-+++ base/ironrdp-server/src/encoder/mod.rs	2026-11-20 12:18:46.840007500 +0400
-@@ -28,6 +28,7 @@
+--- ironrdp-server-1f4dee6b/src/encoder/mod.rs	2026-11-20 16:17:04.400383500 +0400
++++ base/ironrdp-server/src/encoder/mod.rs	2026-11-20 16:19:35.694241300 +0400
+@@ -13,9 +13,8 @@
+ };
+ use ironrdp_pdu::rdp::capability_sets::{CmdFlags, EntropyBits, LargePointerSupportFlags};
+ use ironrdp_pdu::surface_commands::{ExtendedBitmapDataPdu, SurfaceBitsPdu, SurfaceCommand};
+-use tracing::{debug, warn};
++use tracing::{debug, info, warn};
+ 
+-use self::bitmap::BitmapEncoder;
+ use self::rfx::RfxEncoder;
+ use super::BitmapUpdate;
+ use crate::error::{ServerError, ServerErrorExt as _, ServerResult, ServerResultExt as _};
+@@ -28,25 +27,14 @@
  #[cfg(feature = "qoiz")]
  pub(crate) mod qoiz;
  pub(crate) mod rfx;
@@ -70,7 +444,29 @@ diff -ruN ironrdp-server-1f4dee6b/src/encoder/mod.rs base/ironrdp-server/src/enc
  
  pub(crate) use fast_path::*;
  use ironrdp_graphics::rdp6::BitmapEncodeError;
-@@ -134,8 +135,9 @@
+ 
+-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+-#[repr(u8)]
+-enum CodecId {
+-    None = 0x0,
+-}
+-
+-impl CodecId {
+-    #[expect(
+-        clippy::as_conversions,
+-        reason = "guarantees discriminant layout, and as is the only way to cast enum -> primitive"
+-    )]
+-    fn as_u8(self) -> u8 {
+-        self as u8
+-    }
+-}
++/// Warpgate: the tracing target of the display path's own reports, the graphics a viewer
++/// negotiated and how its updates fare, so they can be enabled apart from the rest of the crate.
++pub(crate) const DISPLAY_TARGET: &str = "ironrdp_server::graphics";
+ 
+ #[cfg_attr(any(feature = "__test", feature = "__bench"), visibility::make(pub))]
+ #[derive(Debug)]
+@@ -134,8 +122,9 @@
      max_request_size: usize,
      /// Client's advertised New Pointer Update cache size (MS-RDPBCGR 2.2.7.1.5
      /// `pointerCacheSize`). Zero means the client did not advertise support for the
@@ -82,7 +478,69 @@ diff -ruN ironrdp-server-1f4dee6b/src/encoder/mod.rs base/ironrdp-server/src/enc
      pointer_cache_size: u16,
      /// Client's advertised Large Pointer Capability Set flags (MS-RDPBCGR 2.2.7.2.7).
      /// Empty when the client didn't send this capability set at all. Governs both the
-@@ -248,6 +250,47 @@
+@@ -163,19 +152,24 @@
+         pointer_cache_size: u16,
+         large_pointer_flags: LargePointerSupportFlags,
+     ) -> ServerResult<Self> {
+-        let bitmap_updater = if surface_flags.contains(CmdFlags::SET_SURFACE_BITS) {
++        let (bitmap_updater, graphics) = if surface_flags.contains(CmdFlags::SET_SURFACE_BITS) {
+             match codecs {
+                 #[cfg(feature = "qoiz")]
+-                UpdateEncoderCodecs { qoiz: Some(id), .. } => BitmapUpdater::Qoiz(QoizHandler::new(id)?),
++                UpdateEncoderCodecs { qoiz: Some(id), .. } => {
++                    (BitmapUpdater::Qoiz(QoizHandler::new(id)?), "QOIZ".to_owned())
++                }
+                 #[cfg(feature = "qoi")]
+-                UpdateEncoderCodecs { qoi: Some(id), .. } => BitmapUpdater::Qoi(QoiHandler::new(id)),
++                UpdateEncoderCodecs { qoi: Some(id), .. } => (BitmapUpdater::Qoi(QoiHandler::new(id)), "QOI".to_owned()),
+                 UpdateEncoderCodecs {
+                     remotefx: Some((algo, id, codec)),
+                     remotefx_quant,
+                     ..
+                 } => {
+                     let command = codec.surface_bits_command(surface_flags);
+-                    BitmapUpdater::RemoteFx(RemoteFxHandler::new(algo, remotefx_quant, id, desktop_size, command))
++                    (
++                        BitmapUpdater::RemoteFx(RemoteFxHandler::new(algo, remotefx_quant, id, desktop_size, command)),
++                        format!("{codec:?} ({algo:?}) in {command:?} Surface Bits"),
++                    )
+                 }
+                 // NSCodec is the lowest-priority codec because it predates
+                 // RemoteFX and produces larger output. It's relevant mainly
+@@ -187,12 +181,29 @@
+                 UpdateEncoderCodecs {
+                     nscodec: Some((id, cll)),
+                     ..
+-                } => BitmapUpdater::NsCodec(NsCodecHandler::new(id, cll)),
+-                _ => BitmapUpdater::None(NoneHandler),
++                } => (BitmapUpdater::NsCodec(NsCodecHandler::new(id, cll)), "NSCodec".to_owned()),
++                // Warpgate: lossless RDP 6.0 bitmaps rather than raw surface bits, a fraction of
++                // the bytes. See `bitmap`.
++                _ => (
++                    BitmapUpdater::Bitmap(BitmapHandler),
++                    "RDP 6.0 bitmaps (lossless, no codec in common)".to_owned(),
++                ),
+             }
+         } else {
+-            BitmapUpdater::Bitmap(BitmapHandler::new())
++            (
++                BitmapUpdater::Bitmap(BitmapHandler),
++                "RDP 6.0 bitmaps (lossless, no surface commands)".to_owned(),
++            )
+         };
++        info!(
++            target: DISPLAY_TARGET,
++            %graphics,
++            width = desktop_size.width,
++            height = desktop_size.height,
++            pointer_cache_size,
++            large_pointers = ?large_pointer_flags,
++            "Viewer graphics"
++        );
+ 
+         Ok(Self {
+             desktop_size,
+@@ -248,6 +259,47 @@
              .set_desktop_size(size);
      }
  
@@ -130,7 +588,93 @@ diff -ruN ironrdp-server-1f4dee6b/src/encoder/mod.rs base/ironrdp-server/src/enc
      fn rgba_pointer(ptr: RGBAPointer) -> ServerResult<UpdateFragmenter> {
          let xor_mask = ptr.data;
          let and_mask = pointer_mask::and_mask_from_alpha(&xor_mask, ptr.width, ptr.height);
-@@ -492,42 +535,22 @@
+@@ -432,13 +484,17 @@
+         }
+     }
+ 
+-    async fn bitmap(&mut self, bitmap: BitmapUpdate) -> ServerResult<UpdateFragmenter> {
++    /// Warpgate: encode every changed rectangle of one bitmap update in a single blocking task,
++    /// side by side where the codec allows it. Upstream handed the blocking pool one rectangle at
++    /// a time, and sent each before encoding the next, so an update that changed in several
++    /// places kept one core busy at a time.
++    async fn bitmaps(&mut self, bitmaps: Vec<BitmapUpdate>) -> ServerResult<Vec<UpdateFragmenter>> {
+         // Move the bitmap updater to satisfy spawn_blocking 'static requirement.
+         // It is restored after the blocking operation completes.
+         let mut updater = self.bitmap_updater.take().expect("bitmap updater always Some");
+ 
+         let (result, updater) = tokio::task::spawn_blocking(move || {
+-            let result = time_warn!("Encoding bitmap", 10, updater.handle(&bitmap));
++            let result = time_warn!("Encoding bitmap", 10, updater.handle_all(&bitmaps));
+             (result, updater)
+         })
+         .await
+@@ -450,13 +506,37 @@
+     }
+ }
+ 
++/// The parts of `bitmap` the changed rectangles `diffs` cover, as bitmaps of their own, or `None`
++/// if one of them is not inside it.
++fn sub_bitmaps(bitmap: &BitmapUpdate, diffs: &[Rect]) -> ServerResult<Option<Vec<BitmapUpdate>>> {
++    let invalid = |reason: &'static str| ServerError::reason("bitmap diff", reason);
++    let mut subs = Vec::with_capacity(diffs.len());
++    for rect in diffs {
++        let Rect { x, y, width, height } = *rect;
++        let x = u16::try_from(x).map_err(|_| invalid("invalid `x`: out of range integral conversion"))?;
++        let y = u16::try_from(y).map_err(|_| invalid("invalid `y`: out of range integral conversion"))?;
++        let width = u16::try_from(width).map_err(|_| invalid("invalid `width`: out of range integral conversion"))?;
++        let width = NonZeroU16::new(width).ok_or_else(|| invalid("rectangle width cannot be zero"))?;
++        let height =
++            u16::try_from(height).map_err(|_| invalid("invalid `height`: out of range integral conversion"))?;
++        let height = NonZeroU16::new(height).ok_or_else(|| invalid("rectangle height cannot be zero"))?;
++        let Some(sub) = bitmap.sub(x, y, width, height) else {
++            return Ok(None);
++        };
++        subs.push(sub);
++    }
++    Ok(Some(subs))
++}
++
+ #[derive(Debug, Default)]
+ enum State {
+     Start(DisplayUpdate),
+-    BitmapDiffs {
+-        diffs: Vec<Rect>,
++    /// Warpgate: every changed rectangle of `bitmap` encoded, the updates for them left to hand
++    /// out; `diffs` goes into the framebuffer once they have all been.
++    BitmapEncoded {
++        updates: std::vec::IntoIter<UpdateFragmenter>,
+         bitmap: BitmapUpdate,
+-        pos: usize,
++        diffs: Vec<Rect>,
+     },
+     #[default]
+     Ended,
+@@ -488,46 +568,46 @@
+                             continue;
+                         }
+                         let diffs = encoder.bitmap_diffs(&bitmap);
+-                        self.state = State::BitmapDiffs { diffs, bitmap, pos: 0 };
++                        let subs = match sub_bitmaps(&bitmap, &diffs) {
++                            Ok(Some(subs)) => subs,
++                            Ok(None) => {
++                                warn!("Failed to extract bitmap subregion");
++                                return None;
++                            }
++                            Err(error) => return Some(Err(error)),
++                        };
++                        let updates = if subs.is_empty() {
++                            Vec::new()
++                        } else {
++                            match encoder.bitmaps(subs).await {
++                                Ok(updates) => updates,
++                                Err(error) => return Some(Err(error)),
++                            }
++                        };
++                        self.state = State::BitmapEncoded {
++                            updates: updates.into_iter(),
++                            bitmap,
++                            diffs,
++                        };
                          continue;
                      }
                      DisplayUpdate::PointerPosition(pos) => UpdateEncoder::pointer_position(pos),
@@ -189,37 +733,263 @@ diff -ruN ironrdp-server-1f4dee6b/src/encoder/mod.rs base/ironrdp-server/src/enc
                      DisplayUpdate::ColorPointer(ptr) => UpdateEncoder::color_pointer(ptr),
                      DisplayUpdate::HidePointer => UpdateEncoder::hide_pointer(),
                      DisplayUpdate::DefaultPointer => UpdateEncoder::default_pointer(),
-@@ -795,13 +818,27 @@
+@@ -542,77 +622,18 @@
+                     }
+                     DisplayUpdate::Resize(_) => return None,
+                 },
+-                State::BitmapDiffs { diffs, bitmap, pos } => {
+-                    let Some(rect) = diffs.get(pos) else {
++                State::BitmapEncoded {
++                    mut updates,
++                    bitmap,
++                    diffs,
++                } => {
++                    let Some(update) = updates.next() else {
+                         encoder.bitmap_update_framebuffer(bitmap, &diffs);
+                         self.state = State::Ended;
+                         return None;
+                     };
+-                    let Rect { x, y, width, height } = *rect;
+-
+-                    let x = match u16::try_from(x) {
+-                        Ok(x) => x,
+-                        Err(_) => {
+-                            return Some(Err(ServerError::reason(
+-                                "bitmap diff",
+-                                "invalid `x`: out of range integral conversion",
+-                            )));
+-                        }
+-                    };
+-                    let y = match u16::try_from(y) {
+-                        Ok(y) => y,
+-                        Err(_) => {
+-                            return Some(Err(ServerError::reason(
+-                                "bitmap diff",
+-                                "invalid `y`: out of range integral conversion",
+-                            )));
+-                        }
+-                    };
+-                    let width = match u16::try_from(width) {
+-                        Ok(width) => match NonZeroU16::new(width) {
+-                            Some(width) => width,
+-                            None => {
+-                                return Some(Err(ServerError::reason(
+-                                    "bitmap diff",
+-                                    "rectangle width cannot be zero",
+-                                )));
+-                            }
+-                        },
+-                        Err(_) => {
+-                            return Some(Err(ServerError::reason(
+-                                "bitmap diff",
+-                                "invalid `width`: out of range integral conversion",
+-                            )));
+-                        }
+-                    };
+-                    let height = match u16::try_from(height) {
+-                        Ok(height) => match NonZeroU16::new(height) {
+-                            Some(height) => height,
+-                            None => {
+-                                return Some(Err(ServerError::reason(
+-                                    "bitmap diff",
+-                                    "rectangle height cannot be zero",
+-                                )));
+-                            }
+-                        },
+-                        Err(_) => {
+-                            return Some(Err(ServerError::reason(
+-                                "bitmap diff",
+-                                "invalid `height`: out of range integral conversion",
+-                            )));
+-                        }
+-                    };
+-
+-                    let Some(sub) = bitmap.sub(x, y, width, height) else {
+-                        warn!("Failed to extract bitmap subregion");
+-                        return None;
+-                    };
+-                    self.state = State::BitmapDiffs {
+-                        diffs,
+-                        bitmap,
+-                        pos: pos + 1,
+-                    };
+-                    encoder.bitmap(sub).await
++                    self.state = State::BitmapEncoded { updates, bitmap, diffs };
++                    Ok(update)
+                 }
+                 State::Ended => return None,
+             };
+@@ -624,7 +645,6 @@
+ 
+ #[derive(Debug)]
+ enum BitmapUpdater {
+-    None(NoneHandler),
+     Bitmap(BitmapHandler),
+     RemoteFx(RemoteFxHandler),
+     #[cfg(feature = "qoi")]
+@@ -638,7 +658,6 @@
+ impl BitmapUpdater {
+     fn handle(&mut self, bitmap: &BitmapUpdate) -> ServerResult<UpdateFragmenter> {
+         match self {
+-            Self::None(up) => up.handle(bitmap),
+             Self::Bitmap(up) => up.handle(bitmap),
+             Self::RemoteFx(up) => up.handle(bitmap),
+             #[cfg(feature = "qoi")]
+@@ -650,6 +669,20 @@
+         }
+     }
+ 
++    /// Warpgate: the update for each of `bitmaps`, in order. RemoteFX and RDP 6.0 bitmaps encode
++    /// a rectangle from its pixels alone, so their rectangles are encoded side by side; the
++    /// others keep state from one rectangle to the next and go one at a time.
++    fn handle_all(&mut self, bitmaps: &[BitmapUpdate]) -> ServerResult<Vec<UpdateFragmenter>> {
++        match self {
++            Self::RemoteFx(up) => {
++                let up = &*up;
++                encode_each(bitmaps, |bitmap| up.encode(bitmap))
++            }
++            Self::Bitmap(_) => encode_each(bitmaps, BitmapHandler::encode),
++            other => bitmaps.iter().map(|bitmap| other.handle(bitmap)).collect(),
++        }
++    }
++
+     fn set_desktop_size(&mut self, size: DesktopSize) {
+         if let Self::RemoteFx(up) = self {
+             up.set_desktop_size(size)
+@@ -657,64 +690,44 @@
      }
  }
  
-+/// Warpgate: the most `RfxEncoder::encode` can write for `bitmap`. A tile is a 19-byte tile
-+/// block and three components of at most 4096 bytes (`rfx::UpdateEncoder` gives each that
-+/// much, and fails a tile that needs more), and the message's other blocks come to a little
-+/// over a hundred bytes. Upstream starts from the bitmap's own length instead, which a small
-+/// or thin update outgrows once padded to whole tiles, and every retry below encodes all of
-+/// its tiles again.
-+fn rfx_message_size_bound(bitmap: &BitmapUpdate) -> usize {
-+    const TILE_MAX: usize = 19 + 3 * 4096;
-+    const OTHER_BLOCKS_MAX: usize = 1024;
+-trait BitmapUpdateHandler {
+-    fn handle(&mut self, bitmap: &BitmapUpdate) -> ServerResult<UpdateFragmenter>;
+-}
++/// `encode` applied to each of `bitmaps`, in parallel when the `rayon` feature is on, the results
++/// in the order of `bitmaps`.
++fn encode_each<F>(bitmaps: &[BitmapUpdate], encode: F) -> ServerResult<Vec<UpdateFragmenter>>
++where
++    F: Fn(&BitmapUpdate) -> ServerResult<UpdateFragmenter> + Sync + Send,
++{
++    #[cfg(feature = "rayon")]
++    use rayon::prelude::*;
 +
-+    let tiles = usize::from(bitmap.width.get().div_ceil(64)) * usize::from(bitmap.height.get().div_ceil(64));
-+    OTHER_BLOCKS_MAX + tiles * TILE_MAX
-+}
++    #[cfg(feature = "rayon")]
++    let bitmaps = bitmaps.par_iter();
++    #[cfg(not(feature = "rayon"))]
++    let bitmaps = bitmaps.iter();
+ 
+-#[derive(Clone, Debug)]
+-struct NoneHandler;
+-
+-impl BitmapUpdateHandler for NoneHandler {
+-    fn handle(&mut self, bitmap: &BitmapUpdate) -> ServerResult<UpdateFragmenter> {
+-        let stride = usize::from(bitmap.format.bytes_per_pixel()) * usize::from(bitmap.width.get());
+-        let mut data = Vec::with_capacity(stride * usize::from(bitmap.height.get()));
+-        for row in bitmap.data.chunks(bitmap.stride.get()).rev() {
+-            data.extend_from_slice(&row[..stride]);
+-        }
+-        set_surface(bitmap, CodecId::None.as_u8(), &data)
+-    }
++    bitmaps.map(encode).collect()
+ }
+ 
+-#[derive(Clone)]
+-struct BitmapHandler {
+-    bitmap: BitmapEncoder,
++trait BitmapUpdateHandler {
++    fn handle(&mut self, bitmap: &BitmapUpdate) -> ServerResult<UpdateFragmenter>;
+ }
+ 
+-impl fmt::Debug for BitmapHandler {
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        f.debug_struct("BitmapHandler").finish()
+-    }
+-}
++/// Warpgate: lossless RDP 6.0 bitmap updates, in tiles of at most 64x64; see `bitmap`.
++#[derive(Clone, Debug)]
++struct BitmapHandler;
+ 
+ impl BitmapHandler {
+-    fn new() -> Self {
+-        Self {
+-            bitmap: BitmapEncoder::new(),
+-        }
++    fn encode(bitmap: &BitmapUpdate) -> ServerResult<UpdateFragmenter> {
++        let data = bitmap::encode(bitmap).map_err(|error| match error {
++            BitmapEncodeError::Encode(e) => ServerError::encode(e),
++            BitmapEncodeError::Rle(e) => ServerError::custom("bitmap RLE encode error", e),
++        })?;
++        Ok(UpdateFragmenter::new(UpdateCode::Bitmap, data))
+     }
+ }
+ 
+ impl BitmapUpdateHandler for BitmapHandler {
+     fn handle(&mut self, bitmap: &BitmapUpdate) -> ServerResult<UpdateFragmenter> {
+-        let mut buffer = vec![0; bitmap.data.len() * 2]; // TODO: estimate bitmap encoded size
+-        let len = loop {
+-            match self.bitmap.encode(bitmap, buffer.as_mut_slice()) {
+-                Err(err) => match err {
+-                    BitmapEncodeError::Encode(e) => match e.kind() {
+-                        ironrdp_core::EncodeErrorKind::NotEnoughBytes { .. } => {
+-                            buffer.resize(buffer.len() * 2, 0);
+-                            debug!("encoder buffer resized to: {}", buffer.len() * 2);
+-                        }
+-                        _ => return Err(ServerError::encode(e)).with_context("bitmap encode error"),
+-                    },
+-                    BitmapEncodeError::Rle(e) => return Err(ServerError::custom("bitmap RLE encode error", e)),
+-                },
+-                Ok(len) => break len,
+-            }
+-        };
+-
+-        buffer.truncate(len);
+-        Ok(UpdateFragmenter::new(UpdateCode::Bitmap, buffer))
++        Self::encode(bitmap)
+     }
+ }
+ 
+@@ -793,28 +806,23 @@
+     fn set_desktop_size(&mut self, size: DesktopSize) {
+         self.desktop_size = Some(size);
+     }
 +
++    /// Warpgate: the message comes back from `RfxEncoder::encode` at its exact length, encoded
++    /// once; there is no output buffer to size, zero or grow and refill. Takes `&self`, so the
++    /// rectangles of an update are encoded side by side.
++    fn encode(&self, bitmap: &BitmapUpdate) -> ServerResult<UpdateFragmenter> {
++        let message = self
++            .remotefx
++            .encode(bitmap, self.desktop_size)
++            .map_err(ServerError::encode)
++            .with_context("RemoteFX encode error")?;
++        surface_bits(bitmap, self.codec_id, &message, self.command)
++    }
+ }
+ 
  impl BitmapUpdateHandler for RemoteFxHandler {
      fn handle(&mut self, bitmap: &BitmapUpdate) -> ServerResult<UpdateFragmenter> {
 -        let mut buffer = vec![0; bitmap.data.len()];
-+        let mut buffer = vec![0; rfx_message_size_bound(bitmap)];
-         let len = loop {
-             match self
-                 .remotefx
+-        let len = loop {
+-            match self
+-                .remotefx
 -                .encode(bitmap, buffer.as_mut_slice(), self.desktop_size.take())
-+                .encode(bitmap, buffer.as_mut_slice(), self.desktop_size)
-             {
-                 Err(e) => match e.kind() {
-                     ironrdp_core::EncodeErrorKind::NotEnoughBytes { .. } => {
-@@ -973,3 +1010,252 @@
+-            {
+-                Err(e) => match e.kind() {
+-                    ironrdp_core::EncodeErrorKind::NotEnoughBytes { .. } => {
+-                        buffer.resize(buffer.len() * 2, 0);
+-                        debug!("encoder buffer resized to: {}", buffer.len() * 2);
+-                    }
+-                    _ => return Err(ServerError::encode(e)).with_context("RemoteFX encode error"),
+-                },
+-                Ok(len) => break len,
+-            }
+-        };
+-
+-        surface_bits(bitmap, self.codec_id, &buffer[..len], self.command)
++        self.encode(bitmap)
+     }
+ }
+ 
+@@ -973,3 +981,379 @@
          encode_vec(&cmd).map_err(ServerError::encode)?,
      ))
  }
@@ -435,46 +1205,173 @@ diff -ruN ironrdp-server-1f4dee6b/src/encoder/mod.rs base/ironrdp-server/src/enc
 +        assert_eq!(seen(&mut encoder, rgba(32)).await, [Seen::Default]);
 +        assert_eq!(seen(&mut encoder, large(128)).await, [Seen::Default]);
 +    }
++}
 +
-+    /// The RemoteFX output buffer is never too small, so no update is encoded twice. Noise
-+    /// codes largest; small and thin updates are the ones whose own size fell short.
-+    #[test]
-+    fn the_first_remotefx_buffer_is_large_enough() {
-+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
-+        let mut noise = move || {
-+            state ^= state << 13;
-+            state ^= state >> 7;
-+            state ^= state << 17;
-+            state.to_le_bytes()[0]
-+        };
-+        for (width, height) in [(1, 1), (2, 20), (1920, 1), (1, 1080), (65, 65), (130, 3), (200, 150)] {
-+            let data: Vec<u8> = (0..usize::from(width) * usize::from(height) * 4).map(|_| noise()).collect();
-+            let bitmap = BitmapUpdate {
-+                x: 0,
-+                y: 0,
-+                width: NonZeroU16::new(width).unwrap(),
-+                height: NonZeroU16::new(height).unwrap(),
-+                format: crate::PixelFormat::BgrA32,
-+                data: data.into(),
-+                stride: core::num::NonZeroUsize::new(usize::from(width) * 4).unwrap(),
-+            };
-+            let mut buffer = vec![0; rfx_message_size_bound(&bitmap)];
-+            for entropy in [EntropyBits::Rlgr1, EntropyBits::Rlgr3] {
-+                let mut rfx = RfxEncoder::new(entropy, Quant::default());
-+                let desktop = DesktopSize {
-+                    width: 1920,
-+                    height: 1080,
-+                };
-+                if let Err(error) = rfx.encode(&bitmap, &mut buffer, Some(desktop)) {
-+                    panic!("{width}x{height}: {error}");
-+                }
++/// Warpgate: what a bitmap update turns into, now that all of its changed rectangles are encoded
++/// together.
++#[cfg(test)]
++mod update_tests {
++    use core::num::NonZeroUsize;
++
++    use ironrdp_core::{ReadCursor, decode, decode_cursor};
++    use ironrdp_graphics::rfx::MessageDecoder;
++    use ironrdp_pdu::bitmap::BitmapUpdateData;
++    use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdatePdu, Fragmentation};
++
++    use super::*;
++
++    const DESKTOP: DesktopSize = DesktopSize {
++        width: 640,
++        height: 384,
++    };
++
++    /// A desktop-sized BGRA bitmap, `pixel(x, y)` at each pixel.
++    fn desktop(pixel: impl Fn(usize, usize) -> [u8; 4]) -> BitmapUpdate {
++        let (width, height) = (usize::from(DESKTOP.width), usize::from(DESKTOP.height));
++        let mut data = Vec::with_capacity(width * height * 4);
++        for y in 0..height {
++            for x in 0..width {
++                data.extend_from_slice(&pixel(x, y));
++            }
++        }
++        BitmapUpdate {
++            x: 0,
++            y: 0,
++            width: NonZeroU16::new(DESKTOP.width).unwrap(),
++            height: NonZeroU16::new(DESKTOP.height).unwrap(),
++            format: crate::PixelFormat::BgrA32,
++            data: data.into(),
++            stride: NonZeroUsize::new(width * 4).unwrap(),
++        }
++    }
++
++    fn background(x: usize, y: usize) -> [u8; 4] {
++        [(x / 3) as u8, (y / 2) as u8, 0x40, 0xff]
++    }
++
++    /// The background, with the tiles at `changed` (in 64-pixel units) painted over.
++    fn with_changes(changed: &'static [(usize, usize)]) -> impl Fn(usize, usize) -> [u8; 4] {
++        move |x, y| {
++            if changed.contains(&(x / 64, y / 64)) {
++                [0xff - (x % 256) as u8, (x * y % 256) as u8, (y % 256) as u8, 0xff]
++            } else {
++                background(x, y)
 +            }
 +        }
 +    }
++
++    fn encoder(surface_flags: CmdFlags, remotefx: bool) -> UpdateEncoder {
++        let mut codecs = UpdateEncoderCodecs::new();
++        if remotefx {
++            codecs.set_remotefx_codec(Some((EntropyBits::Rlgr3, 3, RemoteFxCodec::RemoteFx)));
++        }
++        UpdateEncoder::new(
++            DESKTOP,
++            surface_flags,
++            codecs,
++            8 * 1024 * 1024,
++            25,
++            LargePointerSupportFlags::empty(),
++        )
++        .unwrap()
++    }
++
++    /// Each update the client is sent for `update`: its code and its data, reassembled.
++    async fn sent(encoder: &mut UpdateEncoder, update: DisplayUpdate) -> Vec<(UpdateCode, Vec<u8>)> {
++        let mut sent = Vec::new();
++        let mut updates = encoder.update(update);
++        while let Some(fragmenter) = updates.next().await {
++            let mut fragmenter = fragmenter.unwrap();
++            let mut buffer = vec![0; fragmenter.size_hint()];
++            let mut data = Vec::new();
++            while let Some(len) = fragmenter.next(&mut buffer) {
++                let mut cursor = ReadCursor::new(&buffer[..len]);
++                let _: FastPathHeader = decode_cursor(&mut cursor).unwrap();
++                let pdu: FastPathUpdatePdu<'_> = decode_cursor(&mut cursor).unwrap();
++                data.extend_from_slice(pdu.data);
++                if matches!(pdu.fragmentation, Fragmentation::Single | Fragmentation::Last) {
++                    sent.push((pdu.update_code, core::mem::take(&mut data)));
++                }
++            }
++        }
++        sent
++    }
++
++    /// The destination of a surface bits command, and its RemoteFX message's tiles.
++    fn remotefx_rect(data: &[u8]) -> (ExclusiveRectangle, usize) {
++        let SurfaceCommand::StreamSurfaceBits(pdu) = decode::<SurfaceCommand<'_>>(data).unwrap() else {
++            panic!("not a stream surface bits command");
++        };
++        let message = MessageDecoder::new()
++            .parse(pdu.extended_bitmap_data.data)
++            .unwrap();
++        (pdu.destination, message.tile_count())
++    }
++
++    #[tokio::test]
++    async fn each_changed_area_is_sent_once_in_order() {
++        let mut encoder = encoder(CmdFlags::SET_SURFACE_BITS | CmdFlags::STREAM_SURFACE_BITS, true);
++        let first = sent(&mut encoder, DisplayUpdate::Bitmap(desktop(background))).await;
++        assert_eq!(first.len(), 1, "the first frame goes whole");
++
++        // Three separate places change: three surface bits commands, in the order the diff finds
++        // them, each covering exactly its tiles.
++        let changed: &'static [(usize, usize)] = &[(1, 0), (2, 0), (7, 2), (0, 5)];
++        let updates = sent(&mut encoder, DisplayUpdate::Bitmap(desktop(with_changes(changed)))).await;
++        let rects: Vec<_> = updates
++            .iter()
++            .map(|(code, data)| {
++                assert_eq!(*code, UpdateCode::SurfaceCommands);
++                remotefx_rect(data)
++            })
++            .collect();
++        let rect = |left, top, right, bottom| ExclusiveRectangle {
++            left,
++            top,
++            right,
++            bottom,
++        };
++        assert_eq!(
++            rects,
++            [
++                (rect(64, 0, 192, 64), 2),
++                (rect(448, 128, 512, 192), 1),
++                (rect(0, 320, 64, 384), 1)
++            ]
++        );
++
++        // Nothing changed since: nothing is sent.
++        let again = sent(&mut encoder, DisplayUpdate::Bitmap(desktop(with_changes(changed)))).await;
++        assert!(again.is_empty());
++    }
++
++    #[tokio::test]
++    async fn a_client_without_a_shared_codec_gets_rdp6_bitmaps() {
++        for surface_flags in [CmdFlags::SET_SURFACE_BITS, CmdFlags::empty()] {
++            let mut encoder = encoder(surface_flags, false);
++            let updates = sent(&mut encoder, DisplayUpdate::Bitmap(desktop(background))).await;
++            assert_eq!(updates.len(), 1);
++            let (code, data) = &updates[0];
++            assert_eq!(*code, UpdateCode::Bitmap);
++            let bitmap: BitmapUpdateData<'_> = decode(data).unwrap();
++            // 640x384 in 64x64 tiles.
++            assert_eq!(bitmap.rectangles.len(), 10 * 6);
++            assert!(data.len() < 640 * 384 * 4 / 4, "{} bytes", data.len());
++        }
++    }
++
++    /// The pointer goes out unchanged, whatever went before it.
++    #[tokio::test]
++    async fn a_pointer_update_after_a_bitmap_is_still_one_update() {
++        let mut encoder = encoder(CmdFlags::SET_SURFACE_BITS | CmdFlags::STREAM_SURFACE_BITS, true);
++        sent(&mut encoder, DisplayUpdate::Bitmap(desktop(background))).await;
++        let updates = sent(&mut encoder, DisplayUpdate::DefaultPointer).await;
++        assert_eq!(updates, [(UpdateCode::DefaultPointer, Vec::new())]);
++    }
 +}
 diff -ruN ironrdp-server-1f4dee6b/src/encoder/rfx.rs base/ironrdp-server/src/encoder/rfx.rs
---- ironrdp-server-1f4dee6b/src/encoder/rfx.rs	2026-11-20 12:18:37.161257400 +0400
-+++ base/ironrdp-server/src/encoder/rfx.rs	2026-11-20 12:18:46.943775400 +0400
+--- ironrdp-server-1f4dee6b/src/encoder/rfx.rs	2026-11-20 16:17:04.400383500 +0400
++++ base/ironrdp-server/src/encoder/rfx.rs	2026-11-20 16:19:35.839771400 +0400
 @@ -3,7 +3,6 @@
  use ironrdp_acceptor::DesktopSize;
  use ironrdp_core::{Encode as _, EncodeResult, cast_int, cast_length, other_err};
@@ -483,35 +1380,578 @@ diff -ruN ironrdp-server-1f4dee6b/src/encoder/rfx.rs base/ironrdp-server/src/enc
  use ironrdp_graphics::rlgr::RlgrError;
  use ironrdp_pdu::WriteCursor;
  use ironrdp_pdu::codecs::rfx::{
-@@ -12,6 +11,7 @@
+@@ -12,8 +11,13 @@
  };
  use ironrdp_pdu::rdp::capability_sets::EntropyBits;
  
 +use super::rfx_component::encode_component;
  use crate::BitmapUpdate;
  
++/// The most one component of a tile may take. A component that needs more fails its tile, as it
++/// always has: the encoder gives each component this much room.
++const COMPONENT_MAX: usize = 4096;
++
  #[derive(Debug, Clone)]
-@@ -209,11 +209,14 @@
-         let (y_data, buf) = buf.split_at_mut(4096);
-         let (cb_data, cr_data) = buf.split_at_mut(4096);
+ pub(crate) struct RfxEncoder {
+     entropy_algorithm: rfx::EntropyAlgorithm,
+@@ -32,198 +36,179 @@
+         }
+     }
  
+-    pub(crate) fn encode(
+-        &mut self,
+-        bitmap: &BitmapUpdate,
+-        output: &mut [u8],
+-        desktop_size: Option<DesktopSize>,
+-    ) -> EncodeResult<usize> {
+-        let mut cursor = WriteCursor::new(output);
++    /// The RemoteFX message for `bitmap`, in a buffer of exactly its length.
++    ///
++    /// Warpgate: upstream encodes into a buffer the caller sizes and zeroes, and when that was too
++    /// small, grows it and encodes every tile again; its tiles share one more zeroed buffer, three
++    /// worst-case components per tile. Here each tile is encoded into a buffer of exactly its size,
++    /// and the message is then written once, into a buffer of exactly the size the tiles add up to.
++    /// The bytes are the same.
++    pub(crate) fn encode(&self, bitmap: &BitmapUpdate, desktop_size: Option<DesktopSize>) -> EncodeResult<Vec<u8>> {
+         let entropy_algorithm = self.entropy_algorithm;
++        let quant = self.quant.clone();
++        quant.validate()?;
++
++        let encoded = encode_tiles(bitmap, &quant, entropy_algorithm)?;
++        let tiles = encoded.iter().map(EncodedTile::as_tile).collect();
++
++        let mut blocks = Vec::with_capacity(8);
+ 
+         // header messages
+         if let Some(desktop_size) = desktop_size {
+-            let width = desktop_size.width;
+-            let height = desktop_size.height;
+-            Block::Sync(SyncPdu).encode(&mut cursor)?;
+-            let context = rfx::ContextPdu {
++            blocks.push(Block::Sync(SyncPdu));
++            blocks.push(Block::CodecChannel(CodecChannel::Context(rfx::ContextPdu {
+                 flags: OperatingMode::IMAGE_MODE,
+                 entropy_algorithm,
+-            };
+-            Block::CodecChannel(CodecChannel::Context(context)).encode(&mut cursor)?;
+-
+-            let channels = ChannelsPdu(vec![RfxChannel {
+-                width: cast_length!("width", width)?,
+-                height: cast_length!("height", height)?,
+-            }]);
+-            Block::Channels(channels).encode(&mut cursor)?;
+-
+-            Block::CodecVersions(CodecVersionsPdu).encode(&mut cursor)?;
++            })));
++            blocks.push(Block::Channels(ChannelsPdu(vec![RfxChannel {
++                width: cast_length!("width", desktop_size.width)?,
++                height: cast_length!("height", desktop_size.height)?,
++            }])));
++            blocks.push(Block::CodecVersions(CodecVersionsPdu));
+         }
+ 
+         // data messages
+-        let frame_begin = FrameBeginPdu {
++        blocks.push(Block::CodecChannel(CodecChannel::FrameBegin(FrameBeginPdu {
+             index: 0,
+             number_of_regions: 1,
+-        };
+-        Block::CodecChannel(CodecChannel::FrameBegin(frame_begin)).encode(&mut cursor)?;
+-
+-        let width = bitmap.width.get();
+-        let height = bitmap.height.get();
+-        let rectangles = vec![rfx::RfxRectangle {
+-            x: 0,
+-            y: 0,
+-            width,
+-            height,
+-        }];
+-        let region = RegionPdu { rectangles };
+-        Block::CodecChannel(CodecChannel::Region(region)).encode(&mut cursor)?;
+-
+-        let quant = self.quant.clone();
+-        quant.validate()?;
+-
+-        let (encoder, mut data) = UpdateEncoder::new(bitmap, quant.clone(), entropy_algorithm);
+-        let tiles = encoder.encode(&mut data)?;
+-
+-        let quants = vec![quant];
+-        let tile_set = TileSetPdu {
++        })));
++        blocks.push(Block::CodecChannel(CodecChannel::Region(RegionPdu {
++            rectangles: vec![rfx::RfxRectangle {
++                x: 0,
++                y: 0,
++                width: bitmap.width.get(),
++                height: bitmap.height.get(),
++            }],
++        })));
++        blocks.push(Block::CodecChannel(CodecChannel::TileSet(TileSetPdu {
+             entropy_algorithm,
+-            quants,
++            quants: vec![quant],
+             tiles,
+-        };
+-        Block::CodecChannel(CodecChannel::TileSet(tile_set)).encode(&mut cursor)?;
+-
+-        let frame_end = FrameEndPdu;
+-        Block::CodecChannel(CodecChannel::FrameEnd(frame_end)).encode(&mut cursor)?;
++        })));
++        blocks.push(Block::CodecChannel(CodecChannel::FrameEnd(FrameEndPdu)));
+ 
+-        Ok(cursor.pos())
++        let mut output = vec![0; blocks.iter().map(|block| block.size()).sum()];
++        let len = {
++            let mut cursor = WriteCursor::new(&mut output);
++            for block in &blocks {
++                block.encode(&mut cursor)?;
++            }
++            cursor.pos()
++        };
++        output.truncate(len);
++        Ok(output)
+     }
+ }
+ 
+-pub(crate) struct UpdateEncoder<'a> {
+-    bitmap: &'a BitmapUpdate,
+-    quant: Quant,
+-    entropy_algorithm: rfx::EntropyAlgorithm,
+-}
+-
+-struct UpdateEncoderData(Vec<u8>);
+-
+-struct EncodedTile<'a> {
+-    y_data: &'a [u8],
+-    cb_data: &'a [u8],
+-    cr_data: &'a [u8],
++/// One tile, its three components encoded back to back.
++struct EncodedTile {
++    x: u16,
++    y: u16,
++    data: Vec<u8>,
++    y_len: usize,
++    cb_len: usize,
+ }
+ 
+-impl<'a> UpdateEncoder<'a> {
+-    fn new(
+-        bitmap: &'a BitmapUpdate,
+-        quant: Quant,
+-        entropy_algorithm: rfx::EntropyAlgorithm,
+-    ) -> (Self, UpdateEncoderData) {
+-        let this = Self {
+-            bitmap,
+-            quant,
+-            entropy_algorithm,
+-        };
+-        let data = this.alloc_data();
+-
+-        (this, data)
+-    }
+-
+-    fn alloc_data(&self) -> UpdateEncoderData {
+-        let (tiles_x, tiles_y) = self.tiles_xy();
+-
+-        UpdateEncoderData(vec![0u8; 64 * 64 * 3 * tiles_x * tiles_y])
+-    }
+-
+-    fn tiles_xy(&self) -> (usize, usize) {
+-        (
+-            self.bitmap.width.get().div_ceil(64).into(),
+-            self.bitmap.height.get().div_ceil(64).into(),
+-        )
+-    }
+-
+-    fn encode(&self, data: &'a mut UpdateEncoderData) -> EncodeResult<Vec<rfx::Tile<'a>>> {
+-        #[cfg(feature = "rayon")]
+-        use rayon::prelude::*;
+-
+-        let (tiles_x, tiles_y) = self.tiles_xy();
+-
+-        #[cfg(not(feature = "rayon"))]
+-        let chunks = data.0.chunks_mut(64 * 64 * 3);
+-        #[cfg(feature = "rayon")]
+-        let chunks = data.0.par_chunks_mut(64 * 64 * 3);
+-
+-        let tiles: Vec<_> = (0..tiles_y).flat_map(|y| (0..tiles_x).map(move |x| (x, y))).collect();
+-
+-        chunks
+-            .zip(tiles)
+-            .map(|(buf, (tile_x, tile_y))| {
+-                let EncodedTile {
+-                    y_data,
+-                    cb_data,
+-                    cr_data,
+-                } = self
+-                    .encode_tile(tile_x, tile_y, buf)
+-                    .map_err(|e| other_err!("rfxenc", source: e))?;
+-
+-                let tile = rfx::Tile {
+-                    y_quant_index: 0,
+-                    cb_quant_index: 0,
+-                    cr_quant_index: 0,
+-                    x: cast_int!("tile_x", tile_x)?,
+-                    y: cast_int!("tile_y", tile_y)?,
+-                    y_data,
+-                    cb_data,
+-                    cr_data,
+-                };
+-                Ok(tile)
+-            })
+-            .collect()
+-    }
+-
+-    fn encode_tile<'b>(&self, tile_x: usize, tile_y: usize, buf: &'b mut [u8]) -> Result<EncodedTile<'b>, RlgrError> {
+-        #![allow(clippy::similar_names)] // It’s hard to find better names for cr, cb, etc.
+-
+-        assert!(buf.len() >= 4096 * 3);
+-
+-        let bpp: usize = self.bitmap.format.bytes_per_pixel().into();
+-        let width: usize = self.bitmap.width.get().into();
+-        let height: usize = self.bitmap.height.get().into();
+-
+-        let x = tile_x * 64;
+-        let y = tile_y * 64;
+-        let tile_width = u32::try_from(core::cmp::min(width - x, 64)).expect("can always fit in u32");
+-        let tile_height = u32::try_from(core::cmp::min(height - y, 64)).expect("can always fit in u32");
+-        let stride = self.bitmap.stride.get();
+-        let input = &self.bitmap.data[y * stride + x * bpp..];
+-
+-        let stride = u32::try_from(stride).map_err(io::Error::other)?;
+-        let y = &mut [0i16; 4096];
+-        let cb = &mut [0i16; 4096];
+-        let cr = &mut [0i16; 4096];
+-
+-        to_64x64_ycbcr_tile(input, tile_width, tile_height, stride, self.bitmap.format, y, cb, cr)
+-            .map_err(RlgrError::Yuv)?;
+-
+-        let (y_data, buf) = buf.split_at_mut(4096);
+-        let (cb_data, cr_data) = buf.split_at_mut(4096);
+-
 -        let len = rfx_encode_component(y, y_data, &self.quant, self.entropy_algorithm)?;
-+        // Warpgate: `encode_component` writes what `ironrdp_graphics::rfx_encode_component`
-+        // would, faster; see its module.
-+        let temp = &mut [0i16; 4096];
-+        let len = encode_component(y, temp, y_data, &self.quant, self.entropy_algorithm)?;
-         let y_data = &y_data[..len];
+-        let y_data = &y_data[..len];
 -        let len = rfx_encode_component(cb, cb_data, &self.quant, self.entropy_algorithm)?;
-+        let len = encode_component(cb, temp, cb_data, &self.quant, self.entropy_algorithm)?;
-         let cb_data = &cb_data[..len];
+-        let cb_data = &cb_data[..len];
 -        let len = rfx_encode_component(cr, cr_data, &self.quant, self.entropy_algorithm)?;
-+        let len = encode_component(cr, temp, cr_data, &self.quant, self.entropy_algorithm)?;
-         let cr_data = &cr_data[..len];
+-        let cr_data = &cr_data[..len];
+-
+-        Ok(EncodedTile {
++impl EncodedTile {
++    fn as_tile(&self) -> rfx::Tile<'_> {
++        let (y_data, rest) = self.data.split_at(self.y_len);
++        let (cb_data, cr_data) = rest.split_at(self.cb_len);
++        rfx::Tile {
++            y_quant_index: 0,
++            cb_quant_index: 0,
++            cr_quant_index: 0,
++            x: self.x,
++            y: self.y,
+             y_data,
+             cb_data,
+             cr_data,
+-        })
++        }
+     }
+ }
  
-         Ok(EncodedTile {
++/// Every tile of `bitmap`, row by row, encoded in parallel when the `rayon` feature is on.
++fn encode_tiles(
++    bitmap: &BitmapUpdate,
++    quant: &Quant,
++    entropy_algorithm: rfx::EntropyAlgorithm,
++) -> EncodeResult<Vec<EncodedTile>> {
++    #[cfg(feature = "rayon")]
++    use rayon::prelude::*;
++
++    let tiles_x = usize::from(bitmap.width.get().div_ceil(64));
++    let tiles_y = usize::from(bitmap.height.get().div_ceil(64));
++    let positions: Vec<(usize, usize)> = (0..tiles_y)
++        .flat_map(|y| (0..tiles_x).map(move |x| (x, y)))
++        .collect();
++
++    #[cfg(feature = "rayon")]
++    let positions = positions.into_par_iter();
++    #[cfg(not(feature = "rayon"))]
++    let positions = positions.into_iter();
++
++    positions
++        .map(|(tile_x, tile_y)| {
++            let x = cast_int!("tile_x", tile_x)?;
++            let y = cast_int!("tile_y", tile_y)?;
++            let (data, y_len, cb_len) = encode_tile(bitmap, quant, entropy_algorithm, tile_x, tile_y)
++                .map_err(|e| other_err!("rfxenc", source: e))?;
++            Ok(EncodedTile {
++                x,
++                y,
++                data,
++                y_len,
++                cb_len,
++            })
++        })
++        .collect()
++}
++
++/// The Y, Cb and Cr components of one tile, back to back, with the lengths of the first two.
++fn encode_tile(
++    bitmap: &BitmapUpdate,
++    quant: &Quant,
++    entropy_algorithm: rfx::EntropyAlgorithm,
++    tile_x: usize,
++    tile_y: usize,
++) -> Result<(Vec<u8>, usize, usize), RlgrError> {
++    #![allow(clippy::similar_names)] // It’s hard to find better names for cr, cb, etc.
++
++    let bpp: usize = bitmap.format.bytes_per_pixel().into();
++    let width: usize = bitmap.width.get().into();
++    let height: usize = bitmap.height.get().into();
++
++    let x = tile_x * 64;
++    let y = tile_y * 64;
++    let tile_width = u32::try_from(core::cmp::min(width - x, 64)).expect("can always fit in u32");
++    let tile_height = u32::try_from(core::cmp::min(height - y, 64)).expect("can always fit in u32");
++    let stride = bitmap.stride.get();
++    let input = &bitmap.data[y * stride + x * bpp..];
++
++    let stride = u32::try_from(stride).map_err(io::Error::other)?;
++    let y = &mut [0i16; 4096];
++    let cb = &mut [0i16; 4096];
++    let cr = &mut [0i16; 4096];
++
++    to_64x64_ycbcr_tile(input, tile_width, tile_height, stride, bitmap.format, y, cb, cr).map_err(RlgrError::Yuv)?;
++
++    let mut components = [0u8; 3 * COMPONENT_MAX];
++    let (y_data, rest) = components.split_at_mut(COMPONENT_MAX);
++    let (cb_data, cr_data) = rest.split_at_mut(COMPONENT_MAX);
++
++    // Warpgate: `encode_component` writes what `ironrdp_graphics::rfx_encode_component`
++    // would, faster; see its module.
++    let temp = &mut [0i16; 4096];
++    let y_len = encode_component(y, temp, y_data, quant, entropy_algorithm)?;
++    let cb_len = encode_component(cb, temp, cb_data, quant, entropy_algorithm)?;
++    let cr_len = encode_component(cr, temp, cr_data, quant, entropy_algorithm)?;
++
++    let mut data = Vec::with_capacity(y_len + cb_len + cr_len);
++    data.extend_from_slice(&y_data[..y_len]);
++    data.extend_from_slice(&cb_data[..cb_len]);
++    data.extend_from_slice(&cr_data[..cr_len]);
++    Ok((data, y_len, cb_len))
++}
++
+ #[cfg(feature = "__bench")]
+ #[expect(clippy::missing_panics_doc, reason = "panics in benches are allowed")]
+ pub(crate) mod bench {
+@@ -236,15 +221,201 @@
+         tile_x: usize,
+         tile_y: usize,
+     ) {
+-        let (enc, mut data) = UpdateEncoder::new(bitmap, quant.clone(), algo);
+-
+-        enc.encode_tile(tile_x, tile_y, &mut data.0)
+-            .expect("cannot propagate error in benchmark");
++        encode_tile(bitmap, quant, algo, tile_x, tile_y).expect("cannot propagate error in benchmark");
+     }
+ 
+     pub fn rfx_enc(bitmap: &BitmapUpdate, quant: &Quant, algo: rfx::EntropyAlgorithm) {
+-        let (enc, mut data) = UpdateEncoder::new(bitmap, quant.clone(), algo);
++        encode_tiles(bitmap, quant, algo).expect("cannot propagate error in benchmark");
++    }
++}
++
++/// Warpgate: the message is the one upstream's encoder writes, byte for byte, here rebuilt from
++/// IronRDP's own component coder and block encoding.
++#[cfg(test)]
++mod tests {
++    use core::num::{NonZeroU16, NonZeroUsize};
++
++    use ironrdp_core::Encode as _;
++    use ironrdp_graphics::rfx::MessageDecoder;
++    use ironrdp_graphics::rfx_encode_component;
++
++    use super::*;
++    use crate::PixelFormat;
++
++    fn bitmap(width: u16, height: u16, seed: u64) -> BitmapUpdate {
++        let mut state = seed;
++        let data: Vec<u8> = (0..usize::from(width) * usize::from(height) * 4)
++            .map(|i| {
++                state ^= state << 13;
++                state ^= state >> 7;
++                state ^= state << 17;
++                // Smooth areas and noise both, as desktops have.
++                if (i / 4) % 7 < 3 {
++                    (i / 97) as u8
++                } else {
++                    state.to_le_bytes()[0]
++                }
++            })
++            .collect();
++        BitmapUpdate {
++            x: 0,
++            y: 0,
++            width: NonZeroU16::new(width).unwrap(),
++            height: NonZeroU16::new(height).unwrap(),
++            format: PixelFormat::BgrA32,
++            data: data.into(),
++            stride: NonZeroUsize::new(usize::from(width) * 4).unwrap(),
++        }
++    }
++
++    /// The message as upstream builds it: every tile through `rfx_encode_component`, each
++    /// component in a 4096-byte slot, the blocks written one after another.
++    fn upstream_message(
++        bitmap: &BitmapUpdate,
++        quant: &Quant,
++        entropy_algorithm: rfx::EntropyAlgorithm,
++        desktop_size: Option<DesktopSize>,
++    ) -> Vec<u8> {
++        let tiles_x = usize::from(bitmap.width.get().div_ceil(64));
++        let tiles_y = usize::from(bitmap.height.get().div_ceil(64));
++        let mut slots = vec![[0u8; 3 * COMPONENT_MAX]; tiles_x * tiles_y];
++        let mut lens = Vec::new();
++        for (index, slot) in slots.iter_mut().enumerate() {
++            let (tile_x, tile_y) = (index % tiles_x, index / tiles_x);
++            let (x, y) = (tile_x * 64, tile_y * 64);
++            let stride = bitmap.stride.get();
++            let (mut luma, mut cb, mut cr) = ([0i16; 4096], [0i16; 4096], [0i16; 4096]);
++            to_64x64_ycbcr_tile(
++                &bitmap.data[y * stride + x * 4..],
++                u32::try_from((usize::from(bitmap.width.get()) - x).min(64)).unwrap(),
++                u32::try_from((usize::from(bitmap.height.get()) - y).min(64)).unwrap(),
++                u32::try_from(stride).unwrap(),
++                bitmap.format,
++                &mut luma,
++                &mut cb,
++                &mut cr,
++            )
++            .unwrap();
++            let (y_slot, rest) = slot.split_at_mut(COMPONENT_MAX);
++            let (cb_slot, cr_slot) = rest.split_at_mut(COMPONENT_MAX);
++            lens.push((
++                rfx_encode_component(&mut luma, y_slot, quant, entropy_algorithm).unwrap(),
++                rfx_encode_component(&mut cb, cb_slot, quant, entropy_algorithm).unwrap(),
++                rfx_encode_component(&mut cr, cr_slot, quant, entropy_algorithm).unwrap(),
++            ));
++        }
++        let tiles = slots
++            .iter()
++            .zip(&lens)
++            .enumerate()
++            .map(|(index, (slot, &(y_len, cb_len, cr_len)))| rfx::Tile {
++                y_quant_index: 0,
++                cb_quant_index: 0,
++                cr_quant_index: 0,
++                x: u16::try_from(index % tiles_x).unwrap(),
++                y: u16::try_from(index / tiles_x).unwrap(),
++                y_data: &slot[..y_len],
++                cb_data: &slot[COMPONENT_MAX..COMPONENT_MAX + cb_len],
++                cr_data: &slot[2 * COMPONENT_MAX..2 * COMPONENT_MAX + cr_len],
++            })
++            .collect();
++
++        let mut output = vec![0; 64 * 1024 + tiles_x * tiles_y * 3 * COMPONENT_MAX];
++        let mut cursor = WriteCursor::new(&mut output);
++        if let Some(desktop_size) = desktop_size {
++            Block::Sync(SyncPdu).encode(&mut cursor).unwrap();
++            Block::CodecChannel(CodecChannel::Context(rfx::ContextPdu {
++                flags: OperatingMode::IMAGE_MODE,
++                entropy_algorithm,
++            }))
++            .encode(&mut cursor)
++            .unwrap();
++            Block::Channels(ChannelsPdu(vec![RfxChannel {
++                width: i16::try_from(desktop_size.width).unwrap(),
++                height: i16::try_from(desktop_size.height).unwrap(),
++            }]))
++            .encode(&mut cursor)
++            .unwrap();
++            Block::CodecVersions(CodecVersionsPdu).encode(&mut cursor).unwrap();
++        }
++        Block::CodecChannel(CodecChannel::FrameBegin(FrameBeginPdu {
++            index: 0,
++            number_of_regions: 1,
++        }))
++        .encode(&mut cursor)
++        .unwrap();
++        Block::CodecChannel(CodecChannel::Region(RegionPdu {
++            rectangles: vec![rfx::RfxRectangle {
++                x: 0,
++                y: 0,
++                width: bitmap.width.get(),
++                height: bitmap.height.get(),
++            }],
++        }))
++        .encode(&mut cursor)
++        .unwrap();
++        Block::CodecChannel(CodecChannel::TileSet(TileSetPdu {
++            entropy_algorithm,
++            quants: vec![quant.clone()],
++            tiles,
++        }))
++        .encode(&mut cursor)
++        .unwrap();
++        Block::CodecChannel(CodecChannel::FrameEnd(FrameEndPdu))
++            .encode(&mut cursor)
++            .unwrap();
++        let len = cursor.pos();
++        output.truncate(len);
++        output
++    }
++
++    #[test]
++    fn messages_are_what_upstream_writes() {
++        let desktop = DesktopSize {
++            width: 1920,
++            height: 1080,
++        };
++        let sizes = [(1, 1), (3, 70), (64, 64), (65, 63), (130, 129), (200, 1), (1, 200)];
++        for (seed, (width, height)) in (1u64..).zip(sizes) {
++            let bitmap = bitmap(width, height, seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
++            for (entropy_bits, entropy_algorithm) in [
++                (EntropyBits::Rlgr1, rfx::EntropyAlgorithm::Rlgr1),
++                (EntropyBits::Rlgr3, rfx::EntropyAlgorithm::Rlgr3),
++            ] {
++                let encoder = RfxEncoder::new(entropy_bits, Quant::default());
++                for desktop_size in [Some(desktop), None] {
++                    let ours = encoder.encode(&bitmap, desktop_size).unwrap();
++                    let theirs = upstream_message(&bitmap, &Quant::default(), entropy_algorithm, desktop_size);
++                    assert!(
++                        ours == theirs,
++                        "{width}x{height} {entropy_bits:?}: {} bytes against {}",
++                        ours.len(),
++                        theirs.len()
++                    );
++                }
++            }
++        }
++    }
+ 
+-        enc.encode(&mut data).expect("cannot propagate error in benchmark");
++    #[test]
++    fn every_tile_is_in_the_message_in_order() {
++        let bitmap = bitmap(200, 150, 7);
++        let message = RfxEncoder::new(EntropyBits::Rlgr3, Quant::default())
++            .encode(
++                &bitmap,
++                Some(DesktopSize {
++                    width: 800,
++                    height: 600,
++                }),
++            )
++            .unwrap();
++        let parsed = MessageDecoder::new().parse(&message).unwrap();
++        assert_eq!(parsed.frames.len(), 1);
++        let frame = &parsed.frames[0];
++        assert_eq!(frame.rectangles.len(), 1);
++        assert_eq!((frame.rectangles[0].width, frame.rectangles[0].height), (200, 150));
++        let positions: Vec<_> = frame.tile_set.tiles.iter().map(|tile| (tile.x, tile.y)).collect();
++        let expected: Vec<_> = (0..3u16).flat_map(|y| (0..4u16).map(move |x| (x, y))).collect();
++        assert_eq!(positions, expected);
+     }
+ }
 diff -ruN ironrdp-server-1f4dee6b/src/encoder/rfx_component.rs base/ironrdp-server/src/encoder/rfx_component.rs
 --- ironrdp-server-1f4dee6b/src/encoder/rfx_component.rs	1970-01-01 04:00:00.000000000 +0400
-+++ base/ironrdp-server/src/encoder/rfx_component.rs	2026-11-20 12:18:47.010465500 +0400
++++ base/ironrdp-server/src/encoder/rfx_component.rs	2026-11-20 16:19:35.971960000 +0400
 @@ -0,0 +1,509 @@
 +//! Encoding of one 64x64 RemoteFX tile component: forward DWT, quantization, sub-band
 +//! reconstruction and RLGR entropy coding ([MS-RDPRFX] 3.1.8.1).
@@ -1020,5 +2460,316 @@ diff -ruN ironrdp-server-1f4dee6b/src/encoder/rfx_component.rs base/ironrdp-serv
 +                }
 +            }
 +        }
++    }
++}
+diff -ruN ironrdp-server-1f4dee6b/src/server.rs base/ironrdp-server/src/server.rs
+--- ironrdp-server-1f4dee6b/src/server.rs	2026-11-20 16:17:04.717014500 +0400
++++ base/ironrdp-server/src/server.rs	2026-11-20 16:19:35.416428400 +0400
+@@ -62,7 +62,7 @@
+ use crate::clipboard::CliprdrServerFactory;
+ use crate::display::{DisplayContext, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates};
+ use crate::echo::{EchoDvcBridge, EchoServerHandle, EchoServerMessage, build_echo_request};
+-use crate::encoder::{RemoteFxCodec, UpdateEncoder, UpdateEncoderCodecs};
++use crate::encoder::{DISPLAY_TARGET, RemoteFxCodec, UpdateEncoder, UpdateEncoderCodecs};
+ use crate::error::{ServerError, ServerErrorExt as _, ServerErrorKind, ServerResult};
+ #[cfg(feature = "egfx")]
+ use crate::gfx::{EgfxServerMessage, GfxContext, GfxServerFactory, GfxServerHandle};
+@@ -3646,6 +3646,9 @@
+         Ok(RunState::Continue)
+     }
+ 
++    /// Warpgate: the fast-path PDUs of an update are gathered into writes of up to
++    /// [`DISPLAY_WRITE_BYTES`], rather than written, and flushed through TLS, one PDU of at most
++    /// 16 KB at a time; `stats` is told how long encoding and writing took.
+     async fn dispatch_display_update(
+         update: DisplayUpdate,
+         writer: &mut impl FramedWrite,
+@@ -3653,6 +3656,7 @@
+         io_channel_id: u16,
+         buffer: &mut Vec<u8>,
+         mut encoder: UpdateEncoder,
++        stats: &mut DisplayStats,
+     ) -> ServerResult<(RunState, UpdateEncoder)> {
+         if let DisplayUpdate::Resize(desktop_size) = update {
+             debug!(?desktop_size, "Display resize");
+@@ -3661,6 +3665,13 @@
+             return Ok((RunState::DeactivationReactivation { desktop_size }, encoder));
+         }
+ 
++        let bitmap = matches!(update, DisplayUpdate::Bitmap(_));
++        let started = Instant::now();
++        let mut writing = Duration::ZERO;
++        let mut written = 0;
++        // The bytes at the start of `buffer` still to be written.
++        let mut pending = 0;
++
+         let mut encoder_iter = encoder.update(update);
+         loop {
+             let Some(fragmenter) = encoder_iter.next().await else {
+@@ -3668,18 +3679,28 @@
+             };
+ 
+             let mut fragmenter = fragmenter?;
+-            if fragmenter.size_hint() > buffer.len() {
+-                buffer.resize(fragmenter.size_hint(), 0);
+-            }
+-
+-            while let Some(len) = fragmenter.next(buffer) {
+-                writer
+-                    .write_all(&buffer[..len])
+-                    .await
+-                    .map_err(|e| ServerError::io("failed to write display update", e))?;
++            loop {
++                let end = pending + fragmenter.size_hint();
++                if end > buffer.len() {
++                    buffer.resize(end, 0);
++                }
++                let Some(len) = fragmenter.next(&mut buffer[pending..end]) else {
++                    break;
++                };
++                pending += len;
++                if pending >= DISPLAY_WRITE_BYTES {
++                    writing += write_display(writer, &buffer[..pending]).await?;
++                    written += pending;
++                    pending = 0;
++                }
+             }
+         }
++        if pending > 0 {
++            writing += write_display(writer, &buffer[..pending]).await?;
++            written += pending;
++        }
+ 
++        stats.record(bitmap, started.elapsed().saturating_sub(writing), writing, written);
+         Ok((RunState::Continue, encoder))
+     }
+ 
+@@ -4800,6 +4821,7 @@
+ 
+         let dispatch_display = async move {
+             let mut buffer = vec![0u8; 4096];
++            let mut stats = DisplayStats::default();
+ 
+             loop {
+                 match display_updates.next_update().await {
+@@ -4811,6 +4833,7 @@
+                             io_channel_id,
+                             &mut buffer,
+                             encoder,
++                            &mut stats,
+                         )
+                         .await?
+                         {
+@@ -6088,6 +6111,93 @@
+     encode_vec(&X224(mcs_pdu)).map_err(ServerError::encode)
+ }
+ 
++/// Warpgate: how many bytes of display updates go to the writer at once. Every write is flushed
++/// through TLS, so writing each fast-path PDU (at most 16 KB) on its own cost a flush, a lock of
++/// the shared writer and a wakeup of the transport per PDU. Kept small, because the writer stays
++/// locked for a whole write: `dispatch_events` waits for it holding the connection lock, and
++/// input waits for that.
++const DISPLAY_WRITE_BYTES: usize = 64 * 1024;
++
++/// Write `data`, returning how long that took: the time the display path waited on the viewer's
++/// connection.
++async fn write_display(writer: &mut impl FramedWrite, data: &[u8]) -> ServerResult<Duration> {
++    let started = Instant::now();
++    writer
++        .write_all(data)
++        .await
++        .map_err(|e| ServerError::io("failed to write display update", e))?;
++    Ok(started.elapsed())
++}
++
++/// Warpgate: how the display updates of one connection fared, reported under
++/// [`DISPLAY_TARGET`]: each update at trace level, and a summary every
++/// [`DisplayStats::PERIOD`] at debug level. "Encode" is everything but the writing: the diff
++/// against the last frame, the encoding and the framebuffer update. "Write" is the time spent
++/// waiting on the viewer's connection, which grows when the network or the viewer is the
++/// bottleneck.
++#[derive(Default)]
++struct DisplayStats {
++    since: Option<Instant>,
++    bitmaps: u32,
++    others: u32,
++    bytes: u64,
++    encode: Duration,
++    encode_max: Duration,
++    write: Duration,
++    write_max: Duration,
++}
++
++impl DisplayStats {
++    const PERIOD: Duration = Duration::from_secs(10);
++
++    fn record(&mut self, bitmap: bool, encode: Duration, write: Duration, bytes: usize) {
++        let now = Instant::now();
++        let since = *self.since.get_or_insert(now);
++        if bitmap {
++            self.bitmaps += 1;
++        } else {
++            self.others += 1;
++        }
++        self.bytes += u64::try_from(bytes).unwrap_or(u64::MAX);
++        self.encode += encode;
++        self.encode_max = self.encode_max.max(encode);
++        self.write += write;
++        self.write_max = self.write_max.max(write);
++        let us = |duration: Duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
++        trace!(
++            target: DISPLAY_TARGET,
++            bitmap,
++            encode_us = us(encode),
++            write_us = us(write),
++            bytes,
++            "Display update"
++        );
++
++        let elapsed = now.saturating_duration_since(since);
++        if elapsed < Self::PERIOD {
++            return;
++        }
++        let updates = self.bitmaps + self.others;
++        let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
++        debug!(
++            target: DISPLAY_TARGET,
++            seconds = elapsed.as_secs(),
++            bitmap_updates = self.bitmaps,
++            other_updates = self.others,
++            kbit_per_s = self.bytes as f64 * 8.0 / 1000.0 / elapsed.as_secs_f64(),
++            encode_ms_avg = ms(self.encode) / f64::from(updates.max(1)),
++            encode_ms_max = ms(self.encode_max),
++            write_ms_avg = ms(self.write) / f64::from(updates.max(1)),
++            write_ms_max = ms(self.write_max),
++            "Display updates"
++        );
++        *self = Self {
++            since: Some(now),
++            ..Self::default()
++        };
++    }
++}
++
+ async fn deactivate_all(io_channel_id: u16, user_channel_id: u16, writer: &mut impl FramedWrite) -> ServerResult<()> {
+     let pdu = ShareControlPdu::ServerDeactivateAll(ServerDeactivateAll);
+     let pdu = rdp::headers::ShareControlHeader {
+@@ -7599,3 +7709,118 @@
+         assert!(writer.0.is_empty());
+     }
+ }
++
++/// Warpgate: display updates reach the writer in a few large writes, unchanged.
++#[cfg(test)]
++mod display_write_tests {
++    use core::num::{NonZeroU16, NonZeroUsize};
++
++    use super::*;
++    use crate::{BitmapUpdate, PixelFormat};
++
++    /// Keeps each write apart.
++    #[derive(Default)]
++    struct Writes(Vec<Vec<u8>>);
++
++    impl FramedWrite for Writes {
++        type WriteAllFut<'write>
++            = core::future::Ready<std::io::Result<()>>
++        where
++            Self: 'write;
++
++        fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Self::WriteAllFut<'a> {
++            self.0.push(buf.to_vec());
++            core::future::ready(Ok(()))
++        }
++    }
++
++    const DESKTOP: DesktopSize = DesktopSize {
++        width: 640,
++        height: 384,
++    };
++
++    /// No codec in common, so lossless bitmaps: noise makes them large.
++    fn encoder() -> UpdateEncoder {
++        UpdateEncoder::new(
++            DESKTOP,
++            CmdFlags::SET_SURFACE_BITS,
++            UpdateEncoderCodecs::new(),
++            8 * 1024 * 1024,
++            25,
++            LargePointerSupportFlags::empty(),
++        )
++        .unwrap()
++    }
++
++    fn noise() -> DisplayUpdate {
++        let (width, height) = (usize::from(DESKTOP.width), usize::from(DESKTOP.height));
++        let mut state = 0x2545_f491_4f6c_dd1d_u64;
++        let data: Vec<u8> = (0..width * height * 4)
++            .map(|_| {
++                state ^= state << 13;
++                state ^= state >> 7;
++                state ^= state << 17;
++                state.to_le_bytes()[0]
++            })
++            .collect();
++        DisplayUpdate::Bitmap(BitmapUpdate {
++            x: 0,
++            y: 0,
++            width: NonZeroU16::new(DESKTOP.width).unwrap(),
++            height: NonZeroU16::new(DESKTOP.height).unwrap(),
++            format: PixelFormat::BgrA32,
++            data: data.into(),
++            stride: NonZeroUsize::new(width * 4).unwrap(),
++        })
++    }
++
++    /// Every fast-path PDU of `update`, back to back, as an encoder in the same state sends them.
++    async fn pdus(update: DisplayUpdate) -> Vec<u8> {
++        let mut encoder = encoder();
++        let mut pdus = Vec::new();
++        let mut updates = encoder.update(update);
++        while let Some(fragmenter) = updates.next().await {
++            let mut fragmenter = fragmenter.unwrap();
++            let mut buffer = vec![0; fragmenter.size_hint()];
++            while let Some(len) = fragmenter.next(&mut buffer) {
++                pdus.extend_from_slice(&buffer[..len]);
++            }
++        }
++        pdus
++    }
++
++    async fn dispatch(update: DisplayUpdate) -> (Vec<Vec<u8>>, DisplayStats) {
++        let mut writes = Writes::default();
++        let mut stats = DisplayStats::default();
++        let (state, _) =
++            RdpServer::dispatch_display_update(update, &mut writes, 1007, 1003, &mut Vec::new(), encoder(), &mut stats)
++                .await
++                .unwrap();
++        assert!(matches!(state, RunState::Continue));
++        (writes.0, stats)
++    }
++
++    #[tokio::test]
++    async fn a_large_update_goes_out_in_a_few_large_writes() {
++        let expected = pdus(noise()).await;
++        assert!(expected.len() > 3 * DISPLAY_WRITE_BYTES, "{} bytes", expected.len());
++
++        let (writes, stats) = dispatch(noise()).await;
++        assert!(writes.concat() == expected, "the bytes written differ from the PDUs");
++        assert!(writes.len() <= expected.len().div_ceil(DISPLAY_WRITE_BYTES));
++        let (last, rest) = writes.split_last().unwrap();
++        assert!(!last.is_empty());
++        for write in rest {
++            assert!(write.len() >= DISPLAY_WRITE_BYTES, "a {} byte write", write.len());
++        }
++        assert_eq!((stats.bitmaps, stats.others), (1, 0));
++    }
++
++    #[tokio::test]
++    async fn a_small_update_is_one_write() {
++        let expected = pdus(DisplayUpdate::DefaultPointer).await;
++        let (writes, stats) = dispatch(DisplayUpdate::DefaultPointer).await;
++        assert_eq!(writes, [expected]);
++        assert_eq!((stats.bitmaps, stats.others), (0, 1));
 +    }
 +}

@@ -32,6 +32,8 @@ rustls = { version = "0.23", default-features = false, features = [
 ] }
 rustls-native-certs = "0.8"
 rustls-pemfile = "2"
+# The viewer socket's TCP_NOTSENT_LOWAT; already in the lock file, through tokio and others.
+socket2 = { version = "0.6", features = ["all"] }
 tokio = { workspace = true, features = [
     "io-util",
     "net",

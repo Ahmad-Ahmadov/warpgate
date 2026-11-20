@@ -69,6 +69,18 @@ const SERVER_INPUT_CAPACITY: usize = 4;
 /// viewer socket and the RDP server.
 const RELAY_BUFFER_BYTES: usize = 64 * 1024;
 
+/// The most the relay passes from the RDP server to the viewer's socket in one write. With
+/// `tokio::io::copy`'s 8 KB, a busy desktop cost the relay a system call for every 8 KB.
+const RELAY_WRITE_BYTES: usize = 64 * 1024;
+
+/// How much the viewer's socket may hold that it has not sent yet. The kernel otherwise lets it
+/// take megabytes on a slow link, all of it frames the viewer sees late, one after another,
+/// seconds behind the target. Bounded, the relay waits sooner, so does the RDP server behind it,
+/// and the target client folds what changes meanwhile into its next update. The data in flight
+/// is not limited by this, so neither is the link's throughput.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const VIEWER_UNSENT_BYTES: u32 = 256 * 1024;
+
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long the viewer's connection stays open once the session has ended, for the RDP
@@ -116,6 +128,7 @@ pub async fn bind_server(
             listener,
             proxy_protocol,
             move |stream, remote_address| {
+                limit_unsent_bytes(&stream);
                 let services = services.clone();
                 let cert_pem = cert_pem.clone();
                 let key_pem = key_pem.clone();
@@ -166,6 +179,19 @@ pub async fn bind_server(
     }
     .boxed())
 }
+
+/// Bound what the viewer's socket keeps unsent; see [`VIEWER_UNSENT_BYTES`]. A socket that
+/// refuses keeps the kernel's default, as before.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn limit_unsent_bytes(stream: &tokio::net::TcpStream) {
+    if let Err(error) = socket2::SockRef::from(stream).set_tcp_notsent_lowat(VIEWER_UNSENT_BYTES) {
+        debug!(%error, "Could not bound the viewer socket's unsent bytes");
+    }
+}
+
+/// Only Linux has `TCP_NOTSENT_LOWAT`; elsewhere the socket keeps the kernel's default.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const fn limit_unsent_bytes(_: &tokio::net::TcpStream) {}
 
 async fn handle_connection(
     services: Services,
@@ -273,7 +299,8 @@ where
     let (mut server_rx, mut server_tx) = tokio::io::split(server);
 
     let to_viewer = async {
-        tokio::io::copy(&mut server_rx, &mut viewer_tx).await?;
+        let mut server_rx = tokio::io::BufReader::with_capacity(RELAY_WRITE_BYTES, &mut server_rx);
+        tokio::io::copy_buf(&mut server_rx, &mut viewer_tx).await?;
         viewer_tx.shutdown().await
     };
     let from_viewer = async {

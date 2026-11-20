@@ -2842,3 +2842,46 @@ cargo test -p ironrdp-server --lib encoder
 Then in mstsc and MobaXterm: arrow, text field, arrow; window edges (resize
 cursors), links (hand), a busy application (wait cursor); type until the target
 hides the pointer, then move it.
+
+## Native RDP performance: encoding, writes and the send queue
+
+### What changed
+
+- **RemoteFX messages are encoded once, at their exact size.** Every message used to zero two
+  worst-case buffers (about 6 MB each at 1080p) and was encoded again whenever the first was
+  too small. Tiles are now encoded in parallel into buffers of their own size, and the message
+  is written once. The bytes sent are unchanged.
+- **All changed rectangles of an update are encoded together**, in parallel, rather than one
+  blocking task and one rectangle at a time.
+- **Clients with no codec in common get lossless RDP 6.0 bitmaps, not raw pixels.** Before,
+  such a client (a FreeRDP-based one with RemoteFX off, or one offering only NSCodec) got raw
+  32-bit surface bits, about 8 MB per 1080p frame. It now gets 64x64 RLE-compressed bitmap tiles,
+  the same pixels. RemoteFX clients, mstsc among them, are unaffected.
+- **Display updates go out in writes of up to 64 KB**, not one TLS flush per 16 KB PDU, and
+  the relay to the viewer's socket moves up to 64 KB per write instead of 8 KB.
+- **The viewer socket's unsent queue is bounded to 256 KB** (`TCP_NOTSENT_LOWAT`, Linux). On a
+  slow link the kernel would otherwise queue megabytes of frames, which the viewer saw late,
+  one after another; now the server waits and the target client merges what changes meanwhile.
+- **Instrumentation.** One info line per activation says which graphics the viewer
+  negotiated (`Viewer graphics`). With
+  `RUST_LOG=audit=info,warpgate=info,ironrdp=warn,ironrdp_server=error,ironrdp_server::graphics=debug`
+  a summary follows every 10 seconds: updates, kbit/s, and average and worst encode and write
+  times. Write time is waiting on the network or the viewer; encode time is CPU.
+
+The browser path is unaffected: it shares only the target-side client, which this does not
+change.
+
+### To run on the build server
+
+```sh
+cargo test -p ironrdp-server --lib encoder
+cargo test -p ironrdp-server --lib display_write_tests
+cargo test -p warpgate-protocol-rdp
+just clippy
+```
+
+Then, in mstsc and MobaXterm, check the `Viewer graphics` line for each, and compare against
+the previous image at 1080p, 1440p and 4K: scroll a long page, drag a window, play a video,
+type while the screen is busy, and run two sessions at once, with the debug summary on. Over a
+throttled link (for example `tc qdisc add dev <if> root tbf rate 20mbit burst 32kbit latency
+50ms`), typing and window drags should stay current rather than fall seconds behind.
