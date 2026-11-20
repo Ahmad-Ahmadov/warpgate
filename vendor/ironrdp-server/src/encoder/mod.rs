@@ -135,8 +135,9 @@ pub(crate) struct UpdateEncoder {
     max_request_size: usize,
     /// Client's advertised New Pointer Update cache size (MS-RDPBCGR 2.2.7.1.5
     /// `pointerCacheSize`). Zero means the client did not advertise support for the
-    /// New Pointer Update; `RGBAPointer`/`CachedPointer` emission is skipped in that
-    /// case rather than sending a PDU the client did not agree to accept.
+    /// New Pointer Update; a pointer shape then goes as the default pointer and
+    /// `CachedPointer` is skipped, rather than sending a PDU the client did not agree to
+    /// accept.
     pointer_cache_size: u16,
     /// Client's advertised Large Pointer Capability Set flags (MS-RDPBCGR 2.2.7.2.7).
     /// Empty when the client didn't send this capability set at all. Governs both the
@@ -247,6 +248,47 @@ impl UpdateEncoder {
             .as_mut()
             .expect("bitmap updater always Some")
             .set_desktop_size(size);
+    }
+
+    /// Warpgate: the update for a 32 bpp pointer shape, whether it came as an `RGBAPointer` or
+    /// a `LargePointer`: a New Pointer Update if the client takes one that size, otherwise a
+    /// Large Pointer Update if the client takes those, otherwise the client's default pointer.
+    /// Upstream drops a shape the client cannot take, which leaves the client showing the
+    /// shape before it, one the application has already moved away from.
+    fn pointer_shape(&self, ptr: RGBAPointer) -> ServerResult<UpdateFragmenter> {
+        /// MS-RDPBCGR 2.2.9.1.2.1.11.
+        const LARGE_POINTER_MAX: u16 = 384;
+
+        if self.pointer_cache_size == 0 {
+            debug!("Client did not advertise New Pointer Update support, sending the default pointer");
+            return Self::default_pointer();
+        }
+        if self.color_or_new_pointer_size_ok(ptr.width, ptr.height) {
+            return Self::rgba_pointer(ptr);
+        }
+        if self.large_pointer_update_supported() && ptr.width <= LARGE_POINTER_MAX && ptr.height <= LARGE_POINTER_MAX {
+            let RGBAPointer {
+                cache_index,
+                width,
+                height,
+                hot_x,
+                hot_y,
+                data,
+            } = ptr;
+            return Self::large_pointer(LargePointer {
+                cache_index,
+                width,
+                height,
+                hot_x,
+                hot_y,
+                data,
+            });
+        }
+        debug!(
+            "{}x{} pointer is larger than the client negotiated, sending the default pointer",
+            ptr.width, ptr.height,
+        );
+        Self::default_pointer()
     }
 
     fn rgba_pointer(ptr: RGBAPointer) -> ServerResult<UpdateFragmenter> {
@@ -493,42 +535,22 @@ impl EncoderIter<'_> {
                         continue;
                     }
                     DisplayUpdate::PointerPosition(pos) => UpdateEncoder::pointer_position(pos),
-                    DisplayUpdate::RGBAPointer(ptr) => {
-                        if encoder.pointer_cache_size == 0 {
-                            debug!("Dropping RGBAPointer update: client did not advertise New Pointer Update support");
-                            continue;
-                        }
-                        if !encoder.color_or_new_pointer_size_ok(ptr.width, ptr.height) {
-                            debug!(
-                                "Dropping RGBAPointer update: {}x{} exceeds the client's negotiated pointer size \
-                                 ceiling",
-                                ptr.width, ptr.height,
-                            );
-                            continue;
-                        }
-                        UpdateEncoder::rgba_pointer(ptr)
-                    }
-                    DisplayUpdate::LargePointer(ptr) => {
-                        if encoder.pointer_cache_size == 0 {
-                            debug!("Dropping LargePointer update: client did not advertise New Pointer Update support");
-                            continue;
-                        }
-                        if !encoder.large_pointer_update_supported() {
-                            debug!(
-                                "Dropping LargePointer update: client did not advertise \
-                                 LARGE_POINTER_FLAG_384x384 support"
-                            );
-                            continue;
-                        }
-                        if 384 < ptr.width || 384 < ptr.height {
-                            debug!(
-                                "Dropping LargePointer update: {}x{} exceeds the 384x384 protocol maximum",
-                                ptr.width, ptr.height,
-                            );
-                            continue;
-                        }
-                        UpdateEncoder::large_pointer(ptr)
-                    }
+                    DisplayUpdate::RGBAPointer(ptr) => encoder.pointer_shape(ptr),
+                    DisplayUpdate::LargePointer(LargePointer {
+                        cache_index,
+                        width,
+                        height,
+                        hot_x,
+                        hot_y,
+                        data,
+                    }) => encoder.pointer_shape(RGBAPointer {
+                        cache_index,
+                        width,
+                        height,
+                        hot_x,
+                        hot_y,
+                        data,
+                    }),
                     DisplayUpdate::ColorPointer(ptr) => UpdateEncoder::color_pointer(ptr),
                     DisplayUpdate::HidePointer => UpdateEncoder::hide_pointer(),
                     DisplayUpdate::DefaultPointer => UpdateEncoder::default_pointer(),
@@ -796,9 +818,23 @@ impl RemoteFxHandler {
     }
 }
 
+/// Warpgate: the most `RfxEncoder::encode` can write for `bitmap`. A tile is a 19-byte tile
+/// block and three components of at most 4096 bytes (`rfx::UpdateEncoder` gives each that
+/// much, and fails a tile that needs more), and the message's other blocks come to a little
+/// over a hundred bytes. Upstream starts from the bitmap's own length instead, which a small
+/// or thin update outgrows once padded to whole tiles, and every retry below encodes all of
+/// its tiles again.
+fn rfx_message_size_bound(bitmap: &BitmapUpdate) -> usize {
+    const TILE_MAX: usize = 19 + 3 * 4096;
+    const OTHER_BLOCKS_MAX: usize = 1024;
+
+    let tiles = usize::from(bitmap.width.get().div_ceil(64)) * usize::from(bitmap.height.get().div_ceil(64));
+    OTHER_BLOCKS_MAX + tiles * TILE_MAX
+}
+
 impl BitmapUpdateHandler for RemoteFxHandler {
     fn handle(&mut self, bitmap: &BitmapUpdate) -> ServerResult<UpdateFragmenter> {
-        let mut buffer = vec![0; bitmap.data.len()];
+        let mut buffer = vec![0; rfx_message_size_bound(bitmap)];
         let len = loop {
             match self
                 .remotefx
@@ -973,4 +1009,253 @@ fn surface_bits(
         UpdateCode::SurfaceCommands,
         encode_vec(&cmd).map_err(ServerError::encode)?,
     ))
+}
+
+/// Warpgate: what a client makes of the pointer updates, decoded as IronRDP's client
+/// decodes them.
+#[cfg(test)]
+mod pointer_tests {
+    use ironrdp_core::{ReadCursor, decode_cursor};
+    use ironrdp_graphics::pointer::{DecodedPointer, PointerBitmapTarget};
+    use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdate, FastPathUpdatePdu, Fragmentation};
+    use ironrdp_pdu::pointer::PointerUpdateData;
+
+    use super::*;
+
+    /// One colour per shape, B, G, R, A as the application sends it.
+    const ARROW: [u8; 4] = [0x10, 0x20, 0x30, 0xff];
+    const TEXT: [u8; 4] = [0xf0, 0xe0, 0xd0, 0xff];
+    const RESIZE: [u8; 4] = [0x40, 0x80, 0xc0, 0xff];
+
+    /// What the client shows after one pointer update.
+    #[derive(Debug, PartialEq)]
+    enum Seen {
+        Shape {
+            size: (u16, u16),
+            hotspot: (u16, u16),
+            /// The shape's colour, R, G, B, A as the client decodes it.
+            rgba: [u8; 4],
+            /// Sent as a Large Pointer Update rather than a New Pointer Update.
+            large: bool,
+        },
+        Default,
+        Hidden,
+    }
+
+    fn shape(size: u16, hotspot: (u16, u16), bgra: [u8; 4]) -> RGBAPointer {
+        RGBAPointer {
+            cache_index: 0,
+            width: size,
+            height: size,
+            hot_x: hotspot.0,
+            hot_y: hotspot.1,
+            data: bgra.repeat(usize::from(size) * usize::from(size)),
+        }
+    }
+
+    fn seen_shape(size: u16, hotspot: (u16, u16), [b, g, r, a]: [u8; 4], large: bool) -> Seen {
+        Seen::Shape {
+            size: (size, size),
+            hotspot,
+            rgba: [r, g, b, a],
+            large,
+        }
+    }
+
+    fn encoder_for(pointer_cache_size: u16, large_pointer_flags: LargePointerSupportFlags) -> UpdateEncoder {
+        UpdateEncoder::new(
+            DesktopSize {
+                width: 1024,
+                height: 768,
+            },
+            CmdFlags::empty(),
+            UpdateEncoderCodecs::new(),
+            8 * 1024 * 1024,
+            pointer_cache_size,
+            large_pointer_flags,
+        )
+        .unwrap()
+    }
+
+    fn decoded(pointer: DecodedPointer, large: bool) -> Seen {
+        let (first, rest) = pointer.bitmap_data.split_first_chunk::<4>().unwrap();
+        assert!(rest.chunks_exact(4).all(|pixel| pixel == first), "one colour in, several out");
+        Seen::Shape {
+            size: (pointer.width, pointer.height),
+            hotspot: (pointer.hotspot_x, pointer.hotspot_y),
+            rgba: *first,
+            large,
+        }
+    }
+
+    /// Everything the client is sent for `update`, reassembled and decoded.
+    async fn seen(encoder: &mut UpdateEncoder, update: DisplayUpdate) -> Vec<Seen> {
+        let mut seen = Vec::new();
+        let mut updates = encoder.update(update);
+        while let Some(fragmenter) = updates.next().await {
+            let mut fragmenter = fragmenter.unwrap();
+            let mut buffer = vec![0; fragmenter.size_hint()];
+            let mut data = Vec::new();
+            while let Some(len) = fragmenter.next(&mut buffer) {
+                let mut cursor = ReadCursor::new(&buffer[..len]);
+                let _: FastPathHeader = decode_cursor(&mut cursor).unwrap();
+                let pdu: FastPathUpdatePdu<'_> = decode_cursor(&mut cursor).unwrap();
+                data.extend_from_slice(pdu.data);
+                if !matches!(pdu.fragmentation, Fragmentation::Single | Fragmentation::Last) {
+                    continue;
+                }
+                let code = pdu.update_code;
+                let FastPathUpdate::Pointer(pointer) = FastPathUpdate::decode_with_code(&data, code).unwrap() else {
+                    panic!("{code:?} is not a pointer update");
+                };
+                let target = PointerBitmapTarget::Accelerated;
+                seen.push(match pointer {
+                    PointerUpdateData::SetDefault => Seen::Default,
+                    PointerUpdateData::SetHidden => Seen::Hidden,
+                    PointerUpdateData::New(pointer) => {
+                        decoded(DecodedPointer::decode_pointer_attribute(&pointer, target).unwrap(), false)
+                    }
+                    PointerUpdateData::Large(pointer) => {
+                        decoded(DecodedPointer::decode_large_pointer_attribute(&pointer, target).unwrap(), true)
+                    }
+                    other => panic!("unexpected pointer update {other:?}"),
+                });
+                data.clear();
+            }
+        }
+        seen
+    }
+
+    /// The default and the hidden pointer carry no data, and used to reach the client as
+    /// nothing at all: it kept showing whatever shape it had last been sent, such as the
+    /// text cursor after the pointer had left a text field.
+    #[tokio::test]
+    async fn the_text_cursor_gives_way_to_the_arrow() {
+        let mut encoder = encoder_for(25, LargePointerSupportFlags::empty());
+        let arrow = || DisplayUpdate::RGBAPointer(shape(32, (0, 0), ARROW));
+        let text = || DisplayUpdate::RGBAPointer(shape(32, (15, 16), TEXT));
+
+        assert_eq!(seen(&mut encoder, arrow()).await, [seen_shape(32, (0, 0), ARROW, false)]);
+        assert_eq!(seen(&mut encoder, text()).await, [seen_shape(32, (15, 16), TEXT, false)]);
+        assert_eq!(seen(&mut encoder, arrow()).await, [seen_shape(32, (0, 0), ARROW, false)]);
+        assert_eq!(seen(&mut encoder, text()).await, [seen_shape(32, (15, 16), TEXT, false)]);
+        // The target's own default pointer, or a shape Warpgate cannot use.
+        assert_eq!(seen(&mut encoder, DisplayUpdate::DefaultPointer).await, [Seen::Default]);
+    }
+
+    #[tokio::test]
+    async fn every_change_of_shape_or_visibility_reaches_the_client() {
+        let mut encoder = encoder_for(25, LargePointerSupportFlags::empty());
+        let arrow = || DisplayUpdate::RGBAPointer(shape(32, (0, 0), ARROW));
+        let resize = || DisplayUpdate::RGBAPointer(shape(24, (11, 11), RESIZE));
+        let text = || DisplayUpdate::RGBAPointer(shape(32, (15, 16), TEXT));
+
+        let updates = [
+            (arrow(), seen_shape(32, (0, 0), ARROW, false)),
+            (resize(), seen_shape(24, (11, 11), RESIZE, false)),
+            (arrow(), seen_shape(32, (0, 0), ARROW, false)),
+            (text(), seen_shape(32, (15, 16), TEXT, false)),
+            (DisplayUpdate::HidePointer, Seen::Hidden),
+            (text(), seen_shape(32, (15, 16), TEXT, false)),
+            (DisplayUpdate::DefaultPointer, Seen::Default),
+            (DisplayUpdate::HidePointer, Seen::Hidden),
+            (DisplayUpdate::DefaultPointer, Seen::Default),
+            // The same shape twice is still sent twice: what the client shows may have
+            // changed in between without the encoder knowing.
+            (arrow(), seen_shape(32, (0, 0), ARROW, false)),
+            (arrow(), seen_shape(32, (0, 0), ARROW, false)),
+        ];
+        for (update, expected) in updates {
+            assert_eq!(seen(&mut encoder, update).await, [expected]);
+        }
+    }
+
+    /// A shape goes in whichever update the client negotiated for its size, and as the
+    /// client's default pointer when there is none, never as nothing.
+    #[tokio::test]
+    async fn a_shape_goes_in_the_update_the_client_takes_at_its_size() {
+        let rgba = |size| DisplayUpdate::RGBAPointer(shape(size, (1, 2), ARROW));
+        let large = |size| {
+            let RGBAPointer {
+                cache_index,
+                width,
+                height,
+                hot_x,
+                hot_y,
+                data,
+            } = shape(size, (1, 2), ARROW);
+            DisplayUpdate::LargePointer(LargePointer {
+                cache_index,
+                width,
+                height,
+                hot_x,
+                hot_y,
+                data,
+            })
+        };
+        let new_pointer = |size| [seen_shape(size, (1, 2), ARROW, false)];
+        let large_pointer = |size| [seen_shape(size, (1, 2), ARROW, true)];
+
+        // No Large Pointer Capability Set: New Pointer Updates up to 32x32.
+        let mut encoder = encoder_for(25, LargePointerSupportFlags::empty());
+        assert_eq!(seen(&mut encoder, rgba(32)).await, new_pointer(32));
+        assert_eq!(seen(&mut encoder, rgba(48)).await, [Seen::Default]);
+        assert_eq!(seen(&mut encoder, large(100)).await, [Seen::Default]);
+
+        // Up to 96x96 in a New Pointer Update, and no Large Pointer Update.
+        let mut encoder = encoder_for(25, LargePointerSupportFlags::UP_TO_96X96_PIXELS);
+        assert_eq!(seen(&mut encoder, rgba(96)).await, new_pointer(96));
+        assert_eq!(seen(&mut encoder, large(48)).await, new_pointer(48));
+        assert_eq!(seen(&mut encoder, rgba(97)).await, [Seen::Default]);
+        assert_eq!(seen(&mut encoder, large(97)).await, [Seen::Default]);
+
+        // Both.
+        let both = LargePointerSupportFlags::UP_TO_96X96_PIXELS | LargePointerSupportFlags::UP_TO_384X384_PIXELS;
+        let mut encoder = encoder_for(25, both);
+        assert_eq!(seen(&mut encoder, rgba(64)).await, new_pointer(64));
+        assert_eq!(seen(&mut encoder, rgba(128)).await, large_pointer(128));
+        assert_eq!(seen(&mut encoder, large(384)).await, large_pointer(384));
+        assert_eq!(seen(&mut encoder, large(385)).await, [Seen::Default]);
+
+        // No New Pointer Update support at all.
+        let mut encoder = encoder_for(0, both);
+        assert_eq!(seen(&mut encoder, rgba(32)).await, [Seen::Default]);
+        assert_eq!(seen(&mut encoder, large(128)).await, [Seen::Default]);
+    }
+
+    /// The RemoteFX output buffer is never too small, so no update is encoded twice. Noise
+    /// codes largest; small and thin updates are the ones whose own size fell short.
+    #[test]
+    fn the_first_remotefx_buffer_is_large_enough() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut noise = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[0]
+        };
+        for (width, height) in [(1, 1), (2, 20), (1920, 1), (1, 1080), (65, 65), (130, 3), (200, 150)] {
+            let data: Vec<u8> = (0..usize::from(width) * usize::from(height) * 4).map(|_| noise()).collect();
+            let bitmap = BitmapUpdate {
+                x: 0,
+                y: 0,
+                width: NonZeroU16::new(width).unwrap(),
+                height: NonZeroU16::new(height).unwrap(),
+                format: crate::PixelFormat::BgrA32,
+                data: data.into(),
+                stride: core::num::NonZeroUsize::new(usize::from(width) * 4).unwrap(),
+            };
+            let mut buffer = vec![0; rfx_message_size_bound(&bitmap)];
+            for entropy in [EntropyBits::Rlgr1, EntropyBits::Rlgr3] {
+                let mut rfx = RfxEncoder::new(entropy, Quant::default());
+                let desktop = DesktopSize {
+                    width: 1920,
+                    height: 1080,
+                };
+                if let Err(error) = rfx.encode(&bitmap, &mut buffer, Some(desktop)) {
+                    panic!("{width}x{height}: {error}");
+                }
+            }
+        }
+    }
 }

@@ -2801,3 +2801,44 @@ Then compare against the previous image at 1920x1080 and 2560x1440:
 
 `RUST_LOG=ironrdp_server=warn` shows IronRDP's `Encoding bitmap took N ms`
 warnings, for any encode over 10 ms.
+
+## Native RDP: the text cursor that stayed
+
+In mstsc and MobaXterm the pointer turned into the text cursor over a text field
+and stayed one after leaving it.
+
+### Why
+
+Warpgate tells the viewer to show its default pointer whenever the target's
+pointer is its system default one, cannot be decoded, or (until now) was larger
+than 32x32. The vendored IronRDP server never sent that update: its fragmenter
+stopped before writing an update with no payload, and the default and the hidden
+pointer have none. The viewer kept the last shape it had been sent. Upstream
+fixed the fragmenter after our snapshot; `warpgate.patch` now carries that fix
+(see `vendor/ironrdp-server/PATCHES.md`).
+
+### Also changed
+
+- Cursors up to 384x384 are forwarded. The 32x32 limit assumed the server did not
+  advertise large pointers, and it does; the encoder sends each shape in an update
+  the viewer negotiated for its size, or as the default pointer, never as nothing.
+- The client sends the default pointer, rather than nothing, for a pointer bitmap
+  it cannot convert.
+- RemoteFX starts from an output buffer that always fits, so small and thin
+  updates are no longer encoded two or three times.
+- Changed regions are copied to BGRA a pixel at a time into a sized buffer instead
+  of byte by byte, the same bytes, for the browser and native paths alike.
+
+The cursor still goes to one cache slot (0) on the viewer, overwritten by each new
+shape, which the specification allows; the target's own cache is not mirrored.
+
+### To run on the build server
+
+```sh
+cargo test -p warpgate-protocol-rdp
+cargo test -p ironrdp-server --lib encoder
+```
+
+Then in mstsc and MobaXterm: arrow, text field, arrow; window edges (resize
+cursors), links (hand), a busy application (wait cursor); type until the target
+hides the pointer, then move it.

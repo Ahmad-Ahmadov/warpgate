@@ -31,9 +31,10 @@ pub enum DisplayUpdate {
     RGBAPointer(RGBAPointer),
     /// A pointer shape wider or taller than the 96x96 ceiling `RGBAPointer` can carry
     /// (MS-RDPBCGR 2.2.7.2.7), up to 384x384. Only usable when the client's negotiated
-    /// Large Pointer Capability Set includes `LARGE_POINTER_FLAG_384x384`; dropped
-    /// otherwise. See [`RGBAPointer`] for shapes up to 96x96 (32x32 without that
-    /// capability set at all).
+    /// Large Pointer Capability Set includes `LARGE_POINTER_FLAG_384x384`. Otherwise it goes
+    /// as an [`RGBAPointer`] would if it fits one, and as the client's default pointer if
+    /// not (a Warpgate change; upstream drops it). See [`RGBAPointer`] for shapes up to
+    /// 96x96 (32x32 without that capability set at all).
     LargePointer(LargePointer),
     HidePointer,
     DefaultPointer,

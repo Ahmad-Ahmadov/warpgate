@@ -21,8 +21,9 @@ use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
 use ironrdp_server::{
     BitmapUpdate, ConnectionHandler, ConnectionInfo, CredentialDecision, CredentialValidationError,
     CredentialValidator, Credentials, DesktopSize, DisplayContext, DisplayUpdate,
-    ErrorInfoDisconnectHandle, KeyboardEvent, MouseButton, MouseEvent, PixelFormat, RGBAPointer,
-    RdpServer, RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler, ServerResult,
+    ErrorInfoDisconnectHandle, KeyboardEvent, LargePointer, MouseButton, MouseEvent, PixelFormat,
+    RGBAPointer, RdpServer, RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler,
+    ServerResult,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -417,13 +418,19 @@ fn frame_to_update(x: u16, y: u16, width: u16, height: u16, data: Bytes) -> Opti
     }))
 }
 
-/// Largest cursor, in pixels per side, sent to the viewer. Bigger ones need the large-pointer
-/// capability, which this server doesn't advertise, so a viewer can't be assumed to take them.
-const MAX_CURSOR_DIM: u16 = 32;
+/// Largest cursor, in pixels per side, that RDP carries at all: the Large Pointer Update's
+/// limit (MS-RDPBCGR 2.2.9.1.2.1.11). How large a cursor a viewer takes depends on the
+/// large-pointer sizes it negotiated with the server; the server's encoder sends each cursor
+/// in an update the viewer takes at that size, or as the viewer's default pointer.
+const MAX_CURSOR_DIM: u16 = 384;
+
+/// Largest cursor, per side, sent as an [`RGBAPointer`] (a New Pointer Update, at most 96x96);
+/// a larger one goes as a [`LargePointer`].
+const MAX_NEW_POINTER_DIM: u16 = 96;
 
 /// Convert a BGRA cursor image (top row first) into an IronRDP pointer update. A cursor that
-/// is malformed or too large for the viewer becomes the viewer's default arrow, so the viewer
-/// never keeps showing a shape the target has already left.
+/// is malformed, or larger than RDP carries, becomes the viewer's default pointer, so the
+/// viewer never keeps showing a shape the target has already left.
 fn cursor_to_update(
     hotspot_x: u16,
     hotspot_y: u16,
@@ -455,15 +462,27 @@ fn cursor_to_update(
         .flatten()
         .copied()
         .collect();
-    DisplayUpdate::RGBAPointer(RGBAPointer {
-        // Every update replaces the one slot; the target's own cache isn't mirrored.
-        cache_index: 0,
-        width,
-        height,
-        hot_x: hotspot_x,
-        hot_y: hotspot_y,
-        data,
-    })
+    // Every update replaces the one slot; the target's own cache isn't mirrored.
+    let cache_index = 0;
+    if width <= MAX_NEW_POINTER_DIM && height <= MAX_NEW_POINTER_DIM {
+        DisplayUpdate::RGBAPointer(RGBAPointer {
+            cache_index,
+            width,
+            height,
+            hot_x: hotspot_x,
+            hot_y: hotspot_y,
+            data,
+        })
+    } else {
+        DisplayUpdate::LargePointer(LargePointer {
+            cache_index,
+            width,
+            height,
+            hot_x: hotspot_x,
+            hot_y: hotspot_y,
+            data,
+        })
+    }
 }
 
 /// Bound a viewer-supplied desktop size with [`bound_desktop_size`]. On this path it arrives
@@ -990,7 +1009,7 @@ mod cursor_tests {
     use ironrdp_pdu::pointer::{ColorPointerAttribute, Point16, PointerAttribute};
     use ironrdp_server::DisplayUpdate;
 
-    use super::{MAX_CURSOR_DIM, cursor_to_update};
+    use super::{MAX_CURSOR_DIM, MAX_NEW_POINTER_DIM, cursor_to_update};
 
     /// What a viewer decodes from the update: the target's RGBA pixels come back out.
     #[test]
@@ -1054,16 +1073,41 @@ mod cursor_tests {
             cursor_to_update(0, 0, too_big, 1, &pixels(too_big, 1)),
             DisplayUpdate::DefaultPointer
         ));
-        assert!(matches!(
-            cursor_to_update(
-                0,
-                0,
-                MAX_CURSOR_DIM,
-                MAX_CURSOR_DIM,
-                &pixels(MAX_CURSOR_DIM, MAX_CURSOR_DIM)
-            ),
-            DisplayUpdate::RGBAPointer(_)
-        ));
+    }
+
+    /// A target whose cursors are larger than 32x32 (a scaled display, or a larger pointer
+    /// size in its accessibility settings) has them shown, not replaced by the default.
+    /// Which update a viewer can take at that size is the server's encoder's choice.
+    #[test]
+    fn large_cursors_are_sent_whole() {
+        let pixels =
+            |width: u16, height: u16| vec![7; usize::from(width) * usize::from(height) * 4];
+
+        for size in [32, 48, MAX_NEW_POINTER_DIM] {
+            let DisplayUpdate::RGBAPointer(pointer) =
+                cursor_to_update(3, 4, size, size, &pixels(size, size))
+            else {
+                panic!("expected a {size}x{size} cursor to go as an RGBAPointer");
+            };
+            assert_eq!((pointer.width, pointer.height), (size, size));
+            assert_eq!((pointer.hot_x, pointer.hot_y), (3, 4));
+            assert_eq!(pointer.data, pixels(size, size));
+        }
+
+        for (width, height) in [
+            (MAX_NEW_POINTER_DIM + 1, 32),
+            (32, MAX_NEW_POINTER_DIM + 1),
+            (MAX_CURSOR_DIM, MAX_CURSOR_DIM),
+        ] {
+            let DisplayUpdate::LargePointer(pointer) =
+                cursor_to_update(3, 4, width, height, &pixels(width, height))
+            else {
+                panic!("expected a {width}x{height} cursor to go as a LargePointer");
+            };
+            assert_eq!((pointer.width, pointer.height), (width, height));
+            assert_eq!((pointer.hot_x, pointer.hot_y), (3, 4));
+            assert_eq!(pointer.data, pixels(width, height));
+        }
     }
 }
 

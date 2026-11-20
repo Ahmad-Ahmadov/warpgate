@@ -57,6 +57,11 @@ impl UpdateFragmenter {
 
     fn encode_next(&mut self, dst: &mut [u8]) -> Option<(usize, usize)> {
         match self.data.len() - self.position {
+            // Warpgate: from upstream, after the snapshot. An update with nothing in it, the
+            // default or the hidden pointer, is still one PDU; this used to send nothing.
+            0 if self.index == 0 => self
+                .encode_fastpath(Fragmentation::Single, &[], dst)
+                .map(|written| (0, written)),
             0 => None,
 
             1..=MAX_FASTPATH_UPDATE_SIZE => {
@@ -135,6 +140,28 @@ mod tests {
         ));
 
         assert!(fragmenter.next(&mut buffer).is_none());
+    }
+
+    /// The default and the hidden pointer carry no data (MS-RDPBCGR 2.2.9.1.2.1.5 and
+    /// 2.2.9.1.2.1.6), and must still reach the client.
+    #[test]
+    fn an_update_without_data_is_sent_once() {
+        for code in [UpdateCode::DefaultPointer, UpdateCode::HiddenPointer] {
+            let mut fragmenter = UpdateFragmenter::new(code, Vec::new());
+            let mut buffer = vec![0; fragmenter.size_hint()];
+            let written = fragmenter.next(&mut buffer).unwrap();
+
+            let mut cursor = ReadCursor::new(&buffer[..written]);
+            let header: FastPathHeader = decode_cursor(&mut cursor).unwrap();
+            let update: FastPathUpdatePdu<'_> = decode_cursor(&mut cursor).unwrap();
+            assert!(matches!(header, FastPathHeader { data_length: 3, .. }));
+            assert_eq!(update.update_code, code);
+            assert_eq!(update.fragmentation, Fragmentation::Single);
+            assert!(update.data.is_empty());
+            assert!(cursor.is_empty());
+
+            assert!(fragmenter.next(&mut buffer).is_none());
+        }
     }
 
     #[test]

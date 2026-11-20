@@ -597,6 +597,25 @@ impl ViewerBacklog {
         self.pointer.is_none() && self.damage.is_empty()
     }
 
+    /// Note what an active-stage output changed for the viewer. Each pointer output replaces
+    /// the one before it, whatever that was: IronRDP turns every shape the target sends,
+    /// cached or new, into a bitmap, so the latest output is the target's pointer now.
+    fn record(&mut self, output: ActiveStageOutput) {
+        match output {
+            ActiveStageOutput::GraphicsUpdate(region) => self.damage.add(&region),
+            ActiveStageOutput::PointerBitmap(pointer) => {
+                // A bitmap that cannot be sent is not left to show the shape before it.
+                self.pointer =
+                    Some(encode_pointer(&pointer).unwrap_or(DesktopEvent::CursorDefault));
+            }
+            ActiveStageOutput::PointerDefault => self.pointer = Some(DesktopEvent::CursorDefault),
+            ActiveStageOutput::PointerHidden => self.pointer = Some(DesktopEvent::CursorHidden),
+            // The viewer owns the pointer position; warping it to wherever the target last
+            // put its own would fight the user's mouse.
+            _ => {}
+        }
+    }
+
     /// The next event to send, the pointer first: it is small, and the one the user is
     /// watching.
     fn next_event(&mut self, image: &DecodedImage) -> Option<DesktopEvent> {
@@ -645,21 +664,7 @@ async fn process_outputs(
     }
 
     for out in outputs {
-        match out {
-            ActiveStageOutput::GraphicsUpdate(region) => backlog.damage.add(&region),
-            ActiveStageOutput::PointerBitmap(pointer) => {
-                if let Some(event) = encode_pointer(&pointer) {
-                    backlog.pointer = Some(event);
-                }
-            }
-            ActiveStageOutput::PointerDefault => {
-                backlog.pointer = Some(DesktopEvent::CursorDefault);
-            }
-            ActiveStageOutput::PointerHidden => backlog.pointer = Some(DesktopEvent::CursorHidden),
-            // The viewer owns the pointer position; warping it to wherever the target last
-            // put its own would fight the user's mouse.
-            _ => {}
-        }
+        backlog.record(out);
     }
     Ok(terminate)
 }
@@ -736,17 +741,12 @@ fn encode_region(image: &DecodedImage, region: &InclusiveRectangle) -> Option<De
         return None;
     }
 
-    let mut data = Vec::with_capacity(w * h * 4);
+    let row_len = w * 4;
+    let mut data = vec![0; row_len * h];
     #[allow(clippy::indexing_slicing)] // bounds guaranteed by the clamp + length check above
-    for row in 0..h {
+    for (row, dst_row) in data.chunks_exact_mut(row_len).enumerate() {
         let src_start = ((top + row) * img_w + left) * 4;
-        let src_row = &src[src_start..src_start + w * 4];
-        for s in src_row.as_chunks::<4>().0 {
-            data.push(s[2]);
-            data.push(s[1]);
-            data.push(s[0]);
-            data.push(255);
-        }
+        rgba_to_opaque_bgra(&src[src_start..src_start + row_len], dst_row);
     }
 
     Some(DesktopEvent::RawImage {
@@ -758,6 +758,18 @@ fn encode_region(image: &DecodedImage, region: &InclusiveRectangle) -> Option<De
         },
         data: Bytes::from(data),
     })
+}
+
+/// Copy RGBA pixels to `dst` as BGRA with full alpha. Every changed region of the desktop
+/// goes through here. Writing whole pixels into a sized buffer leaves the compiler free to
+/// process several at once, which pushing one byte at a time, with a capacity check per byte,
+/// did not.
+fn rgba_to_opaque_bgra(src: &[u8], dst: &mut [u8]) {
+    let (dst, _) = dst.as_chunks_mut::<4>();
+    let (src, _) = src.as_chunks::<4>();
+    for (d, &[r, g, b, _]) in dst.iter_mut().zip(src) {
+        *d = [b, g, r, 255];
+    }
 }
 
 /// Build the cursor shape update for a pointer bitmap. `None` for a degenerate or short
@@ -1078,12 +1090,19 @@ fn connector_error(step: &'static str, error: connector::ConnectorError) -> Desk
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use ironrdp_graphics::image_processing::PixelFormat;
     use ironrdp_graphics::pointer::DecodedPointer;
+    use ironrdp_pdu::geometry::InclusiveRectangle;
+    use ironrdp_session::ActiveStageOutput;
     use ironrdp_session::image::DecodedImage;
     use warpgate_core::{DesktopEvent, DesktopRect};
 
-    use super::{GraphicsPipelineOutput, connector, encode_pointer, encode_resized_keyframe};
+    use super::{
+        GraphicsPipelineOutput, ViewerBacklog, connector, encode_pointer, encode_region,
+        encode_resized_keyframe, rgba_to_opaque_bgra,
+    };
 
     #[test]
     fn unhandled_graphics_are_reported_once_per_codec() {
@@ -1187,5 +1206,172 @@ mod tests {
             Some(DesktopEvent::CursorHidden)
         ));
         assert!(encode_pointer(&pointer(2, 2, vec![0; 4])).is_none());
+    }
+
+    /// What the viewer side is sent next, reduced to what the tests below compare.
+    #[derive(Debug, PartialEq)]
+    enum Sent {
+        /// A cursor shape, told apart by the colour of its pixels.
+        Cursor(u8),
+        Default,
+        Hidden,
+        Region(DesktopRect),
+        Nothing,
+    }
+
+    fn next(backlog: &mut ViewerBacklog, image: &DecodedImage) -> Sent {
+        match backlog.next_event(image) {
+            None => Sent::Nothing,
+            Some(DesktopEvent::Cursor { data, .. }) => Sent::Cursor(data[0]),
+            Some(DesktopEvent::CursorDefault) => Sent::Default,
+            Some(DesktopEvent::CursorHidden) => Sent::Hidden,
+            Some(DesktopEvent::RawImage { rect, .. }) => Sent::Region(rect),
+            Some(other) => panic!("unexpected event {other:?}"),
+        }
+    }
+
+    /// A 2x2 pointer bitmap of one grey level.
+    fn shape(grey: u8) -> ActiveStageOutput {
+        ActiveStageOutput::PointerBitmap(Arc::new(pointer(2, 2, vec![grey; 16])))
+    }
+
+    const ARROW: u8 = 0x10;
+    const TEXT: u8 = 0x20;
+    const RESIZE: u8 = 0x30;
+
+    #[test]
+    fn every_pointer_change_reaches_the_viewer() {
+        let image = DecodedImage::new(PixelFormat::RgbA32, 8, 8);
+        let mut backlog = ViewerBacklog::default();
+        // Each step is what one batch of IronRDP's output holds. For a pointer the target
+        // had sent before (a Cached Pointer Update), IronRDP outputs `PointerHidden` and
+        // then the bitmap.
+        let steps = [
+            (vec![shape(ARROW)], Sent::Cursor(ARROW)),
+            (vec![shape(TEXT)], Sent::Cursor(TEXT)),
+            (
+                vec![ActiveStageOutput::PointerHidden, shape(ARROW)],
+                Sent::Cursor(ARROW),
+            ),
+            (vec![shape(RESIZE)], Sent::Cursor(RESIZE)),
+            (
+                vec![ActiveStageOutput::PointerHidden, shape(ARROW)],
+                Sent::Cursor(ARROW),
+            ),
+            (vec![ActiveStageOutput::PointerHidden], Sent::Hidden),
+            (
+                vec![ActiveStageOutput::PointerHidden, shape(TEXT)],
+                Sent::Cursor(TEXT),
+            ),
+            (vec![ActiveStageOutput::PointerDefault], Sent::Default),
+            (vec![shape(TEXT)], Sent::Cursor(TEXT)),
+        ];
+        for (outputs, expected) in steps {
+            for output in outputs {
+                backlog.record(output);
+            }
+            assert_eq!(next(&mut backlog, &image), expected);
+            assert_eq!(next(&mut backlog, &image), Sent::Nothing);
+        }
+    }
+
+    /// While the viewer side has no room, the pointer moves over several shapes; once it has,
+    /// it is sent the one the target shows now, ahead of the desktop.
+    #[test]
+    fn a_viewer_that_falls_behind_is_sent_the_pointer_as_it_is_now() {
+        let image = DecodedImage::new(PixelFormat::RgbA32, 8, 8);
+        let mut backlog = ViewerBacklog::default();
+        let region = InclusiveRectangle {
+            left: 1,
+            top: 2,
+            right: 3,
+            bottom: 4,
+        };
+        for output in [
+            ActiveStageOutput::GraphicsUpdate(region),
+            shape(ARROW),
+            shape(TEXT),
+            ActiveStageOutput::PointerHidden,
+            shape(RESIZE),
+            shape(ARROW),
+        ] {
+            backlog.record(output);
+        }
+
+        assert_eq!(next(&mut backlog, &image), Sent::Cursor(ARROW));
+        assert_eq!(
+            next(&mut backlog, &image),
+            Sent::Region(DesktopRect {
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 3,
+            })
+        );
+        assert_eq!(next(&mut backlog, &image), Sent::Nothing);
+    }
+
+    #[test]
+    fn a_pointer_bitmap_that_cannot_be_sent_gives_the_default_pointer() {
+        let image = DecodedImage::new(PixelFormat::RgbA32, 8, 8);
+        let mut backlog = ViewerBacklog::default();
+        backlog.record(shape(TEXT));
+        backlog.record(ActiveStageOutput::PointerBitmap(Arc::new(pointer(
+            2,
+            2,
+            vec![0; 4],
+        ))));
+        assert_eq!(next(&mut backlog, &image), Sent::Default);
+    }
+
+    #[test]
+    fn the_target_pointer_position_is_left_to_the_viewer() {
+        let mut backlog = ViewerBacklog::default();
+        backlog.record(ActiveStageOutput::PointerPosition { x: 5, y: 5 });
+        assert!(backlog.is_empty());
+    }
+
+    /// The pixel copy gives what the byte-at-a-time copy it replaced gave.
+    #[test]
+    fn pixels_are_copied_as_opaque_bgra() {
+        let src: Vec<u8> = (0..4 * 37_usize)
+            .map(|i| u8::try_from(i * 37 % 251).unwrap())
+            .collect();
+        let mut expected = Vec::new();
+        for s in src.as_chunks::<4>().0 {
+            expected.push(s[2]);
+            expected.push(s[1]);
+            expected.push(s[0]);
+            expected.push(255);
+        }
+
+        let mut dst = vec![0; src.len()];
+        rgba_to_opaque_bgra(&src, &mut dst);
+        assert_eq!(dst, expected);
+    }
+
+    #[test]
+    fn a_region_is_cut_from_the_desktop() {
+        let image = DecodedImage::new(PixelFormat::RgbA32, 13, 7);
+        let region = InclusiveRectangle {
+            left: 2,
+            top: 1,
+            right: 10,
+            bottom: 5,
+        };
+        let Some(DesktopEvent::RawImage { rect, data }) = encode_region(&image, &region) else {
+            panic!("expected a region");
+        };
+        assert_eq!(
+            rect,
+            DesktopRect {
+                x: 2,
+                y: 1,
+                width: 9,
+                height: 5,
+            }
+        );
+        assert_eq!(data.len(), 9 * 5 * 4);
+        assert!(data.chunks_exact(4).all(|pixel| pixel == [0, 0, 0, 255]));
     }
 }

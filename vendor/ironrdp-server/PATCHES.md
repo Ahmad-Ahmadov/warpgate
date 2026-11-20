@@ -45,6 +45,38 @@ flat, gradient, edge, noise and sparse inputs and the i16 extremes. Run them wit
 `cargo test -p ironrdp-server --lib rfx_component` (the crate sets `test = false`, so they
 only run when the library is named).
 
+## Default and hidden pointers that were never sent
+
+`UpdateFragmenter` (`src/encoder/fast_path.rs`) ended as soon as no payload was left, before
+writing anything, so an update without a payload produced no PDU. The default pointer and the
+hidden pointer are exactly those (MS-RDPBCGR 2.2.9.1.2.1.5 and 2.2.9.1.2.1.6), so a client
+never heard of either, and kept showing the last pointer shape it had been sent. In Warpgate
+that was the text cursor after the pointer left a text field, whenever the target's next
+pointer was its system default one (or one Warpgate falls back to the default for). The patch
+takes upstream's later fix: an empty update is sent as one empty `Single` fragment.
+
+## Pointer shapes a client cannot take
+
+Upstream drops an `RGBAPointer` or `LargePointer` that the client's negotiated pointer
+capabilities do not cover, which leaves the client on the shape before it. `pointer_shape`
+in `src/encoder/mod.rs` sends either kind as a New Pointer Update if the client takes one that
+size, as a Large Pointer Update if the client takes those, and as the default pointer
+otherwise, so a target's large cursors (a scaled display, a larger pointer size) are shown
+where the client allows and never leave a stale shape where it does not.
+
+## RemoteFX output buffer
+
+`RemoteFxHandler` sized its output buffer from the bitmap's own length and, when RemoteFX
+needed more, doubled it and encoded every tile again. Tiles are padded to 64x64, so small
+and thin updates (a caret, a one-pixel border) routinely needed more and were encoded two or
+three times over. The buffer now starts at the most a message can take
+(`rfx_message_size_bound`): 19 bytes plus three 4096-byte components per tile, which is all
+`rfx::UpdateEncoder` gives a tile, and a kilobyte for the other blocks. For a whole desktop
+that is less than the bitmap's length.
+
+The pointer and RemoteFX tests are in `src/encoder/mod.rs` (`pointer_tests`) and
+`src/encoder/fast_path.rs`: `cargo test -p ironrdp-server --lib encoder`.
+
 ## Manifest
 
 `Cargo.toml` is the snapshot's with the `*.workspace = true` package fields inlined, the
