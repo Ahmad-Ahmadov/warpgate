@@ -15,6 +15,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use ironrdp_displaycontrol::pdu::{DisplayControlMonitorLayout, MonitorLayoutEntry};
+use ironrdp_pdu::codecs::rfx::Quant;
 use ironrdp_pdu::gcc::KeyboardType;
 use ironrdp_pdu::input::fast_path::SynchronizeFlags;
 use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
@@ -54,6 +55,29 @@ const SUPPRESS_SETTLE: Duration = Duration::from_secs(1);
 
 /// How often held-back updates check whether the viewer wants output again.
 const SUPPRESS_POLL: Duration = Duration::from_millis(100);
+
+/// RemoteFX quantization for native viewers (TS_RFX_CODEC_QUANT, one value per DWT sub-band;
+/// 6 keeps a sub-band whole, each step above halves its precision).
+///
+/// IronRDP's default, the values Windows sends, drops up to three bits of the finest detail.
+/// That is text edges, one-pixel lines and the colour of coloured text, which is most of what a
+/// managed desktop shows. Here every sub-band but the three finest is kept whole and those lose
+/// one bit, so text and coloured edges come out close to the screen. Expect more bytes than
+/// the default, an estimated tenth to a quarter, more for photographs than for text. Tiles
+/// still only go when they change, and a slow link gets fewer, current frames rather than a
+/// queue of old ones (see the viewer socket's send limit in `super`).
+const VIEWER_REMOTEFX_QUANT: Quant = Quant {
+    ll3: 6,
+    lh3: 6,
+    hl3: 6,
+    hh3: 6,
+    lh2: 6,
+    hl2: 6,
+    hh2: 6,
+    lh1: 7,
+    hl1: 7,
+    hh1: 7,
+};
 
 /// Run the RDP server on a dedicated thread, resolving to its result.
 ///
@@ -169,6 +193,7 @@ where
             width: MAX_DESKTOP_DIM,
             height: MAX_DESKTOP_DIM,
         }))
+        .with_remotefx_quant(VIEWER_REMOTEFX_QUANT)
         .with_credential_validator(Some(validator))
         .with_cliprdr_factory(Some(Box::new(clipboard.clone())))
         .with_connection_handler(Some(Box::new(ViewerConnection { keyboard_layout })))
@@ -1108,6 +1133,34 @@ mod cursor_tests {
             assert_eq!((pointer.hot_x, pointer.hot_y), (3, 4));
             assert_eq!(pointer.data, pixels(width, height));
         }
+    }
+}
+
+#[cfg(test)]
+mod quantization_tests {
+    use ironrdp_pdu::codecs::rfx::Quant;
+
+    use super::VIEWER_REMOTEFX_QUANT;
+
+    /// The sub-band values in TS_RFX_CODEC_QUANT order.
+    fn values(quant: &Quant) -> [u8; 10] {
+        [
+            quant.ll3, quant.lh3, quant.hl3, quant.hh3, quant.lh2, quant.hl2, quant.hh2, quant.lh1,
+            quant.hl1, quant.hh1,
+        ]
+    }
+
+    #[test]
+    fn viewers_get_valid_quantization_no_coarser_than_the_default() {
+        assert!(VIEWER_REMOTEFX_QUANT.validate().is_ok());
+        let ours = values(&VIEWER_REMOTEFX_QUANT);
+        let default = values(&Quant::default());
+        assert!(
+            ours.iter()
+                .zip(&default)
+                .all(|(ours, default)| ours <= default)
+        );
+        assert_ne!(ours, default);
     }
 }
 

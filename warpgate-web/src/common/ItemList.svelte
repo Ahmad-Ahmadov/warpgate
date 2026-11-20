@@ -94,6 +94,11 @@
          * the debounce pipeline.
          */
         searchInput?: Snippet<[string, (_: string) => void]>
+        /**
+         * The search text. Bindable, so a screen can keep its search field
+         * outside the list, where it survives the list being re-mounted.
+         */
+        filter?: string
     }
 
     let {
@@ -112,9 +117,9 @@
         virtual = false,
         container,
         searchInput,
+        filter = $bindable(''),
     }: Props = $props()
 
-    let filter = $state('')
     let loaded = $state(false)
     let list = $state.raw<T[] | null>(null)
     let total = $state(0)

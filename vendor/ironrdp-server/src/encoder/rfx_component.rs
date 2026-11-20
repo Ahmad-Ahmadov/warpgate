@@ -2,22 +2,23 @@
 //! reconstruction and RLGR entropy coding ([MS-RDPRFX] 3.1.8.1).
 //!
 //! A Warpgate replacement for `ironrdp_graphics::rfx_encode_component`, which every tile of
-//! every frame goes through three times. It produces the same bytes (the tests below compare
-//! the two on many inputs) with the same arithmetic, arranged for speed:
+//! every frame goes through three times. Its DWT and RLGR coder produce the same values and
+//! bytes as IronRDP's (the tests below compare them on many inputs), arranged for speed:
 //!
 //! - The vertical DWT pass walks whole rows rather than one column at a time, so each step
 //!   is the same operation over contiguous memory, which the compiler vectorises.
 //! - RLGR output goes through a 64-bit bit accumulator that writes whole bytes, rather than
 //!   a `bitvec` range fill or store per code, which was its main cost.
 //!
-//! Quantization and sub-band reconstruction are IronRDP's own.
+//! Quantization rounds to the nearest step, where IronRDP's rounds down; see [`quantize`].
+//! Sub-band reconstruction is IronRDP's own.
 //!
 //! [MS-RDPRFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdprfx/62495a4a-a495-46ea-b459-5cde04c44549
 
 use core::cmp::min;
 
 use ironrdp_graphics::rlgr::RlgrError;
-use ironrdp_graphics::{quantization, subband_reconstruction};
+use ironrdp_graphics::subband_reconstruction;
 use ironrdp_pdu::codecs::rfx::{EntropyAlgorithm, Quant};
 
 const TILE_PIXELS: usize = 64 * 64;
@@ -35,9 +36,55 @@ pub(crate) fn encode_component(
     mode: EntropyAlgorithm,
 ) -> Result<usize, RlgrError> {
     dwt_encode(input, temp);
-    quantization::encode(input, quant);
+    quantize(input, quant);
     subband_reconstruction::encode(&mut input[LL3_START..]);
     rlgr_encode(mode, input, output)
+}
+
+// --- Quantization --------------------------------------------------------------------------
+
+/// The sub-bands as `dwt_encode` lays them out, each with its quantization value: where it
+/// starts, how many coefficients it has, and the value. The order and the values are
+/// `ironrdp_graphics::quantization::encode`'s.
+fn sub_bands(quant: &Quant) -> [(usize, usize, u8); 10] {
+    [
+        (0, 1024, quant.hl1),
+        (1024, 1024, quant.lh1),
+        (2048, 1024, quant.hh1),
+        (3072, 256, quant.hl2),
+        (3328, 256, quant.lh2),
+        (3584, 256, quant.hh2),
+        (3840, 64, quant.hl3),
+        (3904, 64, quant.lh3),
+        (3968, 64, quant.hh3),
+        (LL3_START, 64, quant.ll3),
+    ]
+}
+
+/// Divide each sub-band by 2^(value - 1), rounding to the nearest whole step. The decoder
+/// multiplies by the same power; it is one less than the value because, as in IronRDP, the
+/// division also takes off the five fractional bits the colour conversion added.
+///
+/// Warpgate: IronRDP shifts right, which rounds down. A coefficient just below zero then goes
+/// as a whole step below zero, one just above zero goes as zero, and every decoded coefficient
+/// is below the one encoded, by up to a whole step rather than half of one. On a desktop that is
+/// noise around text, blotchy gradients and coloured fringes, and darker tiles than the screen.
+/// FreeRDP's encoder rounds, as here. Rounding changes which values are sent, not how they are
+/// read.
+fn quantize(buffer: &mut [i16; TILE_PIXELS], quant: &Quant) {
+    for (start, len, value) in sub_bands(quant) {
+        // A value of 1 or less leaves the sub-band as it is, as in IronRDP; the encoder only
+        // takes values in 6..=15.
+        let shift = u32::from(value).saturating_sub(1).min(15);
+        if shift == 0 {
+            continue;
+        }
+        let half = 1i32 << (shift - 1);
+        for coefficient in &mut buffer[start..start + len] {
+            // In range: |coefficient| + half is below 2^16 and is shifted right at least once.
+            *coefficient = ((i32::from(*coefficient) + half) >> shift) as i16;
+        }
+    }
 }
 
 // --- Forward DWT ---------------------------------------------------------------------------
@@ -330,7 +377,7 @@ impl<'a> BitWriter<'a> {
 
 #[cfg(test)]
 mod tests {
-    use ironrdp_graphics::{dwt, rfx_encode_component, rlgr};
+    use ironrdp_graphics::{dwt, quantization, rlgr};
 
     use super::*;
 
@@ -471,10 +518,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_whole_component_matches_ironrdp() {
-        let finest = Quant::default();
-        let coarse = Quant {
+    fn coarse() -> Quant {
+        Quant {
             ll3: 8,
             lh3: 9,
             hl3: 9,
@@ -485,22 +530,90 @@ mod tests {
             lh1: 11,
             hl1: 11,
             hh1: 12,
-        };
-        for quant in [&finest, &coarse] {
+        }
+    }
+
+    fn finest() -> Quant {
+        Quant {
+            ll3: 6,
+            lh3: 6,
+            hl3: 6,
+            hh3: 6,
+            lh2: 6,
+            hl2: 6,
+            hh2: 6,
+            lh1: 6,
+            hl1: 6,
+            hh1: 6,
+        }
+    }
+
+    /// The quantization step at each coefficient, as IronRDP's dequantization has it: what it
+    /// makes of a 1. Independent of `sub_bands`, so a sub-band out of place there shows here.
+    fn steps(quant: &Quant) -> [i16; TILE_PIXELS] {
+        let mut steps = [1; TILE_PIXELS];
+        quantization::decode(&mut steps, quant);
+        steps
+    }
+
+    #[test]
+    fn quantization_rounds_to_the_nearest_step() {
+        let mut rng = Xorshift(11);
+        let mut input = [0i16; TILE_PIXELS];
+        for v in &mut input {
+            *v = rng.sample(32768);
+        }
+        // The extremes, zero, and the values either side of zero.
+        input[..5].copy_from_slice(&[i16::MIN, i16::MAX, 0, -1, 1]);
+
+        for quant in [finest(), Quant::default(), coarse()] {
+            let steps = steps(&quant);
+            let mut quantized = input;
+            quantize(&mut quantized, &quant);
+            for (index, ((&value, &sent), &step)) in input.iter().zip(&quantized).zip(&steps).enumerate() {
+                // What the decoder makes of it is within half a step, ties going up. Rounding
+                // down is off by up to a whole step, always below.
+                let error = i32::from(sent) * i32::from(step) - i32::from(value);
+                let step = i32::from(step);
+                assert!(
+                    -step / 2 < error && error <= step / 2,
+                    "{value} at {index} sent as {sent} in steps of {step}, decoded {error} away"
+                );
+            }
+        }
+
+        // What rounding down got most wrong: just below zero is zero, not a whole step below.
+        let mut just_below = [-1i16; TILE_PIXELS];
+        quantize(&mut just_below, &Quant::default());
+        assert!(just_below.iter().all(|&sent| sent == 0));
+    }
+
+    #[test]
+    fn a_whole_component_is_ironrdp_s_with_quantization_rounded() {
+        for quant in [finest(), Quant::default(), coarse()] {
+            let steps = steps(&quant);
             for mode in [EntropyAlgorithm::Rlgr1, EntropyAlgorithm::Rlgr3] {
                 for input in inputs() {
-                    // As the encoder sizes it.
-                    let mut ours = [0u8; 4096];
-                    let mut theirs = [0u8; 4096];
-                    let ours_len = encode_component(&mut input.clone(), &mut [0; TILE_PIXELS], &mut ours, quant, mode);
-                    let theirs_len = rfx_encode_component(&mut input.clone(), &mut theirs, quant, mode);
+                    let capacity = TILE_PIXELS * 16 + 64 * 1024;
+                    let mut ours = vec![0u8; capacity];
+                    let ours_len = encode_component(&mut input.clone(), &mut [0; TILE_PIXELS], &mut ours, &quant, mode);
+
+                    // IronRDP's stages, the quantization rounded in floating point.
+                    let mut theirs = input;
+                    dwt::encode(&mut theirs, &mut [0; TILE_PIXELS]);
+                    for (coefficient, &step) in theirs.iter_mut().zip(&steps) {
+                        *coefficient = (f64::from(*coefficient) / f64::from(step) + 0.5).floor() as i16;
+                    }
+                    subband_reconstruction::encode(&mut theirs[LL3_START..]);
+                    let mut their_bytes = vec![0u8; capacity];
+                    let theirs_len = rlgr::encode(mode, &theirs, &mut their_bytes);
+
                     match (ours_len, theirs_len) {
                         (Ok(ours_len), Ok(theirs_len)) => {
-                            assert_eq!(ours_len, theirs_len);
-                            assert!(ours[..ours_len] == theirs[..theirs_len], "{mode:?} bytes differ");
+                            assert_eq!(ours_len, theirs_len, "{mode:?} lengths differ");
+                            assert!(ours[..ours_len] == their_bytes[..theirs_len], "{mode:?} bytes differ");
                         }
-                        (Err(_), Err(_)) => {}
-                        other => panic!("{mode:?}: one failed, the other did not: {other:?}"),
+                        other => panic!("{mode:?}: {other:?}"),
                     }
                 }
             }

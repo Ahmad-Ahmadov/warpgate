@@ -36,14 +36,39 @@ Every 64x64 tile of every frame goes through `ironrdp_graphics::rfx_encode_compo
 times (Y, Cb, Cr). Two of its four steps dominate: the forward DWT's vertical pass walks the
 tile a column at a time, with a bounds check and a branch per sample, and RLGR writes each
 code through a `bitvec` range `fill`/`store_be`, several per coefficient.
-`src/encoder/rfx_component.rs` replaces both and keeps IronRDP's quantization and sub-band
-reconstruction. The vertical pass works on whole rows, which the compiler vectorises. The
-RLGR coder packs bits in a 64-bit accumulator and writes whole bytes. The arithmetic and the
-output are the same, byte for byte, and its tests compare the DWT, the RLGR coder (both
-modes, including the too-small-buffer error) and the whole component against IronRDP's on
-flat, gradient, edge, noise and sparse inputs and the i16 extremes. Run them with
+`src/encoder/rfx_component.rs` replaces both and keeps IronRDP's sub-band reconstruction. The
+vertical pass works on whole rows, which the compiler vectorises. The RLGR coder packs bits in
+a 64-bit accumulator and writes whole bytes. Both produce IronRDP's values and bytes, and its
+tests compare the DWT, the RLGR coder (both modes, including the too-small-buffer error) and
+the whole component against IronRDP's on flat, gradient, edge, noise and sparse inputs and the
+i16 extremes. The quantization differs on purpose; see below. Run them with
 `cargo test -p ironrdp-server --lib rfx_component` (the crate sets `test = false`, so they
 only run when the library is named).
+
+## RemoteFX picture quality
+
+Three things the snapshot's encoder got wrong, each visible on a viewer as noise around text,
+blotchy gradients, coloured fringes or a seam along the edge of a changed area:
+
+- **Quantization rounds down.** `ironrdp_graphics::quantization::encode` shifts each
+  coefficient right, so a coefficient just below zero goes as a whole step below zero, one just
+  above goes as zero, and every coefficient decodes below the one encoded, by up to a whole step
+  rather than half of one. `rfx_component::quantize` rounds to the nearest step, as FreeRDP's
+  encoder does; the decoder is unchanged, as is everything on the wire but the values.
+- **Edge tiles are padded with grey.** A tile at the right or bottom of an update is less than
+  64x64, and the colour conversion leaves the rest of it zero, mid grey. The wavelet carries the
+  step to that grey back into the picture, and quantization keeps it. `rfx::extend_edges`
+  repeats the last column and row instead, as FreeRDP does. Updates the size of a line of text
+  are almost all edge tiles.
+- **A component over 4 KB ends the session.** Each component gets 4096 bytes; one that needs
+  more fails its tile, the update, and then the connection. Fine detail at fine quantization can
+  need more, so `rfx::encode_tile_in` encodes such a tile again with the most a component can
+  take (64 KB, its length being 16 bits on the wire).
+
+The quantization values themselves are the server's choice (`with_remotefx_quant`); Warpgate
+sets finer ones than the default, and the `Viewer graphics` report now names them. The tests
+read the messages back with IronRDP's own decoder (`TileDecoder`) and bound how far the pixels
+are from the bitmap, and check that a flat colour decodes as itself at any tile size.
 
 ## Default and hidden pointers that were never sent
 
@@ -71,8 +96,7 @@ more, doubled it and encoded every tile again; `rfx::UpdateEncoder` also zeroed 
 buffer of three 4096-byte components per tile for every message. A 1080p frame zeroed two
 buffers of about 6 MB each. `RfxEncoder::encode` (`src/encoder/rfx.rs`) now encodes each tile,
 in parallel, into a buffer of exactly its size, then writes the message once into a buffer of
-exactly the size its blocks add up to. Its tests rebuild the message from IronRDP's own
-`rfx_encode_component` and block encoding and compare the bytes.
+exactly the size its blocks add up to, laid out as upstream lays it out.
 
 ## Changed rectangles encoded together
 
@@ -100,8 +124,8 @@ target `ironrdp_server::graphics` it reports the graphics each activation negoti
 each update's encode and write time and size (trace), and a summary every 10 seconds (debug).
 
 The pointer, RemoteFX, bitmap and update tests are in `src/encoder/` and the write test in
-`src/server.rs` (`display_write_tests`): `cargo test -p ironrdp-server --lib encoder` and
-`cargo test -p ironrdp-server --lib display_write_tests`.
+`src/server.rs` (`display_write_tests`): `cargo test -p ironrdp-server --lib encoder` (which
+includes `rfx_component`) and `cargo test -p ironrdp-server --lib display_write_tests`.
 
 ## Manifest
 

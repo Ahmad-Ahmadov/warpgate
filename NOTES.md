@@ -2885,3 +2885,52 @@ the previous image at 1080p, 1440p and 4K: scroll a long page, drag a window, pl
 type while the screen is busy, and run two sessions at once, with the debug summary on. Over a
 throttled link (for example `tc qdisc add dev <if> root tbf rate 20mbit burst 32kbit latency
 50ms`), typing and window drags should stay current rather than fall seconds behind.
+
+## Native RDP picture quality, and the My targets page
+
+### RemoteFX: why the native desktop looked worse than the browser's
+
+The browser path sends JPEG at quality 90 and re-sends settled areas losslessly. The native
+path sends RemoteFX, and three defects in the vendored encoder made it look worse than
+RemoteFX should (see `vendor/ironrdp-server/PATCHES.md`, "RemoteFX picture quality"):
+
+- **Quantization rounded down** instead of to the nearest step: every slightly negative detail
+  coefficient went out as a whole step below zero. That showed as noise around text, blotchy
+  gradients and colour fringes. It now rounds, as FreeRDP's encoder does.
+- **Edge tiles were padded with mid grey**, which rang back into the picture along the right
+  and bottom of each changed area: a seam around every updated line of text. They are now padded
+  with their own last column and row.
+- **A tile component over 4 KB failed the update and ended the session.** It is now encoded
+  again with up to 64 KB.
+
+On top of that, Warpgate now asks for finer quantization for native viewers
+(`VIEWER_REMOTEFX_QUANT` in `warpgate-protocol-rdp/src/server/rdp.rs`: whole precision in every
+sub-band but the three finest, which lose one bit, against up to three bits by default). That
+costs more bytes per changed tile, an estimated tenth to a quarter. The `Viewer graphics` log
+line names the quantization a viewer got. The bitstream format, codec negotiation and the
+browser path are unchanged. A target whose own compression is `remotefx` still sends Warpgate a
+lossy picture; `lossless` in the target's RDP options avoids that where the link allows.
+
+### My targets
+
+A full-width top bar (brand, My targets and Ticket requests where self-service is on, Admin,
+the account menu with an avatar), and a wider page for the target grid only. Search, protocol
+chips with counts and the list options now sit in one toolbar above the list, outside the list
+the protocol filter re-mounts. A protocol change no longer clears the search or drops the focus,
+and `/` focuses the search. Cards have a protocol icon, a fixed foot for the action, the public
+host or default database where the target has one, and group headers span the grid.
+
+### To run on the build server
+
+```sh
+cargo test -p ironrdp-server --lib encoder
+cargo test -p warpgate-protocol-rdp
+just clippy
+cd warpgate-web && npm run check && npm run lint
+```
+
+Then compare mstsc and MobaXterm against the previous build on text, coloured text (an editor
+or `ls --color`), gradients and photographs, check the `Viewer graphics` line shows
+`quantization 6,6,6,6,6,6,6,7,7,7`, and compare bandwidth with
+`ironrdp_server::graphics=debug`. Check My targets at desktop, laptop and phone widths, in dark
+and light themes, with one, several and grouped targets.

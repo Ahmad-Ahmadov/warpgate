@@ -10,13 +10,18 @@ use ironrdp_pdu::codecs::rfx::{
     RegionPdu, RfxChannel, SyncPdu, TileSetPdu,
 };
 use ironrdp_pdu::rdp::capability_sets::EntropyBits;
+use tracing::debug;
 
+use super::DISPLAY_TARGET;
 use super::rfx_component::encode_component;
 use crate::BitmapUpdate;
 
-/// The most one component of a tile may take. A component that needs more fails its tile, as it
-/// always has: the encoder gives each component this much room.
-const COMPONENT_MAX: usize = 4096;
+/// The room each component of a tile gets at first, as upstream gives it; almost every
+/// component fits.
+const COMPONENT_SLOT: usize = 4096;
+
+/// The most one component of a tile can take: TS_RFX_TILE carries its length in 16 bits.
+const COMPONENT_MAX: usize = u16::MAX as usize;
 
 #[derive(Debug, Clone)]
 pub(crate) struct RfxEncoder {
@@ -42,7 +47,8 @@ impl RfxEncoder {
     /// small, grows it and encodes every tile again; its tiles share one more zeroed buffer, three
     /// worst-case components per tile. Here each tile is encoded into a buffer of exactly its size,
     /// and the message is then written once, into a buffer of exactly the size the tiles add up to.
-    /// The bytes are the same.
+    /// The message is laid out as upstream lays it out; its tiles differ, as `encode_tile_into`
+    /// pads edge tiles with their edges and the quantization rounds (see `rfx_component`).
     pub(crate) fn encode(&self, bitmap: &BitmapUpdate, desktop_size: Option<DesktopSize>) -> EncodeResult<Vec<u8>> {
         let entropy_algorithm = self.entropy_algorithm;
         let quant = self.quant.clone();
@@ -171,6 +177,57 @@ fn encode_tile(
     tile_x: usize,
     tile_y: usize,
 ) -> Result<(Vec<u8>, usize, usize), RlgrError> {
+    encode_tile_in(
+        bitmap,
+        quant,
+        entropy_algorithm,
+        tile_x,
+        tile_y,
+        &mut [0u8; 3 * COMPONENT_SLOT],
+    )
+}
+
+/// `encode_tile`, each component given a third of `slots` first.
+///
+/// Warpgate: upstream fails the tile when a component needs more than its slot, and with it the
+/// update, and the error ends the viewer's connection. Fine detail at fine quantization can need
+/// more, so such a tile is encoded again with as much room as a component can take.
+fn encode_tile_in(
+    bitmap: &BitmapUpdate,
+    quant: &Quant,
+    entropy_algorithm: rfx::EntropyAlgorithm,
+    tile_x: usize,
+    tile_y: usize,
+    slots: &mut [u8],
+) -> Result<(Vec<u8>, usize, usize), RlgrError> {
+    match encode_tile_into(bitmap, quant, entropy_algorithm, tile_x, tile_y, slots) {
+        Err(RlgrError::OutputTooSmall { needed, available }) => {
+            debug!(
+                target: DISPLAY_TARGET,
+                needed, available, tile_x, tile_y, "RemoteFX tile component larger than its slot, encoding again"
+            );
+            encode_tile_into(
+                bitmap,
+                quant,
+                entropy_algorithm,
+                tile_x,
+                tile_y,
+                &mut vec![0u8; 3 * COMPONENT_MAX],
+            )
+        }
+        result => result,
+    }
+}
+
+/// One attempt at `encode_tile`, each component given a third of `slots`.
+fn encode_tile_into(
+    bitmap: &BitmapUpdate,
+    quant: &Quant,
+    entropy_algorithm: rfx::EntropyAlgorithm,
+    tile_x: usize,
+    tile_y: usize,
+    slots: &mut [u8],
+) -> Result<(Vec<u8>, usize, usize), RlgrError> {
     #![allow(clippy::similar_names)] // It’s hard to find better names for cr, cb, etc.
 
     let bpp: usize = bitmap.format.bytes_per_pixel().into();
@@ -179,8 +236,8 @@ fn encode_tile(
 
     let x = tile_x * 64;
     let y = tile_y * 64;
-    let tile_width = u32::try_from(core::cmp::min(width - x, 64)).expect("can always fit in u32");
-    let tile_height = u32::try_from(core::cmp::min(height - y, 64)).expect("can always fit in u32");
+    let tile_width = core::cmp::min(width - x, 64);
+    let tile_height = core::cmp::min(height - y, 64);
     let stride = bitmap.stride.get();
     let input = &bitmap.data[y * stride + x * bpp..];
 
@@ -189,14 +246,28 @@ fn encode_tile(
     let cb = &mut [0i16; 4096];
     let cr = &mut [0i16; 4096];
 
-    to_64x64_ycbcr_tile(input, tile_width, tile_height, stride, bitmap.format, y, cb, cr).map_err(RlgrError::Yuv)?;
+    to_64x64_ycbcr_tile(
+        input,
+        u32::try_from(tile_width).expect("at most 64"),
+        u32::try_from(tile_height).expect("at most 64"),
+        stride,
+        bitmap.format,
+        y,
+        cb,
+        cr,
+    )
+    .map_err(RlgrError::Yuv)?;
+    for plane in [&mut *y, &mut *cb, &mut *cr] {
+        extend_edges(plane, tile_width, tile_height);
+    }
 
-    let mut components = [0u8; 3 * COMPONENT_MAX];
-    let (y_data, rest) = components.split_at_mut(COMPONENT_MAX);
-    let (cb_data, cr_data) = rest.split_at_mut(COMPONENT_MAX);
+    let slot = slots.len() / 3;
+    let (y_data, rest) = slots.split_at_mut(slot);
+    let (cb_data, rest) = rest.split_at_mut(slot);
+    let cr_data = &mut rest[..slot];
 
-    // Warpgate: `encode_component` writes what `ironrdp_graphics::rfx_encode_component`
-    // would, faster; see its module.
+    // Warpgate: `encode_component` is `ironrdp_graphics::rfx_encode_component`, faster, with
+    // its quantization rounded to the nearest step; see its module.
     let temp = &mut [0i16; 4096];
     let y_len = encode_component(y, temp, y_data, quant, entropy_algorithm)?;
     let cb_len = encode_component(cb, temp, cb_data, quant, entropy_algorithm)?;
@@ -207,6 +278,34 @@ fn encode_tile(
     data.extend_from_slice(&cb_data[..cb_len]);
     data.extend_from_slice(&cr_data[..cr_len]);
     Ok((data, y_len, cb_len))
+}
+
+/// Fill what lies outside the `width` by `height` picture in a 64x64 component plane with
+/// copies of the picture's last column, then of its last row.
+///
+/// Warpgate: upstream leaves it as the colour conversion left it, zero, which is mid grey. The
+/// wavelet carries the step from the picture to that grey back into the picture's last columns
+/// and rows, and quantization leaves it there: a tile at the right or bottom edge of an update
+/// shows a fringe along that edge, and most tiles are edge tiles when updates are the size of a
+/// line of text. FreeRDP's encoder repeats the edge, as here. The client paints only the
+/// update's rectangle, so what fills the rest is never seen.
+fn extend_edges(plane: &mut [i16; 4096], width: usize, height: usize) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    if width < 64 {
+        for row in plane.chunks_exact_mut(64).take(height) {
+            let last = row[width - 1];
+            row[width..].fill(last);
+        }
+    }
+    if height < 64 {
+        let (picture, below) = plane.split_at_mut(height * 64);
+        let last_row = &picture[(height - 1) * 64..];
+        for row in below.chunks_exact_mut(64) {
+            row.copy_from_slice(last_row);
+        }
+    }
 }
 
 #[cfg(feature = "__bench")]
@@ -229,34 +328,43 @@ pub(crate) mod bench {
     }
 }
 
-/// Warpgate: the message is the one upstream's encoder writes, byte for byte, here rebuilt from
-/// IronRDP's own component coder and block encoding.
+/// Warpgate: the messages, read back by IronRDP's own decoder, as a client would.
 #[cfg(test)]
 mod tests {
     use core::num::{NonZeroU16, NonZeroUsize};
 
-    use ironrdp_core::Encode as _;
-    use ironrdp_graphics::rfx::MessageDecoder;
-    use ironrdp_graphics::rfx_encode_component;
+    use ironrdp_graphics::rfx::{MessageDecoder, TileDecoder};
 
     use super::*;
     use crate::PixelFormat;
 
-    fn bitmap(width: u16, height: u16, seed: u64) -> BitmapUpdate {
-        let mut state = seed;
-        let data: Vec<u8> = (0..usize::from(width) * usize::from(height) * 4)
-            .map(|i| {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                // Smooth areas and noise both, as desktops have.
-                if (i / 4) % 7 < 3 {
-                    (i / 97) as u8
-                } else {
-                    state.to_le_bytes()[0]
-                }
-            })
-            .collect();
+    const DESKTOP: DesktopSize = DesktopSize {
+        width: 1920,
+        height: 1080,
+    };
+
+    /// No quantization beyond taking off the colour conversion's fractional bits.
+    const FINEST: Quant = Quant {
+        ll3: 6,
+        lh3: 6,
+        hl3: 6,
+        hh3: 6,
+        lh2: 6,
+        hl2: 6,
+        hh2: 6,
+        lh1: 6,
+        hl1: 6,
+        hh1: 6,
+    };
+
+    /// A `width` by `height` BGRA bitmap, `pixel(x, y)` at each pixel.
+    fn bitmap(width: u16, height: u16, pixel: impl Fn(usize, usize) -> [u8; 4]) -> BitmapUpdate {
+        let mut data = Vec::with_capacity(usize::from(width) * usize::from(height) * 4);
+        for y in 0..usize::from(height) {
+            for x in 0..usize::from(width) {
+                data.extend_from_slice(&pixel(x, y));
+            }
+        }
         BitmapUpdate {
             x: 0,
             y: 0,
@@ -268,138 +376,144 @@ mod tests {
         }
     }
 
-    /// The message as upstream builds it: every tile through `rfx_encode_component`, each
-    /// component in a 4096-byte slot, the blocks written one after another.
-    fn upstream_message(
-        bitmap: &BitmapUpdate,
-        quant: &Quant,
-        entropy_algorithm: rfx::EntropyAlgorithm,
-        desktop_size: Option<DesktopSize>,
-    ) -> Vec<u8> {
-        let tiles_x = usize::from(bitmap.width.get().div_ceil(64));
-        let tiles_y = usize::from(bitmap.height.get().div_ceil(64));
-        let mut slots = vec![[0u8; 3 * COMPONENT_MAX]; tiles_x * tiles_y];
-        let mut lens = Vec::new();
-        for (index, slot) in slots.iter_mut().enumerate() {
-            let (tile_x, tile_y) = (index % tiles_x, index / tiles_x);
-            let (x, y) = (tile_x * 64, tile_y * 64);
-            let stride = bitmap.stride.get();
-            let (mut luma, mut cb, mut cr) = ([0i16; 4096], [0i16; 4096], [0i16; 4096]);
-            to_64x64_ycbcr_tile(
-                &bitmap.data[y * stride + x * 4..],
-                u32::try_from((usize::from(bitmap.width.get()) - x).min(64)).unwrap(),
-                u32::try_from((usize::from(bitmap.height.get()) - y).min(64)).unwrap(),
-                u32::try_from(stride).unwrap(),
-                bitmap.format,
-                &mut luma,
-                &mut cb,
-                &mut cr,
-            )
-            .unwrap();
-            let (y_slot, rest) = slot.split_at_mut(COMPONENT_MAX);
-            let (cb_slot, cr_slot) = rest.split_at_mut(COMPONENT_MAX);
-            lens.push((
-                rfx_encode_component(&mut luma, y_slot, quant, entropy_algorithm).unwrap(),
-                rfx_encode_component(&mut cb, cb_slot, quant, entropy_algorithm).unwrap(),
-                rfx_encode_component(&mut cr, cr_slot, quant, entropy_algorithm).unwrap(),
-            ));
+    /// A desktop: a soft gradient, with lines of strokes in dark, red and blue ink.
+    fn desktop(x: usize, y: usize) -> [u8; 4] {
+        let line = y / 16;
+        if (3..12).contains(&(y % 16)) && (x * 7 + line * 13) % 11 < 3 {
+            match line % 3 {
+                0 => [20, 20, 20, 0xff],
+                1 => [40, 40, 210, 0xff],
+                _ => [230, 140, 50, 0xff],
+            }
+        } else {
+            [(90 + y / 4) as u8, (60 + (x + y) / 8) as u8, (40 + x / 4) as u8, 0xff]
         }
-        let tiles = slots
-            .iter()
-            .zip(&lens)
-            .enumerate()
-            .map(|(index, (slot, &(y_len, cb_len, cr_len)))| rfx::Tile {
-                y_quant_index: 0,
-                cb_quant_index: 0,
-                cr_quant_index: 0,
-                x: u16::try_from(index % tiles_x).unwrap(),
-                y: u16::try_from(index / tiles_x).unwrap(),
-                y_data: &slot[..y_len],
-                cb_data: &slot[COMPONENT_MAX..COMPONENT_MAX + cb_len],
-                cr_data: &slot[2 * COMPONENT_MAX..2 * COMPONENT_MAX + cr_len],
-            })
-            .collect();
+    }
 
-        let mut output = vec![0; 64 * 1024 + tiles_x * tiles_y * 3 * COMPONENT_MAX];
-        let mut cursor = WriteCursor::new(&mut output);
-        if let Some(desktop_size) = desktop_size {
-            Block::Sync(SyncPdu).encode(&mut cursor).unwrap();
-            Block::CodecChannel(CodecChannel::Context(rfx::ContextPdu {
-                flags: OperatingMode::IMAGE_MODE,
-                entropy_algorithm,
-            }))
-            .encode(&mut cursor)
-            .unwrap();
-            Block::Channels(ChannelsPdu(vec![RfxChannel {
-                width: i16::try_from(desktop_size.width).unwrap(),
-                height: i16::try_from(desktop_size.height).unwrap(),
-            }]))
-            .encode(&mut cursor)
-            .unwrap();
-            Block::CodecVersions(CodecVersionsPdu).encode(&mut cursor).unwrap();
+    /// Noise, the most a tile can take to encode.
+    fn noise(x: usize, y: usize) -> [u8; 4] {
+        let mut state = (x as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ ((y as u64 + 7) << 32);
+        state ^= state >> 29;
+        state = state.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        state ^= state >> 32;
+        let [b, g, r, ..] = state.to_le_bytes();
+        [b, g, r, 0xff]
+    }
+
+    /// What a client paints for `message`, the message for a `width` by `height` bitmap: BGRA,
+    /// row by row. Every pixel must be painted, and once.
+    fn decode(message: &[u8], width: usize, height: usize) -> Vec<[u8; 4]> {
+        let parsed = MessageDecoder::new().parse(message).unwrap();
+        assert_eq!(parsed.frames.len(), 1);
+        let frame = &parsed.frames[0];
+        let tile_set = &frame.tile_set;
+        let mut decoder = TileDecoder::new();
+        let mut painted = vec![None; width * height];
+        for tile in &tile_set.tiles {
+            let rgba = decoder
+                .decode(tile, &tile_set.quants, tile_set.entropy_algorithm)
+                .unwrap();
+            for (row, pixels) in rgba.chunks_exact(64 * 4).enumerate() {
+                for (column, pixel) in pixels.chunks_exact(4).enumerate() {
+                    let x = usize::from(tile.x) * 64 + column;
+                    let y = usize::from(tile.y) * 64 + row;
+                    if x < width && y < height {
+                        let slot = &mut painted[y * width + x];
+                        assert!(slot.is_none(), "({x}, {y}) is painted twice");
+                        *slot = Some([pixel[2], pixel[1], pixel[0], pixel[3]]);
+                    }
+                }
+            }
         }
-        Block::CodecChannel(CodecChannel::FrameBegin(FrameBeginPdu {
-            index: 0,
-            number_of_regions: 1,
-        }))
-        .encode(&mut cursor)
-        .unwrap();
-        Block::CodecChannel(CodecChannel::Region(RegionPdu {
-            rectangles: vec![rfx::RfxRectangle {
-                x: 0,
-                y: 0,
-                width: bitmap.width.get(),
-                height: bitmap.height.get(),
-            }],
-        }))
-        .encode(&mut cursor)
-        .unwrap();
-        Block::CodecChannel(CodecChannel::TileSet(TileSetPdu {
-            entropy_algorithm,
-            quants: vec![quant.clone()],
-            tiles,
-        }))
-        .encode(&mut cursor)
-        .unwrap();
-        Block::CodecChannel(CodecChannel::FrameEnd(FrameEndPdu))
-            .encode(&mut cursor)
-            .unwrap();
-        let len = cursor.pos();
-        output.truncate(len);
-        output
+        painted
+            .into_iter()
+            .enumerate()
+            .map(|(at, pixel)| pixel.unwrap_or_else(|| panic!("({}, {}) is not painted", at % width, at / width)))
+            .collect()
+    }
+
+    /// The largest difference, in any colour channel, between `bitmap` and what `message` paints.
+    fn worst_error(bitmap: &BitmapUpdate, message: &[u8]) -> u8 {
+        let width = usize::from(bitmap.width.get());
+        let height = usize::from(bitmap.height.get());
+        decode(message, width, height)
+            .iter()
+            .zip(bitmap.data.chunks_exact(4))
+            .flat_map(|(painted, source)| (0..3).map(move |channel| painted[channel].abs_diff(source[channel])))
+            .max()
+            .unwrap()
     }
 
     #[test]
-    fn messages_are_what_upstream_writes() {
-        let desktop = DesktopSize {
-            width: 1920,
-            height: 1080,
-        };
+    fn messages_decode_to_their_bitmap() {
         let sizes = [(1, 1), (3, 70), (64, 64), (65, 63), (130, 129), (200, 1), (1, 200)];
-        for (seed, (width, height)) in (1u64..).zip(sizes) {
-            let bitmap = bitmap(width, height, seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-            for (entropy_bits, entropy_algorithm) in [
-                (EntropyBits::Rlgr1, rfx::EntropyAlgorithm::Rlgr1),
-                (EntropyBits::Rlgr3, rfx::EntropyAlgorithm::Rlgr3),
-            ] {
-                let encoder = RfxEncoder::new(entropy_bits, Quant::default());
-                for desktop_size in [Some(desktop), None] {
-                    let ours = encoder.encode(&bitmap, desktop_size).unwrap();
-                    let theirs = upstream_message(&bitmap, &Quant::default(), entropy_algorithm, desktop_size);
+        for (width, height) in sizes {
+            let bitmap = bitmap(width, height, desktop);
+            for entropy_bits in [EntropyBits::Rlgr1, EntropyBits::Rlgr3] {
+                // The finest quantization only rounds; the default one, Windows', drops detail.
+                // Rounding down, and padding edge tiles with grey, were off by twice as much.
+                for (quant, bound) in [(FINEST, 12), (Quant::default(), 40)] {
+                    let encoder = RfxEncoder::new(entropy_bits, quant);
+                    let message = encoder.encode(&bitmap, Some(DESKTOP)).unwrap();
+                    let worst = worst_error(&bitmap, &message);
                     assert!(
-                        ours == theirs,
-                        "{width}x{height} {entropy_bits:?}: {} bytes against {}",
-                        ours.len(),
-                        theirs.len()
+                        worst <= bound,
+                        "{width}x{height} {entropy_bits:?}: off by {worst}, more than {bound}"
                     );
+
+                    // Without the header blocks, the same message less them.
+                    let bare = encoder.encode(&bitmap, None).unwrap();
+                    assert!(message.len() > bare.len() && message.ends_with(&bare));
                 }
             }
         }
     }
 
     #[test]
+    fn flat_colour_decodes_as_itself_at_any_size() {
+        // Nothing in a flat picture for quantization to drop, if what pads its tiles out to
+        // 64x64 is more of it. Mid grey, as upstream padded them, leaves a fringe.
+        let colours = [[0xff, 0xff, 0xff, 0xff], [38, 34, 32, 0xff], [200, 120, 30, 0xff], [13, 200, 77, 0xff]];
+        for colour in colours {
+            for (width, height) in [(40, 17), (1, 1), (63, 64), (64, 5), (7, 33), (64, 64)] {
+                let bitmap = bitmap(width, height, |_, _| colour);
+                for quant in [FINEST, Quant::default()] {
+                    let message = RfxEncoder::new(EntropyBits::Rlgr3, quant)
+                        .encode(&bitmap, Some(DESKTOP))
+                        .unwrap();
+                    let worst = worst_error(&bitmap, &message);
+                    assert!(worst <= 2, "{colour:?} {width}x{height}: off by {worst}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_component_larger_than_its_slot_is_encoded_with_more_room() {
+        let bitmap = bitmap(64, 64, noise);
+        for algorithm in [rfx::EntropyAlgorithm::Rlgr1, rfx::EntropyAlgorithm::Rlgr3] {
+            // Sixteen bytes are not enough for any component of noise.
+            let cramped = &mut [0u8; 3 * 16];
+            assert!(matches!(
+                encode_tile_into(&bitmap, &FINEST, algorithm, 0, 0, cramped),
+                Err(RlgrError::OutputTooSmall { .. })
+            ));
+            let roomy = encode_tile(&bitmap, &FINEST, algorithm, 0, 0).unwrap();
+            let retried = encode_tile_in(&bitmap, &FINEST, algorithm, 0, 0, cramped).unwrap();
+            assert!(retried == roomy);
+        }
+
+        // And the message that carries it decodes.
+        let message = RfxEncoder::new(EntropyBits::Rlgr3, FINEST)
+            .encode(&bitmap, Some(DESKTOP))
+            .unwrap();
+        let worst = worst_error(&bitmap, &message);
+        assert!(worst <= 24, "noise off by {worst}");
+    }
+
+    #[test]
     fn every_tile_is_in_the_message_in_order() {
-        let bitmap = bitmap(200, 150, 7);
+        let bitmap = bitmap(200, 150, desktop);
         let message = RfxEncoder::new(EntropyBits::Rlgr3, Quant::default())
             .encode(
                 &bitmap,

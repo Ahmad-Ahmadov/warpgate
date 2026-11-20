@@ -3,6 +3,8 @@
         value: T
         label: string
         disabled?: boolean
+        /** Shown after the label: how many items the choice covers, say. */
+        count?: number
     }
 </script>
 
@@ -67,6 +69,9 @@
                     onchange={() => select(segment.value)}
                 >
                 <span>{segment.label}</span>
+                {#if segment.count !== undefined}
+                    <span class="wg-seg-count">{segment.count}</span>
+                {/if}
             </label>
         {/each}
     </div>
@@ -128,6 +133,25 @@
     .wg-seg-active {
         background: var(--wg-primary);
         color: var(--wg-on-primary);
+    }
+
+    .wg-seg-count {
+        min-width: 1.125rem;
+        margin-left: var(--wg-space-xs);
+        padding: 0 3px;
+        border: var(--wg-border-width) solid var(--wg-border);
+        border-radius: var(--wg-radius-sm);
+        background: var(--wg-surface-container-high);
+        color: var(--wg-text-muted);
+        font: var(--wg-text-code-sm);
+        font-variant-numeric: tabular-nums;
+        text-align: center;
+    }
+
+    .wg-seg-active .wg-seg-count {
+        border-color: currentColor;
+        background: transparent;
+        color: inherit;
     }
 
     .wg-seg-disabled {

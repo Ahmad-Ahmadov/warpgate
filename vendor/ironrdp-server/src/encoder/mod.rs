@@ -166,9 +166,13 @@ impl UpdateEncoder {
                     ..
                 } => {
                     let command = codec.surface_bits_command(surface_flags);
+                    let graphics = format!(
+                        "{codec:?} ({algo:?}) in {command:?} Surface Bits, quantization {}",
+                        quant_values(&remotefx_quant)
+                    );
                     (
                         BitmapUpdater::RemoteFx(RemoteFxHandler::new(algo, remotefx_quant, id, desktop_size, command)),
-                        format!("{codec:?} ({algo:?}) in {command:?} Surface Bits"),
+                        graphics,
                     )
                 }
                 // NSCodec is the lowest-priority codec because it predates
@@ -526,6 +530,16 @@ fn sub_bitmaps(bitmap: &BitmapUpdate, diffs: &[Rect]) -> ServerResult<Option<Vec
         subs.push(sub);
     }
     Ok(Some(subs))
+}
+
+/// Warpgate: RemoteFX quantization values in the order TS_RFX_CODEC_QUANT carries them, LL3
+/// first and HH1 last, for the report of the graphics a viewer negotiated.
+fn quant_values(quant: &Quant) -> String {
+    [
+        quant.ll3, quant.lh3, quant.hl3, quant.hh3, quant.lh2, quant.hl2, quant.hh2, quant.lh1, quant.hl1, quant.hh1,
+    ]
+    .map(|value| value.to_string())
+    .join(",")
 }
 
 #[derive(Debug, Default)]

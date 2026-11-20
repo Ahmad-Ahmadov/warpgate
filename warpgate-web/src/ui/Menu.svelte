@@ -54,6 +54,8 @@
      * outside click dismisses it; trapping focus in one is the wrong model
      * and makes Tab feel broken.
      */
+    import type { Snippet } from 'svelte'
+
     interface Props {
         groups: MenuGroup[]
         /** Accessible name for the trigger — required, it is icon-only. */
@@ -67,6 +69,8 @@
          * opens.
          */
         triggerIcon?: 'kebab' | 'chevron'
+        /** Rendered in the trigger before its label, such as an avatar. */
+        triggerPrefix?: Snippet
         align?: 'start' | 'end'
         disabled?: boolean
         class?: string
@@ -77,6 +81,7 @@
         label,
         triggerLabel,
         triggerIcon = 'kebab',
+        triggerPrefix,
         align = 'end',
         disabled = false,
         class: className = '',
@@ -236,6 +241,9 @@
         onclick={() => (open ? closeMenu() : openMenu())}
         onkeydown={onTriggerKeydown}
     >
+        {#if triggerPrefix}
+            {@render triggerPrefix()}
+        {/if}
         {#if triggerLabel}
             <span>{triggerLabel}</span>
         {/if}
@@ -436,12 +444,13 @@
         left: 0;
     }
 
+    /* Sentence case, as DESIGN.md has every label: a heading can be a username,
+     * which upper case would also misspell. */
     .wg-menu-heading {
         margin: var(--wg-space-xs) var(--wg-space-sm);
         font: var(--wg-text-label-sm);
-        letter-spacing: 0.06em;
-        text-transform: uppercase;
         color: var(--wg-text-subtle);
+        overflow-wrap: anywhere;
     }
 
     .wg-menu-item {

@@ -40,9 +40,14 @@
 
     const PORTAL = '/@warpgate/#'
 
+    // The avatar's letter. Decorative: the trigger's label is the username.
+    const initial = $derived(
+        ($serverInfo?.username ?? '').trim().charAt(0).toUpperCase() || '?',
+    )
+
     const accountGroups = $derived([
         {
-            label: $serverInfo?.username,
+            label: `Signed in as ${$serverInfo?.username ?? ''}`,
             items: [
                 { id: 'profile', label: 'Profile', href: `${PORTAL}/profile` },
                 {
@@ -100,6 +105,10 @@
     ])
 </script>
 
+{#snippet avatar()}
+    <span class="avatar" aria-hidden="true">{initial}</span>
+{/snippet}
+
 {#if $serverInfo?.username}
     <div class="authbar">
         {#if $serverInfo.authorizedViaTicket}
@@ -111,6 +120,7 @@
             label="Account menu"
             triggerLabel={$serverInfo.username}
             triggerIcon="chevron"
+            triggerPrefix={avatar}
             align="end"
         />
     </div>
@@ -127,5 +137,20 @@
     .note {
         color: var(--wg-text-muted);
         font: var(--wg-text-label-sm);
+    }
+
+    .avatar {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex: none;
+        width: 1.375rem;
+        height: 1.375rem;
+        border: var(--wg-border-width) solid var(--wg-border-strong);
+        border-radius: var(--wg-radius-full);
+        background: var(--wg-surface-container-highest);
+        color: var(--wg-text);
+        font: var(--wg-text-label-sm);
+        font-weight: 600;
     }
 </style>
