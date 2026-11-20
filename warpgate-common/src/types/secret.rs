@@ -28,6 +28,11 @@ impl<T> Secret<T> {
     pub const fn expose_secret(&self) -> &T {
         &self.0
     }
+
+    /// The value itself, moved out rather than copied, for a caller that wipes it after use.
+    pub fn into_secret(self) -> T {
+        self.0
+    }
 }
 
 impl<T> From<T> for Secret<T> {

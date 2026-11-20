@@ -42,7 +42,10 @@ use ironrdp_tokio::{FramedWrite as _, TokioFramed};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tracing::{debug, warn};
-use warpgate_common::{RdpTargetAuth, RdpTargetCompression, SecretResolver, TargetRdpOptions};
+use warpgate_common::{
+    RdpTargetAuth, RdpTargetCompression, SecretResolver, TargetRdpOptions, WarpgateError,
+};
+use warpgate_core::domain_account::DomainCredentials;
 use warpgate_core::{
     DESKTOP_CONNECT_TIMEOUT, DESKTOP_HANDSHAKE_TIMEOUT, DesktopConnectionError, DesktopEvent,
     DesktopInput, DesktopRect, DesktopState, check_desktop_size, within_deadline,
@@ -93,26 +96,55 @@ pub async fn run(
     mut abort_rx: UnboundedReceiver<()>,
     logon: LogonWatcher,
     secrets: Arc<dyn SecretResolver>,
+    domain_credentials: Option<DomainCredentials>,
 ) -> Result<(), DesktopConnectionError> {
     event_tx
         .send(DesktopEvent::State(DesktopState::Connecting))
         .await
         .ok();
 
-    let RdpTargetAuth::Password(auth) = &options.auth;
     // The viewer-supplied size is untrusted; bound it the same way the native viewer's is,
     // then make it a size the layout PDU accepts (even width), as the resize path does.
     let (width, height) = bound_desktop_size(width, height);
     let (width, height) =
         MonitorLayoutEntry::adjust_display_size(u32::from(width), u32::from(height));
-    let password = auth.password.resolve(&*secrets).await?;
-    let config = build_config(
-        &options,
-        password.expose_secret(),
-        width as u16,
-        height as u16,
-        keyboard_layout,
-    );
+    // Who the target is signed in to as: the stored account and its stored (or vaulted)
+    // password, or the user's own directory account with the password they typed, which
+    // was checked against the directory before this and is dropped, and wiped, right after.
+    let config = match (&options.auth, domain_credentials) {
+        (RdpTargetAuth::Password(auth), _) => {
+            let password = auth.password.resolve(&*secrets).await?;
+            build_config(
+                &options,
+                SignInAs {
+                    username: &options.username,
+                    domain: options.domain.as_deref(),
+                    password: password.expose_secret(),
+                },
+                width as u16,
+                height as u16,
+                keyboard_layout,
+            )
+        }
+        (RdpTargetAuth::DomainAccount(_), Some(credentials)) => build_config(
+            &options,
+            SignInAs {
+                username: &credentials.account().username,
+                domain: credentials.account().domain.as_deref(),
+                password: credentials.password(),
+            },
+            width as u16,
+            height as u16,
+            keyboard_layout,
+        ),
+        (RdpTargetAuth::DomainAccount(_), None) => {
+            return Err(WarpgateError::InvalidRequest(
+                "This target signs in with your domain account, and no domain password was given"
+                    .into(),
+            )
+            .into());
+        }
+    };
 
     let (clipboard_tx, clipboard_rx) = unbounded_channel();
     let clipboard = Clipboard::deferred(ClientClipboardSink(clipboard_tx));
@@ -862,7 +894,17 @@ pub(crate) fn test_connector_config(username: &str, password: &str) -> connector
         interactive_logon: false,
         tls_security: warpgate_common::RdpTlsSecurity::default(),
     };
-    let mut config = build_config(&options, password, 1024, 768, 0);
+    let mut config = build_config(
+        &options,
+        SignInAs {
+            username,
+            domain: None,
+            password,
+        },
+        1024,
+        768,
+        0,
+    );
     config.enable_credssp = false;
     config
 }
@@ -870,9 +912,16 @@ pub(crate) fn test_connector_config(username: &str, password: &str) -> connector
 #[cfg(test)]
 pub(crate) use tls::upgrade as upgrade_tls;
 
+/// The account a connection signs in to the target as.
+struct SignInAs<'a> {
+    username: &'a str,
+    domain: Option<&'a str>,
+    password: &'a str,
+}
+
 fn build_config(
     options: &TargetRdpOptions,
-    password: &str,
+    sign_in_as: SignInAs<'_>,
     width: u16,
     height: u16,
     keyboard_layout: u32,
@@ -883,10 +932,10 @@ fn build_config(
     };
     connector::Config {
         credentials: Credentials::UsernamePassword {
-            username: options.username.clone(),
-            password: password.to_owned(),
+            username: sign_in_as.username.to_owned(),
+            password: sign_in_as.password.to_owned(),
         },
-        domain: options.domain.clone(),
+        domain: sign_in_as.domain.map(str::to_owned),
         enable_tls: true,
         enable_credssp: true,
         keyboard_type: KeyboardType::IBM_ENHANCED,

@@ -18,7 +18,14 @@
     import Fa from 'svelte-fa'
     import { loadTheme } from 'theme'
     import Button from 'ui/Button.svelte'
-    import { api, ResponseError, type WebClientSessionInfo } from './lib/api'
+    import Callout from 'ui/Callout.svelte'
+    import Input from 'ui/Input.svelte'
+    import {
+        api,
+        ResponseError,
+        type WebClientSessionInfo,
+        type WebDesktopTargetAccount,
+    } from './lib/api'
     import {
         ReconnectingWebSocket,
         SocketState,
@@ -58,6 +65,19 @@
     let sessionNotFound = $state(false)
     let opening = $state(false)
     let sessionInfo = $state<WebClientSessionInfo | null>(null)
+
+    // A target that signs in with the user's own domain account asks for its
+    // password before the session starts. The account comes from the directory,
+    // through the server, and is shown, not typed. The password lives in this
+    // field only until it is sent, and is never stored.
+    let domainPrompt = $state<{
+        targetId: string
+        username?: string
+        problem?: string
+    } | null>(null)
+    let domainPassword = $state('')
+    let domainError = $state<string | undefined>()
+    let domainChecking = $state(false)
 
     // Framebuffer messages are queued off the WS thread and painted in a rAF loop so a
     // burst of updates (e.g. dragging a window) can never block the main thread. Beyond
@@ -372,6 +392,10 @@
 
     // RDP uses scancodes and VNC uses the keysym since RFB has no scancodes
     function onKey(e: KeyboardEvent, down: boolean) {
+        // The password prompt types into its own field, not the desktop.
+        if (domainPrompt) {
+            return
+        }
         clipboard.onKey(e, down)
         // The paste combo is left alone so the browser still fires its own `paste`,
         // which is the only way to read the clipboard without a permission prompt.
@@ -413,17 +437,97 @@
         window.close()
     }
 
-    async function startSession(targetId: string): Promise<void> {
+    async function startSession(
+        targetId: string,
+        domainPassword?: string,
+    ): Promise<void> {
         const size = viewportSize()
         const { sessionId: id } = await api.createWebDesktopSession({
             createWebDesktopSessionBody: {
                 targetId,
                 width: size?.width,
                 height: size?.height,
+                domainPassword,
             },
         })
         sessionId = id
         history.replaceState(history.state, '', `#/web-desktop/${id}`)
+    }
+
+    /**
+     * Whether the target signs in with the user's own domain account; if so,
+     * the password prompt is shown and connecting goes on from there. Anything
+     * short of a clear answer leaves it to starting the session, which reports
+     * a lapsed login or a refused target as it always has.
+     */
+    async function asksForDomainPassword(targetId: string): Promise<boolean> {
+        let account: WebDesktopTargetAccount
+        try {
+            account = await api.getWebDesktopTargetAccount({ targetId })
+        } catch {
+            return false
+        }
+        if (!account.domainAccount) {
+            return false
+        }
+        domainPrompt = {
+            targetId,
+            username: account.username,
+            problem: account.problem,
+        }
+        return true
+    }
+
+    async function submitDomainPassword(e: SubmitEvent) {
+        e.preventDefault()
+        if (!domainPrompt || domainChecking) {
+            return
+        }
+        const password = domainPassword
+        // Cleared at once: a wrong password is typed again, not edited.
+        domainPassword = ''
+        if (!password) {
+            domainError = 'Enter your domain password'
+            return
+        }
+        domainChecking = true
+        domainError = undefined
+        try {
+            await startSession(domainPrompt.targetId, password)
+        } catch (err) {
+            if (await handleReauthError(err)) {
+                return
+            }
+            // The directory's answer: a wrong password, a locked or disabled
+            // account, and so on.
+            domainError = await stringifyError(err)
+            return
+        } finally {
+            domainChecking = false
+        }
+        domainPrompt = null
+        await attach()
+    }
+
+    /** Join the session that was started, and stream it. */
+    async function attach(): Promise<void> {
+        try {
+            if (!sessionId) {
+                sessionNotFound = true
+                return
+            }
+            sessionInfo = await api.getWebDesktopSession({ sessionId })
+        } catch (e) {
+            if (await handleReauthError(e)) {
+                return
+            }
+            notice = await stringifyError(e)
+            if (e instanceof ResponseError && e.response.status === 404) {
+                sessionNotFound = true
+            }
+            return
+        }
+        startStream()
     }
 
     let resizeObserver: ResizeObserver | undefined
@@ -443,31 +547,27 @@
             resizeObserver.observe(canvasArea)
         }
         rafHandle = requestAnimationFrame(tick)
-        try {
-            if (!sessionId && params.targetId) {
-                opening = true
-                try {
-                    await startSession(params.targetId)
-                } finally {
-                    opening = false
+        if (!sessionId && params.targetId) {
+            opening = true
+            try {
+                if (await asksForDomainPassword(params.targetId)) {
+                    return
                 }
-            }
-            if (!sessionId) {
-                sessionNotFound = true
+                await startSession(params.targetId)
+            } catch (e) {
+                if (await handleReauthError(e)) {
+                    return
+                }
+                notice = await stringifyError(e)
+                if (e instanceof ResponseError && e.response.status === 404) {
+                    sessionNotFound = true
+                }
                 return
+            } finally {
+                opening = false
             }
-            sessionInfo = await api.getWebDesktopSession({ sessionId })
-        } catch (e) {
-            if (await handleReauthError(e)) {
-                return
-            }
-            notice = await stringifyError(e)
-            if (e instanceof ResponseError && e.response.status === 404) {
-                sessionNotFound = true
-            }
-            return
         }
-        startStream()
+        await attach()
     })
 
     const originalTitle = document.title
@@ -507,7 +607,7 @@
         <span class="me-auto text-muted small"
             >{sessionInfo?.targetName ?? ''}</span
         >
-        {#if !opening}
+        {#if !opening && !domainPrompt}
             <div class="me-3">
                 <WebClientStatus
                     {phase}
@@ -544,6 +644,59 @@
             onwheel={onWheel}
             oncontextmenu={e => e.preventDefault()}
         ></canvas>
+
+        {#if domainPrompt}
+            <form
+                class="domain-prompt"
+                autocomplete="off"
+                aria-labelledby="domain-prompt-title"
+                onsubmit={submitDomainPassword}
+            >
+                <h1 id="domain-prompt-title">
+                    Connect with your domain account
+                </h1>
+                {#if domainPrompt.problem || !domainPrompt.username}
+                    <Callout tone="danger" title="You cannot connect to this target">
+                        {domainPrompt.problem ??
+                            'No domain account was found for you.'}
+                    </Callout>
+                    <div class="domain-actions">
+                        <Button onclick={disconnect}>Close</Button>
+                    </div>
+                {:else}
+                    <p class="domain-lede">
+                        This target signs you in to Windows as yourself. Enter
+                        your domain password to connect: it is used for this
+                        connection only and is never saved.
+                    </p>
+                    <div class="domain-account">
+                        <span class="domain-account-label">Account</span>
+                        <span class="wg-mono">{domainPrompt.username}</span>
+                    </div>
+                    <Input
+                        type="password"
+                        label="Domain password"
+                        bind:value={domainPassword}
+                        autocomplete="off"
+                        autofocus
+                        disabled={domainChecking}
+                        error={domainError}
+                    />
+                    <div class="domain-actions">
+                        <Button variant="ghost" onclick={disconnect}>
+                            Cancel
+                        </Button>
+                        <Button
+                            variant="primary"
+                            type="submit"
+                            disabled={domainChecking}
+                        >
+                            {domainChecking ? 'Connecting...' : 'Connect'}
+                        </Button>
+                    </div>
+                {/if}
+            </form>
+        {/if}
     </div>
 </div>
 
@@ -566,7 +719,52 @@
     }
 
     .canvas-area {
+        position: relative;
         overflow: auto;
+    }
+
+    .domain-prompt {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        display: flex;
+        flex-direction: column;
+        gap: var(--wg-space-md);
+        width: min(26rem, calc(100% - 2rem));
+        padding: var(--wg-space-lg);
+        border: var(--wg-border-width) solid var(--wg-border);
+        border-radius: var(--wg-radius-panel);
+        background: var(--wg-surface-container);
+        color: var(--wg-text);
+
+        h1 {
+            margin: 0;
+            font: var(--wg-text-headline-md);
+        }
+    }
+
+    .domain-lede {
+        margin: 0;
+        color: var(--wg-text-muted);
+        font: var(--wg-text-body-md);
+    }
+
+    .domain-account {
+        display: flex;
+        flex-direction: column;
+        gap: var(--wg-space-xs);
+    }
+
+    .domain-account-label {
+        color: var(--wg-text-muted);
+        font: var(--wg-text-label-md);
+    }
+
+    .domain-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: var(--wg-space-sm);
     }
 
     canvas {

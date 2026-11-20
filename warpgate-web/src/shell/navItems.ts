@@ -18,6 +18,11 @@ export interface NavItem {
     href: string
     /** Route prefix that marks this item active. */
     match: string
+    /**
+     * Further route prefixes under this item: screens with no item of their
+     * own that are reached from this one, such as a session's recordings.
+     */
+    alsoMatch?: string[]
     icon: string
     requires?: AdminPermissionKey
 }
@@ -63,6 +68,7 @@ export const NAV_SECTIONS: NavSection[] = [
                 label: 'Sessions',
                 href: '#/status/sessions',
                 match: '/status/sessions',
+                alsoMatch: ['/status/recordings'],
                 icon: ICONS.sessions,
                 requires: 'sessionsView',
             },
@@ -231,15 +237,16 @@ export function activeItemId(
     path: string,
 ): string | undefined {
     let best: NavItem | undefined
+    let bestLength = -1
     for (const section of sections) {
         for (const item of section.items) {
-            const exact = path === item.match
-            const child = path.startsWith(`${item.match}/`)
-            if (
-                (exact || child) &&
-                (!best || item.match.length > best.match.length)
-            ) {
-                best = item
+            for (const prefix of [item.match, ...(item.alsoMatch ?? [])]) {
+                const exact = path === prefix
+                const child = path.startsWith(`${prefix}/`)
+                if ((exact || child) && prefix.length > bestLength) {
+                    best = item
+                    bestLength = prefix.length
+                }
             }
         }
     }

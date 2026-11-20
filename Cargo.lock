@@ -9421,6 +9421,7 @@ dependencies = [
  "warpgate-sso",
  "warpgate-tls",
  "webpki",
+ "zeroize",
  "zune-jpeg",
 ]
 

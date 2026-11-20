@@ -308,16 +308,22 @@ export function makeExampleKubectlCommand(_opt: ConnectionOptions): string {
 
 export interface ProtocolProperties {
     sessionsCanBeClosed: boolean
+    /**
+     * Whether Warpgate records sessions over the protocol at all (shells and
+     * forwarded connections over SSH, pods and API calls on Kubernetes,
+     * desktops), when recording is on. HTTP and database sessions never are.
+     */
+    sessionsAreRecorded: boolean
 }
 
 export const PROTOCOL_PROPERTIES: Record<string, ProtocolProperties> = {
-    SSH: { sessionsCanBeClosed: true },
-    HTTP: { sessionsCanBeClosed: true },
-    MySQL: { sessionsCanBeClosed: true },
-    PostgreSQL: { sessionsCanBeClosed: true },
-    Kubernetes: { sessionsCanBeClosed: false },
-    VNC: { sessionsCanBeClosed: true },
-    RDP: { sessionsCanBeClosed: true },
+    SSH: { sessionsCanBeClosed: true, sessionsAreRecorded: true },
+    HTTP: { sessionsCanBeClosed: true, sessionsAreRecorded: false },
+    MySQL: { sessionsCanBeClosed: true, sessionsAreRecorded: false },
+    PostgreSQL: { sessionsCanBeClosed: true, sessionsAreRecorded: false },
+    Kubernetes: { sessionsCanBeClosed: false, sessionsAreRecorded: true },
+    VNC: { sessionsCanBeClosed: true, sessionsAreRecorded: true },
+    RDP: { sessionsCanBeClosed: true, sessionsAreRecorded: true },
 }
 
 export type ProtocolID =

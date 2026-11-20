@@ -15,6 +15,10 @@
 //! the viewer while recording them — so native RDP records exactly like the in-browser
 //! path. A viewer that sends no password, as mstsc does without a saved credential, signs
 //! in on Warpgate's own sign-in screen instead (the `sign_in` module).
+//!
+//! A target that signs in with the viewer's own domain account asks, once the viewer is
+//! admitted to it, for the viewer's domain password on the same kind of screen
+//! ([`ask_domain_password`]), and dials the target with it.
 
 use std::io;
 use std::net::SocketAddr;
@@ -29,13 +33,17 @@ use futures::future::BoxFuture;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, DuplexStream};
 use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel};
 use tokio::sync::oneshot;
-use tokio::time::{Instant, timeout, timeout_at};
+use tokio::time::{Instant, sleep, timeout, timeout_at};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 use warpgate_common::helpers::net::accept_loop;
 use warpgate_common::{ListenEndpoint, TargetRdpOptions, WarpgateError};
+use warpgate_core::domain_account::{
+    DomainCredentials, Zeroizing, find_domain_account, uses_domain_account, verify_domain_password,
+};
 use warpgate_core::recordings::DesktopRecorder;
 use warpgate_core::{
-    DesktopInput, Services, State, TargetAuthorization, UserSessionStateInit, WarpgateServerHandle,
+    AdmittedTarget, DesktopInput, Services, State, TargetAuthorization, UserSessionStateInit,
+    WarpgateServerHandle,
 };
 use warpgate_db_entities::Parameters;
 use warpgate_desktop_ui::{DEFAULT_SCREEN_H, DEFAULT_SCREEN_W};
@@ -87,6 +95,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 /// server's last PDUs to reach the viewer and the viewer to hang up. Generous: a viewer
 /// that has them disconnects within a round trip.
 const RELAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the domain password screen shows why the connection cannot go on (a disabled or
+/// locked account, say) before the viewer is disconnected, for the viewer to read it.
+const FINAL_ERROR_HOLD: Duration = Duration::from_secs(6);
 
 /// Handles to the connected target-side RDP client, kept once authentication succeeds.
 struct BackendBridge {
@@ -810,18 +822,113 @@ async fn dial_if_pending(
             }
             Err(error) => return Err(error.into()),
         };
-        *backend = Some(
-            connect_backend(
-                viewer.services,
-                viewer.server_in_tx,
-                admitted,
-                *screen,
-                viewer.keyboard_layout.load(Ordering::Relaxed),
-            )
-            .await?,
-        );
+
+        // A target that signs in with the viewer's own domain account needs its password,
+        // asked for now: after admission, so nobody types one for a session that is not
+        // approved, and before the recording starts, so the keystrokes are never recorded.
+        let (domain_credentials, clipboard) = if uses_domain_account(admitted.options()) {
+            match ask_domain_password(viewer, &admitted, events, screen).await? {
+                Some((credentials, clipboard)) => (Some(credentials), clipboard),
+                None => return Ok(false),
+            }
+        } else {
+            (None, None)
+        };
+
+        let connected = connect_backend(
+            viewer.services,
+            viewer.server_in_tx,
+            admitted,
+            *screen,
+            viewer.keyboard_layout.load(Ordering::Relaxed),
+            domain_credentials,
+        )
+        .await?;
+
+        // The viewer's clipboard text, which the password screen took on its way to the
+        // target: recorded and forwarded as any other input.
+        if let Some(text) = clipboard {
+            let input = DesktopInput::Clipboard(text);
+            if let Some(recorder) = &connected.recorder
+                && let Err(error) = recorder.write_input(&input).await
+            {
+                warn!(%error, "Failed to record RDP viewer input");
+            }
+            let _ = connected.input_tx.send(input).await;
+        }
+        *backend = Some(connected);
     }
     Ok(true)
+}
+
+/// Ask the viewer for its own domain password, for a target that signs in with the viewer's
+/// directory account, and check it with the directory.
+///
+/// The account is the one the viewer's Warpgate user is linked to, shown read-only, so
+/// nothing typed here signs in as anyone else. Each refused password says why (wrong
+/// password, locked or disabled account, ...), as it is the viewer's own; a password the
+/// directory cannot accept at all ends the session, and so does the third wrong one, well
+/// before a typical lockout threshold. A clipboard pasted into the form is not passed on.
+///
+/// `None` once the session is over: the viewer left, or was refused (and told why).
+async fn ask_domain_password(
+    viewer: &Viewer<'_>,
+    admitted: &AdmittedTarget<TargetRdpOptions>,
+    events: &mut UnboundedReceiver<ServerEvent>,
+    screen: &mut warpgate_desktop_ui::Screen,
+) -> Result<Option<(DomainCredentials, Option<String>)>> {
+    let db = &viewer.services.db;
+    let user_id = admitted.user_info().id;
+    let options = admitted.options();
+    let target = admitted.target().name.as_str();
+
+    let account = match find_domain_account(db, user_id, options).await {
+        Ok(account) => account,
+        Err(error) => {
+            warn!(%error, "No domain account to sign in to the target with");
+            let mut form = SignInScreen::for_domain_password(target, "", *screen);
+            form.show_final_error(viewer.server_in_tx, error.user_message())
+                .await?;
+            sleep(FINAL_ERROR_HOLD).await;
+            viewer.refuse(Refusal::Denied).await;
+            return Ok(None);
+        }
+    };
+
+    info!(account = %account.display_name(), "Asking for the domain password for the target");
+    let mut form = SignInScreen::for_domain_password(target, &account.display_name(), *screen);
+    loop {
+        let password = match form
+            .next_submission(events, viewer.server_in_tx, screen)
+            .await?
+        {
+            SignInStep::Submitted(Submission { password, .. }) => Zeroizing::new(password),
+            SignInStep::Disconnected => return Ok(None),
+            SignInStep::TimedOut => {
+                warn!("The viewer did not enter its domain password in time");
+                viewer.refuse(Refusal::TimedOut).await;
+                return Ok(None);
+            }
+        };
+        form.show_checking(viewer.server_in_tx).await?;
+        // `verify_domain_password` logs the directory's answer, without the password.
+        let error = match verify_domain_password(db, user_id, options, password).await {
+            Ok(credentials) => return Ok(Some((credentials, form.into_clipboard()))),
+            Err(error) => error,
+        };
+        if !error.may_retry() {
+            form.show_final_error(viewer.server_in_tx, error.user_message())
+                .await?;
+            sleep(FINAL_ERROR_HOLD).await;
+            viewer.refuse(Refusal::Denied).await;
+            return Ok(None);
+        }
+        if !form.refused_with(error.user_message()) {
+            warn!("Too many refused domain passwords");
+            viewer.refuse(Refusal::Denied).await;
+            return Ok(None);
+        }
+    }
 }
 
 #[cfg(test)]

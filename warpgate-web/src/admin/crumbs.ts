@@ -15,8 +15,17 @@ const LEAF_LABELS: Record<string, string> = {
     credentials: 'Credentials',
 }
 
+/**
+ * The leaf of a screen reached under another item's crumb (a nav item's
+ * `alsoMatch`): a recording sits under Sessions.
+ */
+const ALSO_MATCH_LEAVES: Record<string, string> = {
+    '/status/recordings': 'Recording',
+}
+
 export function crumbsFor(path: string, leaf?: Crumb): Crumb[] {
     const crumbs: Crumb[] = []
+    let alsoMatchLeaf: string | undefined
 
     for (const section of NAV_SECTIONS) {
         for (const item of section.items) {
@@ -25,6 +34,12 @@ export function crumbsFor(path: string, leaf?: Crumb): Crumb[] {
                     label: item.label,
                     href: path === item.match ? undefined : item.href,
                 })
+            }
+            for (const prefix of item.alsoMatch ?? []) {
+                if (path === prefix || path.startsWith(`${prefix}/`)) {
+                    crumbs.push({ label: item.label, href: item.href })
+                    alsoMatchLeaf = ALSO_MATCH_LEAVES[prefix]
+                }
             }
         }
     }
@@ -36,6 +51,11 @@ export function crumbsFor(path: string, leaf?: Crumb): Crumb[] {
 
     if (leaf) {
         crumbs.push(leaf)
+        return crumbs
+    }
+
+    if (alsoMatchLeaf && crumbs.length) {
+        crumbs.push({ label: alsoMatchLeaf })
         return crumbs
     }
 

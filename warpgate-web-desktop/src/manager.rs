@@ -9,6 +9,7 @@ use futures::stream::{FuturesOrdered, StreamExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info_span, warn};
 use warpgate_common::{TargetOptions, UserSessionId, WarpgateError};
+use warpgate_core::domain_account::DomainCredentials;
 use warpgate_core::recordings::{DesktopRecorder, DesktopRecordingMetadata};
 use warpgate_core::{
     AdmittedTarget, DesktopClientHandles, DesktopConnectionError, DesktopEvent, Services,
@@ -40,12 +41,15 @@ impl WebDesktopClientManager {
         Self::default()
     }
 
+    /// `domain_credentials` signs in to a target that takes the user's own directory account:
+    /// checked against the directory already, and held only until the target is connected.
     pub async fn create_session(
         &self,
         services: &Services,
         authorization: TargetAuthorization,
         remote_address: Option<SocketAddr>,
         size: Option<(u16, u16)>,
+        domain_credentials: Option<DomainCredentials>,
     ) -> Result<UserSessionId, WarpgateError> {
         let user_id = authorization.user_info().id;
         let username = authorization.user_info().username.clone();
@@ -83,6 +87,7 @@ impl WebDesktopClientManager {
                 authorization,
                 remote_address,
                 size,
+                domain_credentials,
                 self.0.clone(),
                 services.clone(),
             )
@@ -100,20 +105,30 @@ async fn run_session(
     authorization: TargetAuthorization,
     remote_address: Option<SocketAddr>,
     size: Option<(u16, u16)>,
+    domain_credentials: Option<DomainCredentials>,
     registry: ClientManager<WebDesktopSession>,
     services: Services,
 ) {
+    let (session_ref, services_ref) = (&session, &services);
     run_web_client_lifecycle(
         &session,
         registry,
         &services,
         authorization,
         remote_address,
-        |admitted| async {
-            let (handles, recorder, encode_jpeg) = connect(&session, &services, admitted, size)
-                .await
-                .map_err(|e| Arc::new(DesktopConnectionError::from(e)))?;
-            relay_events(&session, handles, recorder, encode_jpeg).await
+        // Moves the credentials in: a session refused or abandoned before it connects drops
+        // them with this closure, unused.
+        move |admitted| async move {
+            let (handles, recorder, encode_jpeg) = connect(
+                session_ref,
+                services_ref,
+                admitted,
+                size,
+                domain_credentials,
+            )
+            .await
+            .map_err(|e| Arc::new(DesktopConnectionError::from(e)))?;
+            relay_events(session_ref, handles, recorder, encode_jpeg).await
         },
     )
     .await;
@@ -125,6 +140,7 @@ async fn connect(
     services: &Services,
     admitted: AdmittedTarget,
     size: Option<(u16, u16)>,
+    domain_credentials: Option<DomainCredentials>,
 ) -> Result<(DesktopClientHandles, Option<Arc<DesktopRecorder>>, bool), WarpgateError> {
     let target_session_id = admitted.id();
     let (handles, encode_jpeg) = match session.target_kind() {
@@ -147,6 +163,7 @@ async fn connect(
                 admitted.narrow()?,
                 size.unwrap_or(warpgate_protocol_rdp::DEFAULT_SIZE),
                 services.secret_backends.clone(),
+                domain_credentials,
             )?;
             // The RDP helper only ever emits raw BGRA.
             (handles, true)

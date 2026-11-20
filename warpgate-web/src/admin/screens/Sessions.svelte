@@ -14,11 +14,18 @@
      * Columns follow warpgate_sessions_list. "Duration" is computed from
      * started/ended, which the API does provide; nothing here is derived from
      * data that does not exist.
+     *
+     * Recording, for an administrator who may view recordings (the API sends
+     * recordings to no one else, and refuses the filter): one click from the
+     * list to the player, through status/RecordingAction. "Has recording"
+     * narrows the list to sessions with any recording, on the server, so the
+     * pages and the total stay right.
      */
     import { api, type UserSessionSnapshot } from 'admin/lib/api'
     import { autosave } from 'common/autosave'
     import GettingStarted from 'common/GettingStarted.svelte'
     import type { LoadOptions, PaginatedResponse } from 'common/ItemList.svelte'
+    import { sessionRecordingStatus } from 'common/recordings'
     import { formatDistanceStrict } from 'date-fns'
     import { serverInfo } from 'gateway/lib/store'
     import {
@@ -42,6 +49,7 @@
     import { toast } from 'ui/toasts.svelte'
     import PermissionGate from '../lib/PermissionGate.svelte'
     import { adminPermissions } from '../lib/store'
+    import RecordingAction from '../status/RecordingAction.svelte'
 
     let [showActiveOnly, showActiveOnly$] = autosave(
         'sessions-list:show-active-only',
@@ -51,6 +59,12 @@
         'sessions-list:show-logged-in-only',
         true,
     )
+    let [showRecordedOnly, showRecordedOnly$] = autosave(
+        'sessions-list:show-recorded-only',
+        false,
+    )
+
+    const canViewRecordings = $derived($adminPermissions.recordingsView)
 
     let activeSessionCount: number | undefined = $state()
     let closeAllOpen = $state(false)
@@ -70,16 +84,28 @@
         return combineLatest([
             showActiveOnly$,
             showLoggedInOnly$,
+            showRecordedOnly$,
             merge(timer(0, 60000), sessionChanges$),
         ]).pipe(
-            switchMap(([activeOnly, loggedInOnly]) => {
+            switchMap(([activeOnly, loggedInOnly, recordedOnly]) => {
                 api.getSessions({ activeOnly: true, limit: 1 }).then(
                     response => {
                         activeSessionCount = response.total
                     },
                 )
                 return from(
-                    api.getSessions({ activeOnly, loggedInOnly, ...opt }),
+                    api.getSessions({
+                        activeOnly,
+                        loggedInOnly,
+                        // A choice saved in this browser by someone who may
+                        // view recordings is not one this administrator can
+                        // make: the server would refuse the whole list.
+                        hasRecording:
+                            recordedOnly && $adminPermissions.recordingsView
+                                ? true
+                                : undefined,
+                        ...opt,
+                    }),
                 )
             }),
         )
@@ -95,7 +121,7 @@
         await reloadCount()
     }
 
-    const columns: Column[] = [
+    const baseColumns: Column[] = [
         { key: 'status', label: 'Status', width: '10rem' },
         { key: 'user', label: 'User', sortable: true },
         { key: 'target', label: 'Target' },
@@ -104,6 +130,15 @@
         { key: 'started', label: 'Started', width: '11rem' },
         { key: 'duration', label: 'Duration', width: '8rem', align: 'end' },
     ]
+    // Last, where DESIGN.md anchors a row's actions.
+    const columns: Column[] = $derived(
+        canViewRecordings
+            ? [
+                  ...baseColumns,
+                  { key: 'recording', label: 'Recording', width: '9.5rem' },
+              ]
+            : baseColumns,
+    )
 
     function userOf(session: UserSessionSnapshot): string {
         return (
@@ -184,6 +219,13 @@
                 size="compact"
                 bind:checked={$showLoggedInOnly}
             />
+            {#if canViewRecordings}
+                <Toggle
+                    label="Has recording"
+                    size="compact"
+                    bind:checked={$showRecordedOnly}
+                />
+            {/if}
         {/snippet}
 
         {#snippet row(session)}
@@ -200,14 +242,34 @@
             <td class="wg-mono">{session.remoteAddress ?? '—'}</td>
             <td><RelativeDate date={session.started} /></td>
             <td class="num">{durationOf(session)}</td>
+            {#if canViewRecordings}
+                <td>
+                    <RecordingAction
+                        status={sessionRecordingStatus(
+                            session.recordings,
+                            session.recordingCount,
+                        )}
+                        session={session.id}
+                        context="{userOf(session)} on {targetsOf(session)}"
+                    />
+                </td>
+            {/if}
         {/snippet}
 
         {#snippet empty()}
-            <EmptyState
-                size="compact"
-                title="No sessions"
-                hint="Connections appear here as soon as a user opens one."
-            />
+            {#if canViewRecordings && $showRecordedOnly}
+                <EmptyState
+                    size="compact"
+                    title="No recorded sessions"
+                    hint="Turn off Has recording to see every session."
+                />
+            {:else}
+                <EmptyState
+                    size="compact"
+                    title="No sessions"
+                    hint="Connections appear here as soon as a user opens one."
+                />
+            {/if}
         {/snippet}
     </Table>
 </PermissionGate>

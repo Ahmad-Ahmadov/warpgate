@@ -20,6 +20,7 @@ pub use server::bind_server;
 use tokio::sync::mpsc::{channel, unbounded_channel};
 use tracing::{Instrument, error, info_span};
 use warpgate_common::{ListenEndpoint, Protocol, SecretResolver, TargetRdpOptions, WarpgateError};
+use warpgate_core::domain_account::DomainCredentials;
 use warpgate_core::{
     AdmittedTarget, DESKTOP_INPUT_CHANNEL_CAPACITY, DesktopClientHandles, DesktopEvent,
     DesktopInput, DesktopState, LogonState, ProtocolServer, Services,
@@ -84,12 +85,17 @@ impl std::fmt::Debug for RdpProtocolServer {
 }
 
 /// Start an RDP client for a target and bridge it to normalised desktop streams.
+///
+/// `domain_credentials` is what a target that signs users in as their own directory account
+/// is signed in to with: the user's account and the password they typed, already checked
+/// against the directory. `None` for a target with a stored password.
 pub fn connect(
     admitted: AdmittedTarget<TargetRdpOptions>,
     size: (u16, u16),
     secrets: Arc<dyn SecretResolver>,
+    domain_credentials: Option<DomainCredentials>,
 ) -> Result<DesktopClientHandles, WarpgateError> {
-    connect_with_keyboard_layout(admitted, size, secrets, 0)
+    connect_with_keyboard_layout(admitted, size, secrets, 0, domain_credentials)
 }
 
 /// [`connect`], telling the target the viewer's keyboard layout: a Windows KLID such as
@@ -101,6 +107,7 @@ pub fn connect_with_keyboard_layout(
     size: (u16, u16),
     secrets: Arc<dyn SecretResolver>,
     keyboard_layout: u32,
+    domain_credentials: Option<DomainCredentials>,
 ) -> Result<DesktopClientHandles, WarpgateError> {
     let target_session_id = admitted.id();
     let (user_info, target) = admitted.into_approved().into_parts();
@@ -137,6 +144,7 @@ pub fn connect_with_keyboard_layout(
                 abort_rx,
                 logon,
                 secrets,
+                domain_credentials,
             )
             .await
             {

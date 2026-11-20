@@ -12,8 +12,15 @@
      *     servers almost always present self-signed certificates; that is a
      *     legitimate default and worth stating rather than leaving as an
      *     unexplained unchecked box
+     *
+     * Authentication is a stored password (kept by Warpgate, or a Vault
+     * reference) or the connecting user's own domain account, which keeps no
+     * password at all: each user types theirs when connecting. `setAuthKind`
+     * replaces the whole auth object, as the VNC editor does, because the two
+     * carry different shapes.
      */
     import {
+        RdpDomainUsernameFormat,
         RdpTargetCompression,
         RdpTlsSecurity,
         type TargetOptionsTargetRdpOptions,
@@ -57,6 +64,38 @@
     const unsafeTls = $derived(
         options.tlsSecurity === RdpTlsSecurity.Tls10Unsafe,
     )
+
+    type AuthKind = 'Password' | 'DomainAccount'
+
+    const AUTH_KINDS: { value: AuthKind; label: string }[] = [
+        { value: 'Password', label: 'Stored password (managed or Vault)' },
+        { value: 'DomainAccount', label: 'Use my domain account' },
+    ]
+
+    const USERNAME_FORMATS = [
+        {
+            value: RdpDomainUsernameFormat.Upn,
+            label: 'User principal name (alice@corp.example.com)',
+        },
+        {
+            value: RdpDomainUsernameFormat.DownLevel,
+            label: 'Down-level logon name (CORP\\alice)',
+        },
+    ]
+
+    function setAuthKind(kind: AuthKind) {
+        if (kind === options.auth.kind) {
+            return
+        }
+        if (kind === 'DomainAccount') {
+            options.auth = {
+                kind: 'DomainAccount',
+                usernameFormat: RdpDomainUsernameFormat.Upn,
+            }
+        } else {
+            options.auth = { kind: 'Password', password: '' }
+        }
+    }
 </script>
 
 <h5>Connection</h5>
@@ -80,10 +119,43 @@
 
 <h5>Authentication</h5>
 
-<div class="row">
-    <Input label="Username" mono bind:value={options.username} />
-    <Input label="Domain" mono hint="Optional." bind:value={options.domain} />
-</div>
+<Select
+    label="Sign in with"
+    options={AUTH_KINDS}
+    value={options.auth.kind}
+    disabled={!$adminPermissions.targetsEdit}
+    onchange={e =>
+        setAuthKind((e.target as HTMLSelectElement).value as AuthKind)}
+/>
+
+{#if options.auth.kind === 'DomainAccount'}
+    <Callout title="Each user signs in as their own domain account">
+        Users linked to an LDAP / Active Directory server type their domain
+        password when they connect, in the browser or in their RDP client. The
+        account comes from the directory, not from the user, and the password
+        is checked with the directory, used for that one connection and never
+        stored. Users who are not linked to a directory cannot connect.
+    </Callout>
+
+    <div class="row">
+        <Select
+            label="Account name sent to the target"
+            options={USERNAME_FORMATS}
+            bind:value={options.auth.usernameFormat}
+        />
+        <Input
+            label="Domain"
+            mono
+            hint="Optional. For the down-level name; defaults to the directory's DNS domain."
+            bind:value={options.domain}
+        />
+    </div>
+{:else}
+    <div class="row">
+        <Input label="Username" mono bind:value={options.username} />
+        <Input label="Domain" mono hint="Optional." bind:value={options.domain} />
+    </div>
+{/if}
 
 <!-- Upstream #2754. -->
 <Input

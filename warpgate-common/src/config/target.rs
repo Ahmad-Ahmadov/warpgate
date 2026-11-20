@@ -350,11 +350,42 @@ pub enum RdpTlsSecurity {
 pub enum RdpTargetAuth {
     #[serde(rename = "password")]
     Password(RdpTargetPasswordAuth),
+    /// Each user signs in to the target as their own directory (Active Directory) account,
+    /// with the password they type when connecting. Warpgate keeps no password for it.
+    #[serde(rename = "domain_account")]
+    DomainAccount(RdpTargetDomainAccountAuth),
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Object)]
 pub struct RdpTargetPasswordAuth {
     pub password: MaybeSecretRef,
+}
+
+/// Sign in as the connecting user's own directory account: the account their Warpgate user
+/// is linked to, which the user cannot choose, and a password they type, which is checked
+/// against the directory and used for this one connection only.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Object, Default)]
+pub struct RdpTargetDomainAccountAuth {
+    // How the account is named to the target. A plain comment: a field description wraps
+    // the enum in allOf, which typescript-fetch misgenerates. Optional in the API too.
+    #[serde(default)]
+    #[oai(default)]
+    pub username_format: RdpDomainUsernameFormat,
+}
+
+/// How a directory account is named to an RDP target.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default, Enum)]
+pub enum RdpDomainUsernameFormat {
+    /// `alice@corp.example.com`, the account's user principal name.
+    #[default]
+    #[serde(rename = "upn")]
+    #[oai(rename = "upn")]
+    Upn,
+    /// `CORP\alice`: the account name, with the target's domain, or the directory's DNS
+    /// domain where the target has none.
+    #[serde(rename = "down_level")]
+    #[oai(rename = "down_level")]
+    DownLevel,
 }
 
 impl Default for RdpTargetAuth {
@@ -563,8 +594,11 @@ impl TargetSecrets for TargetVncOptions {
 
 impl TargetSecrets for TargetRdpOptions {
     fn secrets_mut(&mut self) -> Vec<&mut MaybeSecretRef> {
-        let RdpTargetAuth::Password(auth) = &mut self.auth;
-        vec![&mut auth.password]
+        match &mut self.auth {
+            RdpTargetAuth::Password(auth) => vec![&mut auth.password],
+            // The password is the user's, typed when connecting, and never stored.
+            RdpTargetAuth::DomainAccount(_) => vec![],
+        }
     }
 }
 
@@ -915,5 +949,32 @@ mod tests {
     #[test]
     fn malformed_reference_is_a_stored_secret() {
         assert_eq!(malformed_options().stored_secrets_mut().len(), 1);
+    }
+
+    /// A domain-account target stores no password, so it has no secret to encrypt or resolve,
+    /// and its username format defaults to the UPN when the stored options predate it.
+    #[test]
+    fn a_domain_account_target_keeps_no_secret() {
+        use super::{
+            RdpDomainUsernameFormat, RdpTargetAuth, RdpTargetDomainAccountAuth, TargetSecrets,
+        };
+
+        let mut rdp: TargetRdpOptions =
+            serde_json::from_str(r#"{"auth":{"kind":"domain_account"}}"#).unwrap();
+        assert_eq!(
+            rdp.auth,
+            RdpTargetAuth::DomainAccount(RdpTargetDomainAccountAuth {
+                username_format: RdpDomainUsernameFormat::Upn,
+            })
+        );
+        assert!(rdp.secrets_mut().is_empty());
+
+        let rdp: TargetRdpOptions = serde_json::from_str(
+            r#"{"auth":{"kind":"domain_account","username_format":"down_level"}}"#,
+        )
+        .unwrap();
+        let json = serde_json::to_value(&rdp.auth).unwrap();
+        assert_eq!(json["kind"], "domain_account");
+        assert_eq!(json["username_format"], "down_level");
     }
 }

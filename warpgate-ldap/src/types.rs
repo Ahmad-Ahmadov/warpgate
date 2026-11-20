@@ -68,6 +68,12 @@ pub struct LdapUser {
     /// parsed. Never the password or anything derived from it.
     #[serde(default)]
     pub password_last_set: Option<String>,
+    /// Active Directory's pre-Windows 2000 account name (`alice`), when the entry has one.
+    #[serde(default)]
+    pub sam_account_name: Option<String>,
+    /// The entry's user principal name (`alice@corp.example.com`), when it has one.
+    #[serde(default)]
+    pub user_principal_name: Option<String>,
 }
 
 /// The answer to a user's password, from [`crate::authenticate_user`].

@@ -10,6 +10,9 @@
 //! password for a wrong one, refusing the connection and counting a failed attempt, so mstsc
 //! could not connect at all without "Allow me to save credentials". It now shows this form,
 //! and checks what is typed into it exactly as it checks a password from the Client Info PDU.
+//!
+//! The same form, with the account filled in and fixed, asks for the viewer's own domain
+//! password for a target that signs in with it ([`SignInScreen::for_domain_password`]).
 
 use std::time::Duration;
 
@@ -17,6 +20,7 @@ use anyhow::Result;
 use tokio::sync::mpsc::{Sender, UnboundedReceiver};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
 use warpgate_common::consts::TICKET_SELECTOR_PREFIX;
+use warpgate_core::domain_account::{MAX_DOMAIN_PASSWORD_CHARS, Zeroize as _};
 use warpgate_core::{DesktopInput, Scancode};
 use warpgate_desktop_ui::{self as ui, SignInField, SignInNotice, SignInPrompt};
 
@@ -39,6 +43,7 @@ const MAX_FIELD_CHARS: usize = 256;
 /// them apart here would confirm a password to anyone who pairs it with a made-up target.
 const REFUSED: &str = "Sign-in failed. Check the username, target and password";
 const CHECKING: &str = "Signing in...";
+const CHECKING_DOMAIN_PASSWORD: &str = "Checking your domain password...";
 
 /// Whether the viewer has to sign in on the form: it sent no password, and its username is
 /// not a ticket, which needs none.
@@ -64,6 +69,9 @@ pub(super) enum SignInStep {
 /// The sign-in form on the viewer's screen.
 pub(super) struct SignInScreen {
     form: Form,
+    /// The target, when the form asks for the viewer's domain password to sign in to it
+    /// rather than for Warpgate credentials.
+    domain_target: Option<String>,
     keyboard: Keyboard,
     painter: HoldPainter,
     /// Whether the form has changed since it was last painted. It is painted only then:
@@ -85,8 +93,24 @@ impl SignInScreen {
     /// A form with `username` filled in: what the viewer's Client Info PDU carried, as
     /// mstsc sends the username it was given even when it has no password.
     pub(super) fn new(username: &str, screen: ui::Screen) -> Self {
+        Self::with_form(Form::new(username), None, screen)
+    }
+
+    /// A form asking for the viewer's own domain password, to sign in to `target` as
+    /// `account`. The account is shown and cannot be edited: it is the directory's, not the
+    /// viewer's to choose. A submission's `username` is that account, unchanged.
+    pub(super) fn for_domain_password(target: &str, account: &str, screen: ui::Screen) -> Self {
+        Self::with_form(
+            Form::for_domain_password(account),
+            Some(target.to_owned()),
+            screen,
+        )
+    }
+
+    fn with_form(form: Form, domain_target: Option<String>, screen: ui::Screen) -> Self {
         Self {
-            form: Form::new(username),
+            form,
+            domain_target,
             keyboard: Keyboard::default(),
             painter: HoldPainter::new(screen),
             dirty: true,
@@ -134,18 +158,40 @@ impl SignInScreen {
     /// Show that the submitted credentials are being checked. That can take a moment (an
     /// LDAP bind, say), and the form is not repainted meanwhile.
     pub(super) async fn show_checking(&mut self, server_in_tx: &Sender<ServerInput>) -> Result<()> {
-        self.form.notice = Some(SignInNotice::Info(CHECKING));
+        self.form.notice = Some(SignInNotice::Info(if self.domain_target.is_some() {
+            CHECKING_DOMAIN_PASSWORD
+        } else {
+            CHECKING
+        }));
         self.paint(server_in_tx).await
     }
 
     /// Report a refused attempt. Returns `false` once the viewer has used up its
     /// [`MAX_SIGN_IN_ATTEMPTS`].
     pub(super) fn refused(&mut self) -> bool {
+        self.refused_with(REFUSED)
+    }
+
+    /// Report a refused attempt with `notice`, which says why. For the domain password,
+    /// where the directory's answer is the viewer's own business: their password, their
+    /// account. Returns `false` once the viewer has used up its [`MAX_SIGN_IN_ATTEMPTS`].
+    pub(super) fn refused_with(&mut self, notice: &'static str) -> bool {
         self.failures += 1;
         self.form.focus = SignInField::Password;
-        self.form.notice = Some(SignInNotice::Error(REFUSED));
+        self.form.notice = Some(SignInNotice::Error(notice));
         self.dirty = true;
         self.failures < MAX_SIGN_IN_ATTEMPTS
+    }
+
+    /// Show `notice` as the form's last word, before the session is ended: no further
+    /// attempt is taken.
+    pub(super) async fn show_final_error(
+        &mut self,
+        server_in_tx: &Sender<ServerInput>,
+        notice: &'static str,
+    ) -> Result<()> {
+        self.form.notice = Some(SignInNotice::Error(notice));
+        self.paint(server_in_tx).await
     }
 
     /// The viewer's clipboard text, for the target: the form took the event that would have
@@ -219,9 +265,19 @@ impl SignInScreen {
     async fn paint(&mut self, server_in_tx: &Sender<ServerInput>) -> Result<()> {
         self.dirty = false;
         let prompt = self.form.prompt();
+        let domain_target = self.domain_target.as_deref();
         self.painter
-            .paint(server_in_tx, |screen, _tick| {
-                ui::render_sign_in(screen, &prompt)
+            .paint(server_in_tx, |screen, _tick| match domain_target {
+                None => ui::render_sign_in(screen, &prompt),
+                Some(target) => ui::render_domain_password(
+                    screen,
+                    &ui::DomainPasswordPrompt {
+                        target,
+                        account: prompt.username,
+                        password_len: prompt.password_len,
+                        notice: prompt.notice,
+                    },
+                ),
             })
             .await
     }
@@ -252,12 +308,22 @@ enum Edit {
     Submit,
 }
 
-/// The form's content. The password is kept only until it is submitted.
+/// The form's content. The password is kept only until it is submitted, and wiped if the
+/// form goes away with one typed.
 struct Form {
     username: String,
     password: String,
     focus: SignInField,
     notice: Option<SignInNotice<'static>>,
+    /// The username is an account the form was given, not one to type: the focus stays on
+    /// the password, and only a password is asked for.
+    account_fixed: bool,
+}
+
+impl Drop for Form {
+    fn drop(&mut self) {
+        self.password.zeroize();
+    }
 }
 
 impl Form {
@@ -275,6 +341,19 @@ impl Form {
             password: String::new(),
             focus,
             notice: None,
+            account_fixed: false,
+        }
+    }
+
+    fn for_domain_password(account: &str) -> Self {
+        Self {
+            username: account.to_owned(),
+            // Room for the longest password up front, so typing it never reallocates and
+            // leaves a copy of its beginning behind in freed memory.
+            password: String::with_capacity(MAX_DOMAIN_PASSWORD_CHARS * 4),
+            focus: SignInField::Password,
+            notice: None,
+            account_fixed: true,
         }
     }
 
@@ -302,6 +381,7 @@ impl Form {
                 self.notice = None;
                 self.field_mut().clear();
             }
+            Edit::Next | Edit::Previous | Edit::Focus(_) if self.account_fixed => {}
             Edit::Next | Edit::Previous => {
                 self.focus = match self.focus {
                     SignInField::Username => SignInField::Password,
@@ -318,6 +398,18 @@ impl Form {
 
     /// The credentials to check, or `None` with the form told what is missing.
     fn submit(&mut self) -> Option<Submission> {
+        if self.account_fixed {
+            if self.password.is_empty() {
+                self.notice = Some(SignInNotice::Error("Enter your domain password"));
+                return None;
+            }
+            // Swapped for another buffer with room for a whole password, for a retry.
+            let password = String::with_capacity(MAX_DOMAIN_PASSWORD_CHARS * 4);
+            return Some(Submission {
+                username: self.username.clone(),
+                password: std::mem::replace(&mut self.password, password),
+            });
+        }
         let username = signed_in_name(&self.username);
         let ticket = username.starts_with(TICKET_SELECTOR_PREFIX);
         let missing = if username.is_empty() {
@@ -1143,5 +1235,61 @@ mod tests {
         assert!(!sign_in.refused());
         assert_eq!(sign_in.form.notice, Some(SignInNotice::Error(REFUSED)));
         assert_eq!(sign_in.form.focus, SignInField::Password);
+    }
+
+    /// The domain password form asks for the password alone: the account is the directory's,
+    /// and no key or click moves the focus to it, let alone edits it.
+    #[test]
+    fn the_domain_account_cannot_be_edited() {
+        let mut form = Form::for_domain_password(r"CORP\alice");
+        for edit in [
+            Edit::Next,
+            Edit::Previous,
+            Edit::Focus(SignInField::Username),
+        ] {
+            form.apply(edit);
+            assert_eq!(form.focus, SignInField::Password);
+        }
+        assert!(form.apply(Edit::Submit).is_none());
+        assert_eq!(
+            form.notice,
+            Some(SignInNotice::Error("Enter your domain password"))
+        );
+        for c in "s3cret".chars() {
+            form.apply(Edit::Type(c));
+        }
+        let submission = form.apply(Edit::Submit).unwrap();
+        assert_eq!(submission.username, r"CORP\alice");
+        assert_eq!(submission.password, "s3cret");
+        assert!(form.password.is_empty());
+        assert!(form.password.capacity() >= MAX_DOMAIN_PASSWORD_CHARS);
+    }
+
+    #[test]
+    fn a_refused_domain_password_says_why() {
+        let mut sign_in =
+            SignInScreen::for_domain_password("server", "alice@corp.example.com", screen());
+        assert!(sign_in.refused_with("The domain password is incorrect"));
+        assert_eq!(
+            sign_in.form.notice,
+            Some(SignInNotice::Error("The domain password is incorrect"))
+        );
+        assert!(sign_in.refused_with("The domain password is incorrect"));
+        assert!(!sign_in.refused_with("The domain password is incorrect"));
+    }
+
+    #[tokio::test]
+    async fn typing_the_domain_password_submits_it() {
+        let (tx, mut events) = unbounded_channel();
+        let mut sign_in =
+            SignInScreen::for_domain_password("server", "alice@corp.example.com", screen());
+        // Tab first: it must not move the typing into the account.
+        press(&tx, 0x0f, false);
+        type_text(&tx, "pa55word");
+        press(&tx, 0x1c, false);
+
+        let submission = submitted(&mut sign_in, &mut events).await;
+        assert_eq!(submission.username, "alice@corp.example.com");
+        assert_eq!(submission.password, "pa55word");
     }
 }

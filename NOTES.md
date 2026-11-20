@@ -2934,3 +2934,140 @@ or `ls --color`), gradients and photographs, check the `Viewer graphics` line sh
 `quantization 6,6,6,6,6,6,6,7,7,7`, and compare bandwidth with
 `ironrdp_server::graphics=debug`. Check My targets at desktop, laptop and phone widths, in dark
 and light themes, with one, several and grouped targets.
+
+## Session recordings: one click from the session list
+
+Recordings used to be reachable only from a session's timeline, through a small badge
+("Desktop session"). Now:
+
+- **Sessions list.** A Recording column for administrators who may view recordings:
+  - **Watch** (play icon) opens the player directly; **Watch live** while the connection is
+    still being recorded; **+N** says how many more the session has.
+  - A Kubernetes API log gets **View log**, a forwarded connection's traffic **Capture**.
+    Neither gets a play action, since neither plays.
+  - Otherwise it shows Processing, Expired or Not recorded.
+  - **Has recording** filters on the server, so paging and totals stay right.
+- **Session page.** A Watch action beside the title, then three sections: Timeline,
+  Recordings and Log.
+  - Recordings lists every recording grouped by target connection, with its type,
+    details (channel, forwarded host, pod), start, duration, state and action. Captures
+    download directly.
+  - Recordings now come with the session itself. The separate per-second request
+    returned 403 for administrators who may view sessions but not recordings, and broke
+    the whole page for them.
+- **Player page.** A Back to session link, the recording's type, user, target, start,
+  duration and state, and a one-byte availability check first. A file that is gone shows
+  "no longer available" instead of a spinner that never ends. So do empty recordings,
+  missing permission and server errors. Recordings still processing or past retention get
+  a notice.
+
+**API (admin).** Both changes are additive.
+- `UserSessionSnapshot` gains `recordings` and `recording_count`. They are filled only
+  for callers with `RecordingsView`. The list sends the five most relevant per session,
+  the detail endpoint sends all of them.
+- `GET /sessions` gains `has_recording`, which requires `RecordingsView`.
+- Each recording has a server-computed `state`:
+  - `Live`: its connection is open.
+  - `Processing`: the connection closed under five minutes ago and the recording is not
+    finalized.
+  - `Available`
+  - `Expired`: past `log.retention`, by the cleanup's own rule.
+- The committed `openapi-schema.json` was updated by hand to match. Regenerating it with
+  `just openapi-all` should give the same content.
+
+**To run on the build server:**
+
+```sh
+cargo test -p warpgate-admin sessions_list
+cd warpgate-web && npm run check && npm run lint
+```
+
+Then:
+- An administrator with recording access sees the column and filter.
+- One without it sees neither, and the session page still opens for them.
+- RDP, VNC, SSH (shell, exec and port forward) and Kubernetes sessions each show the
+  right action.
+- Watch live works on an open session.
+- Deleting a recording's file on disk gives the "no longer available" message.
+- Both Comfortable and Dense table modes look right.
+
+## RDP: "Use my domain account"
+
+An RDP target can now sign each user in to Windows as their own Active Directory account,
+using their domain password. Warpgate never stores that password.
+
+### How it works
+
+- **Target setting.** The target editor has a new "Sign in with" choice: "Stored password
+  (managed or Vault)", which is the existing behaviour, or "Use my domain account".
+  - In config this is `auth.kind = "domain_account"`, with an optional
+    `username_format` of `upn` (the default) or `down_level`.
+  - Domain-account targets have no secret, so nothing goes to the encryption or Vault
+    paths.
+- **Which account.** The account always comes from the database link between the
+  Warpgate user and the directory (`ldap_server_id` + `ldap_object_uuid`). The client
+  never names it, so a request cannot sign in as anyone else.
+  - The UPN, or the down-level `sAMAccountName` with the target's Domain field (or, if
+    that is empty, the DNS domain from the entry's `DC=` parts). If one form is missing,
+    the other is used.
+  - `warpgate-ldap` now reads `sAMAccountName` and `userPrincipalName`.
+- **Checking the password.** The password is checked by binding to the directory as that
+  entry (LDAPS/StartTLS only, the same `authenticate_user` used for LDAP logins).
+  - The user gets a specific reason when it fails: wrong password, disabled, locked out,
+    expired, password expired, logon restricted, not linked, or directory unavailable.
+  - The target then checks the credentials again over CredSSP/NLA, so Windows' own
+    restrictions still apply.
+- **Browser.** Before starting a session, `WebDesktop.svelte` calls
+  `GET /web-desktop/targets/{id}/account`. That call is authorized the same way as
+  starting a session.
+  - For a domain-account target, the page shows the account (read-only) and a password
+    field.
+  - The password is sent once, in `domain_password` on `POST /web-desktop/sessions`, and
+    checked after the target authorization.
+  - A refusal comes back as a 400 with the directory's reason, which the prompt shows.
+- **Native (mstsc, MobaXterm, FreeRDP).** After sign-in, second factor, banner and
+  approval, and before the recorder starts, a Warpgate screen asks for the domain
+  password. It reuses the sign-in form in a password-only mode.
+  - The account is fixed and the focus cannot leave the password field.
+  - Up to 3 attempts are allowed, each showing the reason, with the existing 180-second
+    limit.
+  - Disabled, locked or expired accounts end the session after the message has been
+    shown.
+  - Keystrokes on this screen are never recorded. A clipboard pasted into it is not
+    passed to the target.
+- **Memory.** The password is held as `Zeroizing<String>` inside `DomainCredentials`
+  until the target connection is configured, then wiped.
+  - The native form's buffer is pre-allocated, so it does not reallocate, and is wiped
+    on drop.
+  - The password is never logged: `Debug` is redacted and the log lines name only the
+    account.
+  - Waiting for approval on the browser path keeps it in memory until the target is
+    dialed. The native path asks only after approval.
+
+### Not changed
+
+- Stored-password and Vault-backed targets behave as before.
+- Permissions, MFA, approvals, recording and audit are unchanged.
+
+### To run on the build server
+
+```sh
+cargo test -p warpgate-common a_domain_account_target_keeps_no_secret
+cargo test -p warpgate-core domain_account
+cargo test -p warpgate-desktop-ui
+cargo test -p warpgate-protocol-rdp
+just clippy
+cd warpgate-web && npm run check && npm run lint
+```
+
+The two `openapi-schema.json` files were edited by hand. Running `just openapi-all`
+should produce the same content.
+
+Then test by hand with an AD-linked user on a domain-account target:
+- In the browser and in mstsc/MobaXterm:
+  - the right password connects as the user;
+  - a wrong password shows "incorrect" and can be retried;
+  - disabled, locked and expired accounts show their own message.
+- A local (not linked) user is told they have no domain account.
+- Both username formats work.
+- The recording and logs contain no password.

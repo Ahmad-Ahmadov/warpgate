@@ -65,6 +65,16 @@
             "required": false,
             "deprecated": false,
             "explode": true
+          },
+          {
+            "name": "has_recording",
+            "schema": {
+              "type": "boolean"
+            },
+            "in": "query",
+            "required": false,
+            "deprecated": false,
+            "explode": true
           }
         ],
         "responses": {
@@ -7000,19 +7010,53 @@
           "3.2"
         ]
       },
+      "RdpDomainUsernameFormat": {
+        "type": "string",
+        "description": "How a directory account is named to an RDP target.",
+        "enum": [
+          "upn",
+          "down_level"
+        ]
+      },
       "RdpTargetAuth": {
         "type": "object",
         "oneOf": [
           {
             "$ref": "#/components/schemas/RdpTargetAuth_RdpTargetPasswordAuth"
+          },
+          {
+            "$ref": "#/components/schemas/RdpTargetAuth_RdpTargetDomainAccountAuth"
           }
         ],
         "discriminator": {
           "propertyName": "kind",
           "mapping": {
-            "Password": "#/components/schemas/RdpTargetAuth_RdpTargetPasswordAuth"
+            "Password": "#/components/schemas/RdpTargetAuth_RdpTargetPasswordAuth",
+            "DomainAccount": "#/components/schemas/RdpTargetAuth_RdpTargetDomainAccountAuth"
           }
         }
+      },
+      "RdpTargetAuth_RdpTargetDomainAccountAuth": {
+        "allOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "DomainAccount"
+                ],
+                "example": "DomainAccount"
+              }
+            }
+          },
+          {
+            "$ref": "#/components/schemas/RdpTargetDomainAccountAuth"
+          }
+        ]
       },
       "RdpTargetAuth_RdpTargetPasswordAuth": {
         "allOf": [
@@ -7043,6 +7087,16 @@
           "lossless",
           "graphics_pipeline"
         ]
+      },
+      "RdpTargetDomainAccountAuth": {
+        "type": "object",
+        "title": "RdpTargetDomainAccountAuth",
+        "description": "Sign in as the connecting user's own directory account: the account their Warpgate user\nis linked to, which the user cannot choose, and a password they type, which is checked\nagainst the directory and used for this one connection only.",
+        "properties": {
+          "username_format": {
+            "$ref": "#/components/schemas/RdpDomainUsernameFormat"
+          }
+        }
       },
       "RdpTargetPasswordAuth": {
         "type": "object",
@@ -7116,6 +7170,58 @@
           "Traffic",
           "Kubernetes",
           "Desktop"
+        ]
+      },
+      "RecordingSnapshot": {
+        "type": "object",
+        "title": "RecordingSnapshot",
+        "description": "A recording as the session screens show it, without its storage name or layout.",
+        "required": [
+          "id",
+          "target_session_id",
+          "kind",
+          "metadata",
+          "started",
+          "state"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "target_session_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The target connection it was made on."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/RecordingKind"
+          },
+          "metadata": {
+            "type": "string",
+            "description": "What was recorded, as the recorder describes it: JSON with a `type` such as\n`ssh-shell` or `desktop`."
+          },
+          "started": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "ended": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "state": {
+            "$ref": "#/components/schemas/RecordingState"
+          }
+        }
+      },
+      "RecordingState": {
+        "type": "string",
+        "description": "What can be done with a recording now.",
+        "enum": [
+          "Live",
+          "Processing",
+          "Available",
+          "Expired"
         ]
       },
       "RecordingsDiskConfig": {
@@ -9301,7 +9407,9 @@
           "protocol",
           "remote_address",
           "target_sessions",
-          "admin_approvals"
+          "admin_approvals",
+          "recordings",
+          "recording_count"
         ],
         "properties": {
           "id": {
@@ -9349,6 +9457,18 @@
             "items": {
               "$ref": "#/components/schemas/SessionApprovalRequestSnapshot"
             }
+          },
+          "recordings": {
+            "type": "array",
+            "description": "The session's recordings, for a viewer allowed to see recordings, and otherwise none.\nThe session list carries the few that matter most for each session, a single session\nall of them.",
+            "items": {
+              "$ref": "#/components/schemas/RecordingSnapshot"
+            }
+          },
+          "recording_count": {
+            "type": "integer",
+            "format": "uint32",
+            "description": "How many recordings the session has, for a viewer allowed to see recordings."
           }
         }
       },

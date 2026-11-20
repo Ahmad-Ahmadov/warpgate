@@ -56,6 +56,8 @@ warpgate-sso = { path = "../warpgate-sso", default-features = false }
 warpgate-tls = { path = "../warpgate-tls" }
 webpki = { version = "0.22", default-features = false }
 zune-jpeg.workspace = true
+# Wipes a domain password typed for one connection when it is dropped (domain_account).
+zeroize = "1.5"
 
 [features]
 postgres = ["sea-orm/sqlx-postgres"]

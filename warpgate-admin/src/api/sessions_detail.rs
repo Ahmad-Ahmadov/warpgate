@@ -9,7 +9,7 @@ use warpgate_core::{SessionsFilter, UserSessionSnapshot};
 use warpgate_db_entities::{HttpSession, Recording, TargetSession, UserSession};
 
 use super::AdminContext;
-use super::sessions_list::user_session_snapshots;
+use super::sessions_list::{Recordings, user_session_snapshots};
 
 pub struct Api;
 
@@ -51,7 +51,9 @@ impl Api {
         let Some(session) = UserSession::Entity::find_by_id(id.0).one(db).await? else {
             return Ok(GetSessionResponse::NotFound);
         };
-        let Some(snapshot) = user_session_snapshots(db, vec![session])
+        // Every recording of the session, for a viewer allowed to see recordings.
+        let recordings = Recordings::for_admin(&admin, None).await;
+        let Some(snapshot) = user_session_snapshots(db, vec![session], &recordings)
             .await?
             .into_iter()
             .next()

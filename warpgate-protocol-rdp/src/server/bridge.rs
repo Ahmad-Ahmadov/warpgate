@@ -7,6 +7,7 @@ use anyhow::Result;
 use tokio::sync::mpsc::Sender;
 use tracing::{Instrument as _, info, warn};
 use warpgate_common::TargetRdpOptions;
+use warpgate_core::domain_account::DomainCredentials;
 use warpgate_core::recordings::DesktopRecorder;
 use warpgate_core::{AdmittedTarget, DesktopClientHandles, DesktopEvent, DesktopState, Services};
 
@@ -98,12 +99,15 @@ async fn frame_bridge(
 
 /// Connect to the target and start bridging its framebuffer, once auth is complete.
 /// `keyboard_layout` is the viewer's (a Windows KLID), or `0` for the target's default.
+/// `domain_credentials` signs in to a target that uses the viewer's own domain account,
+/// and is consumed (and wiped) once the connection is configured.
 pub(super) async fn connect_backend(
     services: &Services,
     server_in_tx: &Sender<ServerInput>,
     admitted: AdmittedTarget<TargetRdpOptions>,
     screen: warpgate_desktop_ui::Screen,
     keyboard_layout: u32,
+    domain_credentials: Option<DomainCredentials>,
 ) -> Result<BackendBridge> {
     info!(
         target = %admitted.target().name,
@@ -125,6 +129,7 @@ pub(super) async fn connect_backend(
         (screen.width, screen.height),
         services.secret_backends.clone(),
         keyboard_layout,
+        domain_credentials,
     )?;
     if let Some(recorder) = &recorder {
         recorder.track_logon_state(logon_state);

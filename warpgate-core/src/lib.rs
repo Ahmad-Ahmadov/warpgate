@@ -11,6 +11,7 @@ mod credential_encryption;
 mod data;
 pub mod db;
 mod db_auth;
+pub mod domain_account;
 pub(crate) mod helpers;
 mod listener_status;
 pub mod logging;

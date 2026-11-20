@@ -1,8 +1,9 @@
-use poem_openapi::Object;
+use poem_openapi::{Enum, Object};
 use serde::Serialize;
 use time::OffsetDateTime;
 use uuid::Uuid;
 use warpgate_common::{NodeId, StoredSecrets, Target, TargetSessionId, UserSessionId};
+use warpgate_db_entities::Recording::RecordingKind;
 use warpgate_db_entities::{SessionApprovalRequest, TargetSession, UserSession};
 
 #[derive(Serialize, Object)]
@@ -21,6 +22,12 @@ pub struct UserSessionSnapshot {
     pub remote_address: String,
     pub target_sessions: Vec<TargetSessionSnapshot>,
     pub admin_approvals: Vec<SessionApprovalRequestSnapshot>,
+    /// The session's recordings, for a viewer allowed to see recordings, and otherwise none.
+    /// The session list carries the few that matter most for each session, a single session
+    /// all of them.
+    pub recordings: Vec<RecordingSnapshot>,
+    /// How many recordings the session has, for a viewer allowed to see recordings.
+    pub recording_count: u32,
 }
 
 impl From<UserSession::Model> for UserSessionSnapshot {
@@ -37,8 +44,39 @@ impl From<UserSession::Model> for UserSessionSnapshot {
             remote_address: model.remote_address,
             target_sessions: vec![],
             admin_approvals: vec![],
+            recordings: vec![],
+            recording_count: 0,
         }
     }
+}
+
+/// What can be done with a recording now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Enum)]
+pub enum RecordingState {
+    /// Being written: its target connection is still open.
+    Live,
+    /// Its connection has closed and it is being finalized; on object storage, its upload is
+    /// finishing.
+    Processing,
+    /// Complete.
+    Available,
+    /// Past the recording retention period: removed with its session at the next cleanup.
+    Expired,
+}
+
+/// A recording as the session screens show it, without its storage name or layout.
+#[derive(Serialize, Object)]
+pub struct RecordingSnapshot {
+    pub id: Uuid,
+    /// The target connection it was made on.
+    pub target_session_id: TargetSessionId,
+    pub kind: RecordingKind,
+    /// What was recorded, as the recorder describes it: JSON with a `type` such as
+    /// `ssh-shell` or `desktop`.
+    pub metadata: String,
+    pub started: OffsetDateTime,
+    pub ended: Option<OffsetDateTime>,
+    pub state: RecordingState,
 }
 
 #[derive(Serialize, Object)]

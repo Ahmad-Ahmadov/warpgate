@@ -140,6 +140,22 @@ pub struct SignInPrompt<'a> {
     pub notice: Option<SignInNotice<'a>>,
 }
 
+/// The password prompt for a target that signs in with the viewer's own domain (Active
+/// Directory) account, shown to a native RDP viewer once Warpgate has admitted it to the
+/// target and before the target is dialed.
+///
+/// The account is the directory's, looked up from the viewer's Warpgate user, and is shown
+/// read-only: nothing typed here can sign in as anyone else. As on the sign-in form, the
+/// password never reaches the renderer, only its length.
+pub struct DomainPasswordPrompt<'a> {
+    /// The target's name.
+    pub target: &'a str,
+    /// The account the target is signed in to, as `DOMAIN\user` or `user@domain`.
+    pub account: &'a str,
+    pub password_len: usize,
+    pub notice: Option<SignInNotice<'a>>,
+}
+
 /// Width of a [`FONT_10X20`] glyph, the font every screen is drawn in.
 const CHAR_W: i32 = 10;
 /// Pitch of the lines of text, as in [`render`].
@@ -163,6 +179,23 @@ const SIGN_IN_HINTS: [&str; 3] = [
     "Keys are read as on a US English keyboard",
 ];
 const SIGN_IN_HINT_LINES: i32 = 3;
+
+const DOMAIN_PASSWORD_HINTS: [&str; 3] = [
+    "Your domain password, used for this connection only",
+    "Enter connects, Esc clears the password",
+    "Keys are read as on a US English keyboard",
+];
+
+/// What a form screen shows: the sign-in form, or the domain password prompt.
+struct FormContent<'a> {
+    title: &'a str,
+    labels: [&'a str; 2],
+    username: &'a str,
+    password_len: usize,
+    focus: SignInField,
+    notice: Option<SignInNotice<'a>>,
+    hints: &'a [&'a str; 3],
+}
 
 /// Where everything on the sign-in form goes, for drawing it and for telling which field a
 /// click landed on.
@@ -266,47 +299,115 @@ pub fn sign_in_field_center(screen: Screen, field: SignInField) -> (u16, u16) {
 /// The sign-in form, see [`SignInPrompt`]. It has no animation, unlike the other screens:
 /// it is shown before the viewer has signed in, so it is repainted only when it changes.
 pub fn render_sign_in(screen: Screen, prompt: &SignInPrompt) -> Result<Vec<u8>, Infallible> {
+    render_form(
+        screen,
+        &FormContent {
+            title: "Sign in to Warpgate",
+            labels: ["Username", "Password"],
+            username: prompt.username,
+            password_len: prompt.password_len,
+            focus: prompt.focus,
+            notice: prompt.notice,
+            hints: &SIGN_IN_HINTS,
+        },
+    )
+}
+
+/// The domain password prompt, see [`DomainPasswordPrompt`]. Laid out as the sign-in form,
+/// so a click lands where [`sign_in_field_at`] says; the account field is drawn dimmed, as
+/// it never takes the focus.
+pub fn render_domain_password(
+    screen: Screen,
+    prompt: &DomainPasswordPrompt,
+) -> Result<Vec<u8>, Infallible> {
+    let title = format!("Connect to {}", prompt.target);
+    render_form(
+        screen,
+        &FormContent {
+            title: &title,
+            labels: ["Domain account", "Domain password"],
+            username: prompt.account,
+            password_len: prompt.password_len,
+            focus: SignInField::Password,
+            notice: prompt.notice,
+            hints: &DOMAIN_PASSWORD_HINTS,
+        },
+    )
+}
+
+fn render_form(screen: Screen, content: &FormContent) -> Result<Vec<u8>, Infallible> {
     let layout = SignInLayout::new(screen);
     let mut fb = Framebuffer::new(u32::from(screen.width), u32::from(screen.height), BG);
 
     Image::new(logo(), layout.logo).draw(&mut fb)?;
 
     let text = MonoTextStyle::new(&FONT_10X20, FG);
-    Text::with_alignment("Sign in to Warpgate", layout.title, text, Alignment::Center)
+    let [username_label, password_label] = content.labels;
+    Text::with_alignment(content.title, layout.title, text, Alignment::Center).draw(&mut fb)?;
+    Text::with_alignment(username_label, layout.username_label, text, Alignment::Left)
         .draw(&mut fb)?;
-    Text::with_alignment("Username", layout.username_label, text, Alignment::Left).draw(&mut fb)?;
-    Text::with_alignment("Password", layout.password_label, text, Alignment::Left).draw(&mut fb)?;
+    Text::with_alignment(password_label, layout.password_label, text, Alignment::Left)
+        .draw(&mut fb)?;
 
-    let password = "*".repeat(prompt.password_len);
+    let password = "*".repeat(content.password_len);
     for (field, value) in [
-        (SignInField::Username, prompt.username),
+        (SignInField::Username, content.username),
         (SignInField::Password, password.as_str()),
     ] {
-        draw_field(&mut fb, layout.field(field), value, prompt.focus == field);
+        draw_field(&mut fb, layout.field(field), value, content.focus == field);
     }
 
-    if let Some(notice) = prompt.notice {
-        let (line, color) = match notice {
-            SignInNotice::Error(line) => (line, ERROR),
-            SignInNotice::Info(line) => (line, FG),
+    // A notice too long for one line wraps, and pushes the hints down with it.
+    let mut hint = layout.hints;
+    if let Some(notice) = content.notice {
+        let (text, color) = match notice {
+            SignInNotice::Error(text) => (text, ERROR),
+            SignInNotice::Info(text) => (text, FG),
         };
-        Text::with_alignment(
-            line,
-            layout.notice,
-            MonoTextStyle::new(&FONT_10X20, color),
-            Alignment::Center,
-        )
-        .draw(&mut fb)?;
+        let style = MonoTextStyle::new(&FONT_10X20, color);
+        let room = (i32::from(screen.width) - 2 * FIELD_PADDING).min(2 * FIELD_W) / CHAR_W;
+        let mut at = layout.notice;
+        for (index, line) in wrap(text, usize::try_from(room).unwrap_or(1))
+            .iter()
+            .enumerate()
+        {
+            if index > 0 {
+                at.y += LINE_H;
+                hint.y += LINE_H;
+            }
+            Text::with_alignment(line, at, style, Alignment::Center).draw(&mut fb)?;
+        }
     }
 
     let dim = MonoTextStyle::new(&FONT_10X20, DIM);
-    let mut hint = layout.hints;
-    for line in SIGN_IN_HINTS {
+    for line in content.hints {
         Text::with_alignment(line, hint, dim, Alignment::Center).draw(&mut fb)?;
         hint.y += LINE_H;
     }
 
     Ok(fb.take_pixels())
+}
+
+/// `text` in lines of at most `room` characters, broken between words. A word longer than a
+/// line has a line of its own, and is cut where it runs off the screen.
+fn wrap(text: &str, room: usize) -> Vec<String> {
+    let room = room.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let width = line.chars().count();
+        if width > 0 && width + 1 + word.chars().count() > room {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// A text field holding `value`. The focused field is lit and has the caret; text too long
@@ -490,11 +591,41 @@ mod sign_in_tests {
                 pixels.len(),
                 usize::from(screen.width) * usize::from(screen.height) * 3
             );
+
+            let pixels = render_domain_password(
+                screen,
+                &DomainPasswordPrompt {
+                    target: "a-windows-server-with-a-name-wider-than-the-screen",
+                    account: "alice.longname@corp.example.com",
+                    password_len: 256,
+                    notice: Some(SignInNotice::Error("The domain account is locked out")),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                pixels.len(),
+                usize::from(screen.width) * usize::from(screen.height) * 3
+            );
         }
     }
 
     #[test]
+    fn a_long_notice_wraps_between_words() {
+        assert_eq!(
+            wrap("Your domain account is locked out.", 20),
+            vec!["Your domain account", "is locked out."]
+        );
+        assert_eq!(wrap("short", 80), vec!["short"]);
+        assert_eq!(wrap("unbreakable-word", 4), vec!["unbreakable-word"]);
+        assert!(wrap("", 10).is_empty());
+    }
+
+    #[test]
     fn the_layout_has_room_for_every_hint() {
+        assert_eq!(
+            DOMAIN_PASSWORD_HINTS.len(),
+            usize::try_from(SIGN_IN_HINT_LINES).unwrap()
+        );
         assert_eq!(
             SIGN_IN_HINTS.len(),
             usize::try_from(SIGN_IN_HINT_LINES).unwrap()

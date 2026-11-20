@@ -14,6 +14,7 @@ fn ldap_user_attributes(config: &LdapConfig) -> Vec<String> {
         "mail".into(),
         "displayName".into(),
         "userPrincipalName".into(),
+        "sAMAccountName".into(),
     ];
 
     // Add UUID attributes - either custom or default ones
@@ -117,6 +118,15 @@ fn extract_ldap_user(search_entry: &SearchEntry, config: &LdapConfig) -> Result<
             .cloned()
     });
 
+    let first_of = |attr: &str| {
+        search_entry
+            .attrs
+            .get(attr)
+            .and_then(|v| v.first())
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+    };
+
     Ok(LdapUser {
         username,
         email,
@@ -125,6 +135,8 @@ fn extract_ldap_user(search_entry: &SearchEntry, config: &LdapConfig) -> Result<
         object_uuid,
         ssh_public_keys,
         password_last_set,
+        sam_account_name: first_of("sAMAccountName"),
+        user_principal_name: first_of("userPrincipalName"),
     })
 }
 
