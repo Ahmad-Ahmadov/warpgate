@@ -2991,83 +2991,145 @@ Then:
 - Deleting a recording's file on disk gives the "no longer available" message.
 - Both Comfortable and Dense table modes look right.
 
-## RDP: "Use my domain account"
+## RDP: Windows account access control
 
-An RDP target can now sign each user in to Windows as their own Active Directory account,
-using their domain password. Warpgate never stores that password.
+Each RDP target says which Windows account a user may sign in as. Warpgate enforces that for
+browser and native (mstsc, MobaXterm, FreeRDP) connections alike: both go through the same
+shared code (`warpgate-core/src/rdp_account.rs` and the RDP client in
+`warpgate-protocol-rdp/src/client`).
 
-### How it works
+### The three sign-in modes ("Sign in with", on the target's RDP options)
 
-- **Target setting.** The target editor has a new "Sign in with" choice: "Stored password
-  (managed or Vault)", which is the existing behaviour, or "Use my domain account".
-  - In config this is `auth.kind = "domain_account"`, with an optional
-    `username_format` of `upn` (the default) or `down_level`.
-  - Domain-account targets have no secret, so nothing goes to the encryption or Vault
-    paths.
-- **Which account.** The account always comes from the database link between the
-  Warpgate user and the directory (`ldap_server_id` + `ldap_object_uuid`). The client
-  never names it, so a request cannot sign in as anyone else.
-  - The UPN, or the down-level `sAMAccountName` with the target's Domain field (or, if
-    that is empty, the DNS domain from the entry's `DC=` parts). If one form is missing,
-    the other is used.
-  - `warpgate-ldap` now reads `sAMAccountName` and `userPrincipalName`.
-- **Checking the password.** The password is checked by binding to the directory as that
-  entry (LDAPS/StartTLS only, the same `authenticate_user` used for LDAP logins).
-  - The user gets a specific reason when it fails: wrong password, disabled, locked out,
-    expired, password expired, logon restricted, not linked, or directory unavailable.
-  - The target then checks the credentials again over CredSSP/NLA, so Windows' own
-    restrictions still apply.
-- **Browser.** Before starting a session, `WebDesktop.svelte` calls
-  `GET /web-desktop/targets/{id}/account`. That call is authorized the same way as
-  starting a session.
-  - For a domain-account target, the page shows the account (read-only) and a password
-    field.
-  - The password is sent once, in `domain_password` on `POST /web-desktop/sessions`, and
-    checked after the target authorization.
-  - A refusal comes back as a 400 with the directory's reason, which the prompt shows.
-- **Native (mstsc, MobaXterm, FreeRDP).** After sign-in, second factor, banner and
-  approval, and before the recorder starts, a Warpgate screen asks for the domain
-  password. It reuses the sign-in form in a password-only mode.
-  - The account is fixed and the focus cannot leave the password field.
-  - Up to 3 attempts are allowed, each showing the reason, with the existing 180-second
-    limit.
-  - Disabled, locked or expired accounts end the session after the message has been
-    shown.
-  - Keystrokes on this screen are never recorded. A clipboard pasted into it is not
-    passed to the target.
-- **Memory.** The password is held as `Zeroizing<String>` inside `DomainCredentials`
-  until the target connection is configured, then wiped.
-  - The native form's buffer is pre-allocated, so it does not reallocate, and is wiped
-    on drop.
-  - The password is never logged: `Debug` is redacted and the log lines name only the
-    account.
-  - Waiting for approval on the browser path keeps it in memory until the target is
-    dialed. The native path asks only after approval.
+- **Managed account**: `auth.kind = "password"`, as before. The stored username and the
+  stored or Vault password; users never see the password.
+- **My domain account**: `auth.kind = "domain_account"`. The account is the directory entry
+  the Warpgate user is linked to (`ldap_server_id` + `ldap_object_uuid`), never one a client
+  names. The user types its password once; it is checked by an LDAP bind as that entry
+  (LDAPS/StartTLS only) before the target is dialed. Users not linked to a directory are
+  refused with "not linked to a directory account".
+- **Assigned Windows account**: `auth.kind = "local_account"` (new), with
+  `accounts: [{ username, users: [user ids] }]`. An administrator lists the accounts and
+  assigns each to Warpgate users. A user may only choose among the accounts assigned to
+  them, and types its password once; the target checks it. No LDAP is needed.
+  - `name` takes the target's Domain field (shown as "Computer name" in this mode),
+    `COMPUTER\name` names it explicitly, `.\name` is the target's own, and a UPN is allowed.
+  - Nothing is stored except the assignment: no password.
 
-### Not changed
+### One password prompt, after authorization
 
-- Stored-password and Vault-backed targets behave as before.
-- Permissions, MFA, approvals, recording and audit are unchanged.
+- The order is: Warpgate sign-in, then MFA, then approval, then the account password, then
+  the target.
+  - Before the approval is requested, `plan_sign_in` checks that the user has an account
+    to use. A user with none is refused at once, both in the browser
+    (`POST /web-desktop/sessions` returns 400) and in native clients (a message on screen,
+    then disconnect).
+- The browser no longer sends a password in `POST /web-desktop/sessions`; the
+  `domain_password` field and `GET /web-desktop/targets/{id}/account` are gone.
+  - Once the session is approved, the server sends a `sign_in` message on the session's
+    websocket: the kind, the target, the accounts to choose from, and the last error.
+  - The browser answers with `{type: "sign_in", account, password}`. That message never
+    reaches the target as input, nor the recording.
+  - It is asked again after a reload, and allows 3 attempts within 180 seconds.
+- Native clients see the password screen after approval.
+  - For assigned accounts, the account field cycles through the user's accounts with Up
+    and Down (or a click), and cannot be typed into. Switching accounts wipes the password.
+- The verified password goes to Windows by CredSSP/NLA with autologon, so Windows signs the
+  session in without showing its own sign-in screen. The "Interactive logon" option now
+  applies only to managed accounts: these two modes always delegate credentials.
+
+### Account enforcement at the target (what stops account switching)
+
+- `verify_sign_in` (shared) only ever resolves an account from the user's own directory
+  link or their assignments.
+  - A request naming another account is refused and logged.
+  - `connect_with_keyboard_layout` checks again that the resolved credentials belong to the
+    admitted user and to the target's mode.
+- The RDP client reads every Save Session Info PDU from the target, before IronRDP
+  processes it, in `client/logon.rs`. These PDUs are Windows' report of who logged on: a
+  NetBIOS domain or computer name, plus an account name. IronRDP asks for them with
+  `INFO_LOGONNOTIFY`.
+  - The client compares each report with the account Warpgate signed in with (the
+    `LogonIdentity`).
+  - On a mismatch it ends the session immediately. This covers the first logon, and any
+    later one: Windows' sign-in screen, lock screen or "switch user".
+  - The browser shows the reason; a native client gets a refusal.
+  - The refusal is audited as `TargetLogonRefused`, with both the Warpgate user and the
+    Windows account.
+- Domain accounts match on `sAMAccountName`, against any known name of the domain:
+  - the NetBIOS name from AD's `msDS-PrincipalName`, now requested from the directory;
+  - the target's Domain field;
+  - the DNS domain, and its first label.
+  - A logon reported by UPN matches the entry's UPN.
+- Managed accounts match on the stored name and domain.
+  - Assigned accounts match on the assigned name and computer.
+  - Where no domain is known, the first logon's domain is pinned, and later logons must
+    match it.
+- Keystrokes typed before Windows confirms the logon are not recorded. For managed
+  targets, this was already true only on interactive-logon targets; it now also applies to
+  the two typed-password modes. So a Windows prompt that appears anyway does not leak
+  the password into the recording.
+- `TargetLogon` audit events now carry `target_account` (DOMAIN\user, as Windows reported
+  it). A connect log line gives the Warpgate user, the target, the mode and the account.
+
+### Limitations
+
+- Managed targets with "Interactive logon" are monitored, not restricted. The logon's
+  account is audited, but any account may be used. The admin form warns about this.
+- If a target ignores autologon, Windows still shows its own prompt. The usual cause is the
+  GPO "Always prompt for password upon connection" (`fPromptForPassword`); "Do not allow
+  passwords to be saved" or Remote Credential Guard settings can also do it.
+  - Warpgate cannot suppress such a server-side policy. Turn the setting off for these
+    hosts.
+  - The account check still applies to anything typed there.
+- A logon notification without an account name (Plain Notify) is accepted as the account
+  Warpgate signed in with. Per MS-RDPBCGR 3.3.5.10.1, Windows names the account whenever it
+  differs, or whenever the client asked, which IronRDP does.
+- Ending a session closes the RDP connection. Windows keeps a disconnected session for the
+  wrong account under its own policies; set "End a disconnected session" accordingly.
+- For a local account written without a computer name, the first logon's domain is pinned.
+  - That first logon is Warpgate's own autologon, unless the target forces its own
+    sign-in prompt.
+  - Set the Computer name for strict checking.
+- A domain whose NetBIOS name differs from the DNS first label is recognised through
+  `msDS-PrincipalName`, if the service account can read it, or through the target's Domain
+  field set to the NetBIOS name. Otherwise logons are refused, with the reported account in
+  the message.
+- A wrong local-account password is refused by the target (NLA) and ends the session. The
+  user then has to reconnect, and approval is asked for again. Domain passwords are
+  checked with LDAP first, so those can be retried.
+- IronRDP's connector keeps its own copy of the password, in a plain `String`, until the
+  connection is set up. It is freed but not wiped, as for managed passwords.
+- Windows-side hardening is still recommended:
+  - restrict "Allow log on through Remote Desktop Services" to the intended accounts and
+    groups;
+  - hide Fast User Switching (`HideFastUserSwitching`);
+  - set "Interactive logon: Do not display last signed-in".
 
 ### To run on the build server
 
 ```sh
-cargo test -p warpgate-common a_domain_account_target_keeps_no_secret
-cargo test -p warpgate-core domain_account
+cargo test -p warpgate-common a_local_account_target_keeps_assignments_and_no_secret
+cargo test -p warpgate-core rdp_account
 cargo test -p warpgate-desktop-ui
 cargo test -p warpgate-protocol-rdp
 just clippy
 cd warpgate-web && npm run check && npm run lint
 ```
 
-The two `openapi-schema.json` files were edited by hand. Running `just openapi-all`
-should produce the same content.
+The two `openapi-schema.json` files were edited by hand. Running `just openapi-all` should
+produce the same content.
 
-Then test by hand with an AD-linked user on a domain-account target:
-- In the browser and in mstsc/MobaXterm:
-  - the right password connects as the user;
-  - a wrong password shows "incorrect" and can be retried;
-  - disabled, locked and expired accounts show their own message.
-- A local (not linked) user is told they have no domain account.
-- Both username formats work.
-- The recording and logs contain no password.
+Then test by hand, in the browser and in mstsc/MobaXterm:
+- **Domain account.**
+  - The password is asked once, after approval, and Windows opens with no second prompt.
+  - A wrong password shows "incorrect" and can be retried.
+  - Disabled, locked and expired accounts show their own message.
+  - An unlinked local user is refused before the approval is requested.
+- **Assigned account.**
+  - Only the user's own accounts are offered.
+  - A user with none is refused up front.
+  - A forged account name over the websocket is refused.
+- **Switching accounts.** Lock the Windows session, or switch user, and sign in as another
+  account. Warpgate ends the session, and the audit log shows `TargetLogonRefused`.
+- **Logs and recordings.** The recording and logs contain no password. `TargetLogon`
+  shows both the Warpgate user and the Windows account.

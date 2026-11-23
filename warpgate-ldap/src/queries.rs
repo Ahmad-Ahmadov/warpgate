@@ -137,8 +137,14 @@ fn extract_ldap_user(search_entry: &SearchEntry, config: &LdapConfig) -> Result<
         password_last_set,
         sam_account_name: first_of("sAMAccountName"),
         user_principal_name: first_of("userPrincipalName"),
+        nt_account_name: first_of(NT_ACCOUNT_NAME_ATTRIBUTE),
     })
 }
+
+/// Active Directory's name for an account as Windows reports a logon: `CORP\alice`, with the
+/// domain's NetBIOS name. Constructed, so returned only when asked for by name; a server
+/// that does not know it leaves it out.
+const NT_ACCOUNT_NAME_ATTRIBUTE: &str = "msDS-PrincipalName";
 
 /// Active Directory's, then the OpenLDAP password policy overlay's (an
 /// operational attribute, hence the `+` in single-user searches).
@@ -233,7 +239,9 @@ async fn find_user_by_filter(
                 base_dn,
                 Scope::Subtree,
                 filter,
-                vec!["*", "+"], // Request all user attributes (*) and operational attributes (+)
+                // All user attributes (*) and operational attributes (+), and Active
+                // Directory's constructed `DOMAIN\name`, which neither includes.
+                vec!["*", "+", NT_ACCOUNT_NAME_ATTRIBUTE],
             )
             .await
             .map_err(|e| LdapError::QueryFailed(e.to_string()))?

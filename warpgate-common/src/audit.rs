@@ -116,6 +116,19 @@ pub enum AuditEvent {
         target_account: Option<String>,
         target_session_id: Option<u32>,
     },
+    /// The target logged a session on as an account the user may not use there (an account
+    /// typed into the target's own sign-in screen, say), so Warpgate ended the session.
+    TargetLogonRefused {
+        session_id: Uuid,
+        target_name: String,
+        target_id: Uuid,
+        user_id: Uuid,
+        username: String,
+        /// The account the target reported, as DOMAIN\user.
+        target_account: String,
+        /// The account the user may sign in as, which Warpgate signed in with.
+        allowed_account: String,
+    },
     TicketCreated {
         ticket_id: Uuid,
         user_id: Uuid,
@@ -455,6 +468,29 @@ impl AuditEvent {
                     target_session_id = *target_session_id,
                     related_users = %format_related_ids(&[*user_id]),
                     "Logged on to target"
+                );
+            }
+            Self::TargetLogonRefused {
+                session_id,
+                target_name,
+                target_id,
+                user_id,
+                username,
+                target_account,
+                allowed_account,
+            } => {
+                tracing::warn!(
+                    target: "audit",
+                    _type = "TargetLogonRefused1",
+                    session_id = %session_id,
+                    target_id = %target_id,
+                    target_name = %target_name,
+                    user_id = %user_id,
+                    username = %username,
+                    target_account = %target_account,
+                    allowed_account = %allowed_account,
+                    related_users = %format_related_ids(&[*user_id]),
+                    "Target logged on as an account the user may not use; session ended"
                 );
             }
             Self::TicketCreated {

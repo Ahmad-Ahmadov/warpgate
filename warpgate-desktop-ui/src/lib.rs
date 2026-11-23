@@ -140,18 +140,32 @@ pub struct SignInPrompt<'a> {
     pub notice: Option<SignInNotice<'a>>,
 }
 
-/// The password prompt for a target that signs in with the viewer's own domain (Active
-/// Directory) account, shown to a native RDP viewer once Warpgate has admitted it to the
-/// target and before the target is dialed.
+/// The kind of account an [`AccountPasswordPrompt`] asks the password of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountKind {
+    /// The viewer's own domain (Active Directory) account.
+    Domain,
+    /// A Windows account an administrator assigned to the viewer on the target.
+    Local,
+}
+
+/// The password prompt for a target that signs in with an account the viewer types the
+/// password of: their own domain account, or one assigned to them. Shown to a native RDP
+/// viewer once Warpgate has admitted it to the target and before the target is dialed.
 ///
-/// The account is the directory's, looked up from the viewer's Warpgate user, and is shown
-/// read-only: nothing typed here can sign in as anyone else. As on the sign-in form, the
-/// password never reaches the renderer, only its length.
-pub struct DomainPasswordPrompt<'a> {
+/// The account is Warpgate's to give, not the viewer's to type: the directory's, looked up
+/// from the viewer's Warpgate user, or one of those assigned to them, which the viewer can
+/// only step through. As on the sign-in form, the password never reaches the renderer, only
+/// its length.
+pub struct AccountPasswordPrompt<'a> {
     /// The target's name.
     pub target: &'a str,
+    pub kind: AccountKind,
     /// The account the target is signed in to, as `DOMAIN\user` or `user@domain`.
     pub account: &'a str,
+    /// Where `account` is among the accounts the viewer may choose from, and how many there
+    /// are, counting from 1, when there are several.
+    pub choice: Option<(usize, usize)>,
     pub password_len: usize,
     pub notice: Option<SignInNotice<'a>>,
 }
@@ -183,6 +197,18 @@ const SIGN_IN_HINT_LINES: i32 = 3;
 const DOMAIN_PASSWORD_HINTS: [&str; 3] = [
     "Your domain password, used for this connection only",
     "Enter connects, Esc clears the password",
+    "Keys are read as on a US English keyboard",
+];
+
+const LOCAL_PASSWORD_HINTS: [&str; 3] = [
+    "The account's password, used for this connection only",
+    "Enter connects, Esc clears the password",
+    "Keys are read as on a US English keyboard",
+];
+
+const ACCOUNT_CHOICE_HINTS: [&str; 3] = [
+    "The account's password, used for this connection only",
+    "Up and Down choose the account, Enter connects",
     "Keys are read as on a US English keyboard",
 ];
 
@@ -313,24 +339,37 @@ pub fn render_sign_in(screen: Screen, prompt: &SignInPrompt) -> Result<Vec<u8>, 
     )
 }
 
-/// The domain password prompt, see [`DomainPasswordPrompt`]. Laid out as the sign-in form,
-/// so a click lands where [`sign_in_field_at`] says; the account field is drawn dimmed, as
-/// it never takes the focus.
-pub fn render_domain_password(
+/// The account password prompt, see [`AccountPasswordPrompt`]. Laid out as the sign-in
+/// form, so a click lands where [`sign_in_field_at`] says; the account field is drawn
+/// dimmed, as it never takes the focus.
+pub fn render_account_password(
     screen: Screen,
-    prompt: &DomainPasswordPrompt,
+    prompt: &AccountPasswordPrompt,
 ) -> Result<Vec<u8>, Infallible> {
     let title = format!("Connect to {}", prompt.target);
+    // The count goes last: a long account name is cut at its start, so it stays in view.
+    let account = match prompt.choice {
+        Some((index, count)) => format!("{} ({index} of {count})", prompt.account),
+        None => prompt.account.to_owned(),
+    };
+    let (labels, hints) = match (prompt.kind, prompt.choice) {
+        (AccountKind::Domain, _) => (
+            ["Domain account", "Domain password"],
+            &DOMAIN_PASSWORD_HINTS,
+        ),
+        (AccountKind::Local, None) => (["Windows account", "Password"], &LOCAL_PASSWORD_HINTS),
+        (AccountKind::Local, Some(_)) => (["Windows account", "Password"], &ACCOUNT_CHOICE_HINTS),
+    };
     render_form(
         screen,
         &FormContent {
             title: &title,
-            labels: ["Domain account", "Domain password"],
-            username: prompt.account,
+            labels,
+            username: &account,
             password_len: prompt.password_len,
             focus: SignInField::Password,
             notice: prompt.notice,
-            hints: &DOMAIN_PASSWORD_HINTS,
+            hints,
         },
     )
 }
@@ -592,20 +631,28 @@ mod sign_in_tests {
                 usize::from(screen.width) * usize::from(screen.height) * 3
             );
 
-            let pixels = render_domain_password(
-                screen,
-                &DomainPasswordPrompt {
-                    target: "a-windows-server-with-a-name-wider-than-the-screen",
-                    account: "alice.longname@corp.example.com",
-                    password_len: 256,
-                    notice: Some(SignInNotice::Error("The domain account is locked out")),
-                },
-            )
-            .unwrap();
-            assert_eq!(
-                pixels.len(),
-                usize::from(screen.width) * usize::from(screen.height) * 3
-            );
+            for (kind, choice) in [
+                (AccountKind::Domain, None),
+                (AccountKind::Local, None),
+                (AccountKind::Local, Some((2, 3))),
+            ] {
+                let pixels = render_account_password(
+                    screen,
+                    &AccountPasswordPrompt {
+                        target: "a-windows-server-with-a-name-wider-than-the-screen",
+                        kind,
+                        account: "alice.longname@corp.example.com",
+                        choice,
+                        password_len: 256,
+                        notice: Some(SignInNotice::Error("The domain account is locked out")),
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    pixels.len(),
+                    usize::from(screen.width) * usize::from(screen.height) * 3
+                );
+            }
         }
     }
 
@@ -622,10 +669,13 @@ mod sign_in_tests {
 
     #[test]
     fn the_layout_has_room_for_every_hint() {
-        assert_eq!(
-            DOMAIN_PASSWORD_HINTS.len(),
-            usize::try_from(SIGN_IN_HINT_LINES).unwrap()
-        );
+        for hints in [
+            DOMAIN_PASSWORD_HINTS,
+            LOCAL_PASSWORD_HINTS,
+            ACCOUNT_CHOICE_HINTS,
+        ] {
+            assert_eq!(hints.len(), usize::try_from(SIGN_IN_HINT_LINES).unwrap());
+        }
         assert_eq!(
             SIGN_IN_HINTS.len(),
             usize::try_from(SIGN_IN_HINT_LINES).unwrap()

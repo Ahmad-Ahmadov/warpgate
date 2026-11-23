@@ -173,6 +173,10 @@ pub enum DesktopConnectionError {
         "target reported a {width}x{height} desktop, above the {MAX_DESKTOP_DIM} per-edge limit"
     )]
     OversizedDesktop { width: u16, height: u16 },
+    /// The target logged the session on as an account the user may not use there (one typed
+    /// into the target's own sign-in screen, say), so Warpgate ended it.
+    #[error("the target logged on as {reported}, an account the user may not use there")]
+    LogonAccountRefused { reported: String },
 }
 
 impl UserFacingReason for DesktopConnectionError {
@@ -185,6 +189,9 @@ impl UserFacingReason for DesktopConnectionError {
             Self::Handshake(_) => "Protocol negotiation with the target failed".into(),
             Self::Session(_) => "The target session failed".into(),
             Self::OversizedDesktop { .. } => "Target reported an unsupported desktop size".into(),
+            Self::LogonAccountRefused { reported } => format!(
+                "Windows signed in as {reported}, which you may not use on this target, so the session was ended. Sign in only as the account Warpgate connected you with."
+            ),
         }
     }
 }

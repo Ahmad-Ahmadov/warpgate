@@ -354,6 +354,11 @@ pub enum RdpTargetAuth {
     /// with the password they type when connecting. Warpgate keeps no password for it.
     #[serde(rename = "domain_account")]
     DomainAccount(RdpTargetDomainAccountAuth),
+    /// Each user signs in to the target as a Windows account an administrator assigned to
+    /// them here, with that account's password, typed when connecting. Warpgate keeps no
+    /// password for it, and no user may sign in as an account not assigned to them.
+    #[serde(rename = "local_account")]
+    LocalAccount(RdpTargetLocalAccountAuth),
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Object)]
@@ -386,6 +391,30 @@ pub enum RdpDomainUsernameFormat {
     #[serde(rename = "down_level")]
     #[oai(rename = "down_level")]
     DownLevel,
+}
+
+/// Sign in as a Windows account assigned to the connecting user: a local account of the
+/// target (or any account the target accepts), which the user may use only if it is assigned
+/// to them, and a password they type, used for this one connection only.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Object, Default)]
+pub struct RdpTargetLocalAccountAuth {
+    /// The accounts users may sign in as, and who may use each.
+    #[serde(default)]
+    #[oai(default)]
+    pub accounts: Vec<RdpLocalAccountAssignment>,
+}
+
+/// A Windows account of an RDP target, and the Warpgate users allowed to sign in as it.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Object)]
+pub struct RdpLocalAccountAssignment {
+    /// The account's name: `name`, which takes the target's computer name (its `domain`)
+    /// when one is set, or `COMPUTER\name`.
+    #[oai(validator(min_length = 1, max_length = 256))]
+    pub username: String,
+    /// The Warpgate users the account is assigned to. Nobody else may sign in as it.
+    #[serde(default)]
+    #[oai(default)]
+    pub users: Vec<Uuid>,
 }
 
 impl Default for RdpTargetAuth {
@@ -597,7 +626,7 @@ impl TargetSecrets for TargetRdpOptions {
         match &mut self.auth {
             RdpTargetAuth::Password(auth) => vec![&mut auth.password],
             // The password is the user's, typed when connecting, and never stored.
-            RdpTargetAuth::DomainAccount(_) => vec![],
+            RdpTargetAuth::DomainAccount(_) | RdpTargetAuth::LocalAccount(_) => vec![],
         }
     }
 }
@@ -976,5 +1005,36 @@ mod tests {
         let json = serde_json::to_value(&rdp.auth).unwrap();
         assert_eq!(json["kind"], "domain_account");
         assert_eq!(json["username_format"], "down_level");
+    }
+
+    /// A local-account target stores who may use each account, and no password.
+    #[test]
+    fn a_local_account_target_keeps_assignments_and_no_secret() {
+        use super::{
+            RdpLocalAccountAssignment, RdpTargetAuth, RdpTargetLocalAccountAuth, TargetSecrets,
+        };
+
+        let mut rdp: TargetRdpOptions =
+            serde_json::from_str(r#"{"auth":{"kind":"local_account"}}"#).unwrap();
+        assert_eq!(
+            rdp.auth,
+            RdpTargetAuth::LocalAccount(RdpTargetLocalAccountAuth { accounts: vec![] })
+        );
+        assert!(rdp.secrets_mut().is_empty());
+
+        let user = uuid::Uuid::from_u128(7);
+        let rdp: TargetRdpOptions = serde_json::from_str(&format!(
+            r#"{{"auth":{{"kind":"local_account","accounts":[{{"username":"SRV01\\operator","users":["{user}"]}}]}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            rdp.auth,
+            RdpTargetAuth::LocalAccount(RdpTargetLocalAccountAuth {
+                accounts: vec![RdpLocalAccountAssignment {
+                    username: r"SRV01\operator".to_owned(),
+                    users: vec![user],
+                }],
+            })
+        );
     }
 }

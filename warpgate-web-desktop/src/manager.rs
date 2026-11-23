@@ -2,14 +2,14 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::stream::{FuturesOrdered, StreamExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info_span, warn};
 use warpgate_common::{TargetOptions, UserSessionId, WarpgateError};
-use warpgate_core::domain_account::DomainCredentials;
+use warpgate_core::rdp_account::{SignInKind, SignInPlan, TargetCredentials, verify_sign_in};
 use warpgate_core::recordings::{DesktopRecorder, DesktopRecordingMetadata};
 use warpgate_core::{
     AdmittedTarget, DesktopClientHandles, DesktopConnectionError, DesktopEvent, Services,
@@ -21,10 +21,18 @@ use warpgate_web_clients_common::{
 };
 
 use crate::dirty::DirtyTracker;
-use crate::protocol::{ServerMessage, phase_for};
+use crate::protocol::{ServerMessage, SignInRequest, phase_for};
 use crate::session::{DesktopBackend, WebDesktopSession};
 
 const MAX_SESSIONS_PER_USER: usize = 50;
+
+/// Refused passwords a session may be answered with before it is ended, as on the native
+/// RDP password screen: well under a typical directory lockout threshold.
+const MAX_SIGN_IN_ATTEMPTS: usize = 3;
+
+/// How long a session waits for the browser to answer its sign-in request, across all of its
+/// attempts.
+const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Default)]
 pub struct WebDesktopClientManager(ClientManager<WebDesktopSession>);
@@ -41,15 +49,17 @@ impl WebDesktopClientManager {
         Self::default()
     }
 
-    /// `domain_credentials` signs in to a target that takes the user's own directory account:
-    /// checked against the directory already, and held only until the target is connected.
+    /// `sign_in` is who the user signs in to an RDP target as, from
+    /// [`warpgate_core::rdp_account::plan_sign_in`]: for an account they type the password
+    /// of, the session asks the browser for it once approved, and checks it the way the
+    /// native RDP listener does.
     pub async fn create_session(
         &self,
         services: &Services,
         authorization: TargetAuthorization,
         remote_address: Option<SocketAddr>,
         size: Option<(u16, u16)>,
-        domain_credentials: Option<DomainCredentials>,
+        sign_in: SignInPlan,
     ) -> Result<UserSessionId, WarpgateError> {
         let user_id = authorization.user_info().id;
         let username = authorization.user_info().username.clone();
@@ -87,7 +97,7 @@ impl WebDesktopClientManager {
                 authorization,
                 remote_address,
                 size,
-                domain_credentials,
+                sign_in,
                 self.0.clone(),
                 services.clone(),
             )
@@ -105,7 +115,7 @@ async fn run_session(
     authorization: TargetAuthorization,
     remote_address: Option<SocketAddr>,
     size: Option<(u16, u16)>,
-    domain_credentials: Option<DomainCredentials>,
+    sign_in: SignInPlan,
     registry: ClientManager<WebDesktopSession>,
     services: Services,
 ) {
@@ -116,22 +126,95 @@ async fn run_session(
         &services,
         authorization,
         remote_address,
-        // Moves the credentials in: a session refused or abandoned before it connects drops
-        // them with this closure, unused.
         move |admitted| async move {
-            let (handles, recorder, encode_jpeg) = connect(
-                session_ref,
-                services_ref,
-                admitted,
-                size,
-                domain_credentials,
-            )
-            .await
-            .map_err(|e| Arc::new(DesktopConnectionError::from(e)))?;
+            // The account's password is asked for only now: after sign-in, second factor
+            // and approval, so nobody types one for a session that is not approved. It is
+            // held from the browser's answer until the target is connected, and no longer.
+            let credentials = if sign_in.kind().asks_for_password() {
+                Some(
+                    ask_sign_in(session_ref, services_ref, &admitted, &sign_in)
+                        .await
+                        .map_err(|e| Arc::new(DesktopConnectionError::from(e)))?,
+                )
+            } else {
+                None
+            };
+            let (handles, recorder, encode_jpeg) =
+                connect(session_ref, services_ref, admitted, size, credentials)
+                    .await
+                    .map_err(|e| Arc::new(DesktopConnectionError::from(e)))?;
             relay_events(session_ref, handles, recorder, encode_jpeg).await
         },
     )
     .await;
+}
+
+/// Ask the browser for the password of the account to sign in to the target as, and check
+/// it with [`verify_sign_in`], which takes only an account `plan` allows the admitted user,
+/// whatever the browser names. A refused password is asked for again, saying why, up to
+/// [`MAX_SIGN_IN_ATTEMPTS`] times; one that cannot be accepted at all ends the session.
+async fn ask_sign_in(
+    session: &WebDesktopSession,
+    services: &Services,
+    admitted: &AdmittedTarget,
+    plan: &SignInPlan,
+) -> Result<TargetCredentials, WarpgateError> {
+    let TargetOptions::Rdp(options) = admitted.options() else {
+        return Err(WarpgateError::InvalidTarget);
+    };
+    let Some(mut answers) = session.take_sign_in_answers() else {
+        return Err(WarpgateError::InconsistentState(
+            "the session's sign-in was already taken".into(),
+        ));
+    };
+    let user_id = admitted.user_info().id;
+    let kind = match plan.kind() {
+        SignInKind::DomainAccount => "domain_account",
+        SignInKind::LocalAccount | SignInKind::Managed => "local_account",
+    };
+    let deadline = tokio::time::Instant::now() + SIGN_IN_TIMEOUT;
+    let mut error = None;
+    for attempt in 1..=MAX_SIGN_IN_ATTEMPTS {
+        session
+            .ask_sign_in(SignInRequest {
+                kind,
+                target: admitted.target().name.clone(),
+                accounts: plan.account_names(),
+                error: error.take(),
+            })
+            .await;
+        let answer = tokio::select! {
+            () = session.cancellation().cancelled() => None,
+            () = tokio::time::sleep_until(deadline) => None,
+            answer = answers.recv() => answer,
+        };
+        session.close_sign_in();
+        let Some(answer) = answer else {
+            return Err(WarpgateError::InvalidRequest(
+                "The password was not entered in time".into(),
+            ));
+        };
+        // `verify_sign_in` logs its answer, without the password.
+        match verify_sign_in(
+            &services.db,
+            user_id,
+            options,
+            answer.account.as_deref(),
+            answer.password.into_zeroizing(),
+        )
+        .await
+        {
+            Ok(credentials) => return Ok(credentials),
+            Err(refusal) if refusal.may_retry() && attempt < MAX_SIGN_IN_ATTEMPTS => {
+                error = Some(refusal.user_message().to_owned());
+            }
+            Err(refusal) => {
+                warn!(%refusal, "Ending the session: the account's password was refused");
+                return Err(WarpgateError::InvalidRequest(refusal.user_message().into()));
+            }
+        }
+    }
+    unreachable!("the last attempt returns")
 }
 
 /// connect & start recording
@@ -140,7 +223,7 @@ async fn connect(
     services: &Services,
     admitted: AdmittedTarget,
     size: Option<(u16, u16)>,
-    domain_credentials: Option<DomainCredentials>,
+    credentials: Option<TargetCredentials>,
 ) -> Result<(DesktopClientHandles, Option<Arc<DesktopRecorder>>, bool), WarpgateError> {
     let target_session_id = admitted.id();
     let (handles, encode_jpeg) = match session.target_kind() {
@@ -163,7 +246,7 @@ async fn connect(
                 admitted.narrow()?,
                 size.unwrap_or(warpgate_protocol_rdp::DEFAULT_SIZE),
                 services.secret_backends.clone(),
-                domain_credentials,
+                credentials,
             )?;
             // The RDP helper only ever emits raw BGRA.
             (handles, true)

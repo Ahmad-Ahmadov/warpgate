@@ -12,6 +12,7 @@ use warpgate_web_clients_common::{ClientManager, run_stream_loop};
 
 use crate::manager::WebDesktopClientManager;
 use crate::protocol::{ClientMessage, WsPayload};
+use crate::session::SignInSubmission;
 
 #[handler]
 pub async fn ws_handler(
@@ -46,6 +47,8 @@ pub async fn ws_handler(
             session.push(keyframe).await;
         }
         session.replay_phase().await;
+        // A sign-in request still open, for a browser that reloaded while it was shown.
+        session.replay_sign_in().await;
 
         let input_session = session.clone();
         run_stream_loop(
@@ -60,6 +63,12 @@ pub async fn ws_handler(
                 let session = input_session.clone();
                 async move {
                     if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
+                        // The account and password to sign in to the target with go to the
+                        // sign-in waiting for them, never to the target as input.
+                        if let ClientMessage::SignIn { account, password } = client_msg {
+                            session.answer_sign_in(SignInSubmission { account, password });
+                            return;
+                        }
                         // Answer a refresh from our own surface as well as asking the
                         // backend. RDP has no repaint request wired through the helper,
                         // so forwarding alone would leave the viewer stuck on black.

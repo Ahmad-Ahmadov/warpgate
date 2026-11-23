@@ -45,7 +45,7 @@ use tracing::{debug, warn};
 use warpgate_common::{
     RdpTargetAuth, RdpTargetCompression, SecretResolver, TargetRdpOptions, WarpgateError,
 };
-use warpgate_core::domain_account::DomainCredentials;
+use warpgate_core::rdp_account::TargetCredentials;
 use warpgate_core::{
     DESKTOP_CONNECT_TIMEOUT, DESKTOP_HANDSHAKE_TIMEOUT, DesktopConnectionError, DesktopEvent,
     DesktopInput, DesktopRect, DesktopState, check_desktop_size, within_deadline,
@@ -53,6 +53,7 @@ use warpgate_core::{
 
 use self::damage::Damage;
 pub(crate) use self::logon::LogonWatcher;
+use self::logon::{LogonReport, RefusedLogon, logon_reports};
 use crate::client::input::InputHold;
 use crate::clipboard::{Clipboard, ClipboardSink, TextClipboard};
 use crate::desktop_size::bound_desktop_size;
@@ -94,9 +95,9 @@ pub async fn run(
     event_tx: Sender<DesktopEvent>,
     input_rx: Receiver<DesktopInput>,
     mut abort_rx: UnboundedReceiver<()>,
-    logon: LogonWatcher,
+    mut logon: LogonWatcher,
     secrets: Arc<dyn SecretResolver>,
-    domain_credentials: Option<DomainCredentials>,
+    credentials: Option<TargetCredentials>,
 ) -> Result<(), DesktopConnectionError> {
     event_tx
         .send(DesktopEvent::State(DesktopState::Connecting))
@@ -109,9 +110,9 @@ pub async fn run(
     let (width, height) =
         MonitorLayoutEntry::adjust_display_size(u32::from(width), u32::from(height));
     // Who the target is signed in to as: the stored account and its stored (or vaulted)
-    // password, or the user's own directory account with the password they typed, which
-    // was checked against the directory before this and is dropped, and wiped, right after.
-    let config = match (&options.auth, domain_credentials) {
+    // password, or an account the user may use (their own directory account, or one assigned
+    // to them) with the password they typed, which is dropped, and wiped, right after.
+    let config = match (&options.auth, credentials) {
         (RdpTargetAuth::Password(auth), _) => {
             let password = auth.password.resolve(&*secrets).await?;
             build_config(
@@ -120,26 +121,33 @@ pub async fn run(
                     username: &options.username,
                     domain: options.domain.as_deref(),
                     password: password.expose_secret(),
+                    interactive: options.interactive_logon,
                 },
                 width as u16,
                 height as u16,
                 keyboard_layout,
             )
         }
-        (RdpTargetAuth::DomainAccount(_), Some(credentials)) => build_config(
-            &options,
-            SignInAs {
-                username: &credentials.account().username,
-                domain: credentials.account().domain.as_deref(),
-                password: credentials.password(),
-            },
-            width as u16,
-            height as u16,
-            keyboard_layout,
-        ),
-        (RdpTargetAuth::DomainAccount(_), None) => {
+        (RdpTargetAuth::DomainAccount(_) | RdpTargetAuth::LocalAccount(_), Some(credentials)) => {
+            build_config(
+                &options,
+                SignInAs {
+                    username: &credentials.account().username,
+                    domain: credentials.account().domain.as_deref(),
+                    password: credentials.password(),
+                    // The password the user typed signs the session on, so Windows does not
+                    // ask for it again, and its sign-in screen, where another account could
+                    // be typed, is not shown.
+                    interactive: false,
+                },
+                width as u16,
+                height as u16,
+                keyboard_layout,
+            )
+        }
+        (RdpTargetAuth::DomainAccount(_) | RdpTargetAuth::LocalAccount(_), None) => {
             return Err(WarpgateError::InvalidRequest(
-                "This target signs in with your domain account, and no domain password was given"
+                "This target signs in with an account you enter the password of when connecting, and no password was given"
                     .into(),
             )
             .into());
@@ -185,10 +193,15 @@ pub async fn run(
         &mut abort_rx,
         &clipboard,
         clipboard_rx,
-        &logon,
+        &mut logon,
     )
     .await
-    .map_err(DesktopConnectionError::Session)
+    .map_err(|error| match error.downcast::<RefusedLogon>() {
+        Ok(refused) => DesktopConnectionError::LogonAccountRefused {
+            reported: refused.reported,
+        },
+        Err(error) => DesktopConnectionError::Session(error),
+    })
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -201,7 +214,7 @@ async fn active_loop(
     abort_rx: &mut UnboundedReceiver<()>,
     clipboard: &Clipboard<ClientClipboardSink>,
     mut clipboard_rx: UnboundedReceiver<ClipboardOut>,
-    logon: &LogonWatcher,
+    logon: &mut LogonWatcher,
 ) -> Result<()> {
     let activation_factory = connection_result.activation_factory;
     let channel_ids = ChannelIds {
@@ -251,6 +264,8 @@ async fn active_loop(
             pending_resize = None;
         }
 
+        // Whether this frame's logon reports were read here, ahead of IronRDP.
+        let mut logon_read = false;
         let outputs = tokio::select! {
             biased;
             _ = abort_rx.recv() => return Ok(()),
@@ -340,6 +355,13 @@ async fn active_loop(
             pdu = framed.read_pdu() => {
                 let (action, payload) = pdu.context("reading PDU")?;
                 let received_at = framed.last_read_at();
+                // A logon is checked before IronRDP processes the frame, which keeps the
+                // account it names to itself; one as an account the user may not use ends
+                // the session here.
+                for report in logon_reports(action, &payload, channel_ids.io) {
+                    logon_read = true;
+                    logon.observe(report)?;
+                }
                 active_stage
                     .process(image, action, &payload, received_at)
                     .context("processing PDU")?
@@ -350,16 +372,18 @@ async fn active_loop(
             .iter()
             .any(|output| matches!(output, ActiveStageOutput::DeactivateAll));
 
-        // `SessionId` precedes the `SaveSessionInfo` of the same notification.
-        let mut session_id = None;
-        for output in &outputs {
-            match output {
-                ActiveStageOutput::SessionId(id) => session_id = Some(*id),
-                ActiveStageOutput::SaveSessionInfo { logon_complete } => {
-                    logon.notify_logon(*logon_complete, session_id.take());
-                }
-                _ => {}
-            }
+        // A logon IronRDP read and this loop could not: reported without its account.
+        if !logon_read
+            && outputs.iter().any(|output| {
+                matches!(
+                    output,
+                    ActiveStageOutput::SaveSessionInfo {
+                        logon_complete: true
+                    }
+                )
+            })
+        {
+            logon.observe(LogonReport::Unnamed)?;
         }
 
         match process_outputs(
@@ -900,6 +924,7 @@ pub(crate) fn test_connector_config(username: &str, password: &str) -> connector
             username,
             domain: None,
             password,
+            interactive: false,
         },
         1024,
         768,
@@ -917,6 +942,9 @@ struct SignInAs<'a> {
     username: &'a str,
     domain: Option<&'a str>,
     password: &'a str,
+    /// Leave the session at the target's own sign-in screen: an interactive-logon target
+    /// with stored credentials only.
+    interactive: bool,
 }
 
 fn build_config(
@@ -976,8 +1004,8 @@ fn build_config(
         // interactive-logon target flips both switches: no autologon flag, and CredSSP
         // delegates no credentials — NLA still authenticates the connection, but the
         // server has nothing to log the session on with and shows its sign-in screen.
-        autologon: !options.interactive_logon,
-        credssp_credentialless: options.interactive_logon,
+        autologon: !sign_in_as.interactive,
+        credssp_credentialless: sign_in_as.interactive,
         enable_audio_playback: false,
         performance_flags: PerformanceFlags::default(),
         license_cache: None,

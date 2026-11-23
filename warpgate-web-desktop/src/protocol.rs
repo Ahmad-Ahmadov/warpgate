@@ -1,5 +1,8 @@
+use std::fmt;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use warpgate_core::rdp_account::{Zeroize as _, Zeroizing};
 use warpgate_core::{
     DesktopEvent, DesktopInput, DesktopRect, DesktopState, MAX_CLIPBOARD_BYTES, Scancode,
     truncate_clipboard_contents_in_place,
@@ -59,6 +62,52 @@ pub enum ClientMessage {
         width: u16,
         height: u16,
     },
+    /// The account to sign in to the target as and its password, answering a
+    /// [`ServerMessage::SignIn`]. Never input: it goes to the sign-in waiting for it, never
+    /// to the target or the recording.
+    SignIn {
+        #[serde(default)]
+        account: Option<String>,
+        password: SignInPassword,
+    },
+}
+
+/// A password the browser sent for the account to sign in to the target as. Never printed,
+/// and wiped when dropped.
+#[derive(Deserialize, Default)]
+#[serde(transparent)]
+pub struct SignInPassword(String);
+
+impl SignInPassword {
+    pub fn into_zeroizing(mut self) -> Zeroizing<String> {
+        Zeroizing::new(std::mem::take(&mut self.0))
+    }
+}
+
+impl fmt::Debug for SignInPassword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl Drop for SignInPassword {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+/// What the browser is asked for when a target signs in with an account the user types the
+/// password of: after the session is approved, before the target is dialed.
+#[derive(Debug, Clone, Serialize)]
+pub struct SignInRequest {
+    /// How the target signs in: `domain_account` or `local_account`.
+    pub kind: &'static str,
+    pub target: String,
+    /// The accounts the user may sign in as, to choose from: one for a domain account. The
+    /// browser shows them; it cannot add to them.
+    pub accounts: Vec<String>,
+    /// Why the last attempt was refused.
+    pub error: Option<String>,
 }
 
 impl From<ClientMessage> for Option<DesktopInput> {
@@ -94,6 +143,7 @@ impl From<ClientMessage> for Option<DesktopInput> {
             }
             ClientMessage::Refresh => DesktopInput::Refresh,
             ClientMessage::Resize { width, height } => DesktopInput::Resize { width, height },
+            ClientMessage::SignIn { .. } => return None,
         })
     }
 }
@@ -143,6 +193,8 @@ pub enum ServerMessage {
         text: String,
     },
     Bell,
+    /// Ask for the password of the account to sign in to the target as.
+    SignIn(SignInRequest),
 }
 
 impl From<SessionPhase> for ServerMessage {

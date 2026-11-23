@@ -1469,57 +1469,6 @@
         "operationId": "create_web_desktop_session"
       }
     },
-    "/web-desktop/targets/{target_id}/account": {
-      "get": {
-        "summary": "Whether connecting to a desktop target takes the user's own domain password, and\nwhich account it signs in as: for the browser to ask for the password, with the\naccount filled in, before it starts the session. Authorized as starting one is.",
-        "parameters": [
-          {
-            "name": "target_id",
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            },
-            "in": "path",
-            "required": true,
-            "deprecated": false,
-            "explode": true
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json; charset=utf-8": {
-                "schema": {
-                  "$ref": "#/components/schemas/WebDesktopTargetAccount"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": ""
-          },
-          "403": {
-            "description": ""
-          },
-          "404": {
-            "description": ""
-          }
-        },
-        "security": [
-          {
-            "TokenSecurityScheme": []
-          },
-          {
-            "CookieSecurityScheme": []
-          },
-          {
-            "ClusterSecurityScheme": []
-          }
-        ],
-        "operationId": "get_web_desktop_target_account"
-      }
-    },
     "/web-desktop/sessions/{session_id}": {
       "get": {
         "parameters": [
@@ -1865,10 +1814,6 @@
           "height": {
             "type": "integer",
             "format": "uint16"
-          },
-          "domain_password": {
-            "type": "string",
-            "description": "The user's own domain password, for a target that signs in with the user's domain\naccount (see `get_web_desktop_target_account`). Checked with the directory, used for\nthis one connection and never stored. Ignored for any other target."
           }
         }
       },
@@ -2934,28 +2879,6 @@
           },
           "target_kind": {
             "$ref": "#/components/schemas/TargetKind"
-          }
-        }
-      },
-      "WebDesktopTargetAccount": {
-        "type": "object",
-        "title": "WebDesktopTargetAccount",
-        "description": "How the user signs in to a desktop target, asked before connecting to it.",
-        "required": [
-          "domain_account"
-        ],
-        "properties": {
-          "domain_account": {
-            "type": "boolean",
-            "description": "The target signs in with the user's own domain account, so connecting to it takes\nthe user's domain password."
-          },
-          "username": {
-            "type": "string",
-            "description": "The account the target is signed in to, as `DOMAIN\\user` or `user@domain`, when\n`domain_account` is set and the directory has one for the user."
-          },
-          "problem": {
-            "type": "string",
-            "description": "Why the user cannot sign in to the target with a domain account, when they cannot."
           }
         }
       }

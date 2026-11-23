@@ -74,6 +74,10 @@ pub struct LdapUser {
     /// The entry's user principal name (`alice@corp.example.com`), when it has one.
     #[serde(default)]
     pub user_principal_name: Option<String>,
+    /// The account as Windows names it in a logon, `CORP\alice` (Active Directory's
+    /// `msDS-PrincipalName`), when the directory gave it.
+    #[serde(default)]
+    pub nt_account_name: Option<String>,
 }
 
 /// The answer to a user's password, from [`crate::authenticate_user`].

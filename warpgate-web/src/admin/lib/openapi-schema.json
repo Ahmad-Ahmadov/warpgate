@@ -7018,6 +7018,31 @@
           "down_level"
         ]
       },
+      "RdpLocalAccountAssignment": {
+        "type": "object",
+        "title": "RdpLocalAccountAssignment",
+        "description": "A Windows account of an RDP target, and the Warpgate users allowed to sign in as it.",
+        "required": [
+          "username"
+        ],
+        "properties": {
+          "username": {
+            "type": "string",
+            "description": "The account's name: `name`, which takes the target's computer name (its `domain`)\nwhen one is set, or `COMPUTER\\name`.",
+            "maxLength": 256,
+            "minLength": 1
+          },
+          "users": {
+            "type": "array",
+            "description": "The Warpgate users the account is assigned to. Nobody else may sign in as it.",
+            "default": [],
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        }
+      },
       "RdpTargetAuth": {
         "type": "object",
         "oneOf": [
@@ -7026,13 +7051,17 @@
           },
           {
             "$ref": "#/components/schemas/RdpTargetAuth_RdpTargetDomainAccountAuth"
+          },
+          {
+            "$ref": "#/components/schemas/RdpTargetAuth_RdpTargetLocalAccountAuth"
           }
         ],
         "discriminator": {
           "propertyName": "kind",
           "mapping": {
             "Password": "#/components/schemas/RdpTargetAuth_RdpTargetPasswordAuth",
-            "DomainAccount": "#/components/schemas/RdpTargetAuth_RdpTargetDomainAccountAuth"
+            "DomainAccount": "#/components/schemas/RdpTargetAuth_RdpTargetDomainAccountAuth",
+            "LocalAccount": "#/components/schemas/RdpTargetAuth_RdpTargetLocalAccountAuth"
           }
         }
       },
@@ -7055,6 +7084,28 @@
           },
           {
             "$ref": "#/components/schemas/RdpTargetDomainAccountAuth"
+          }
+        ]
+      },
+      "RdpTargetAuth_RdpTargetLocalAccountAuth": {
+        "allOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "LocalAccount"
+                ],
+                "example": "LocalAccount"
+              }
+            }
+          },
+          {
+            "$ref": "#/components/schemas/RdpTargetLocalAccountAuth"
           }
         ]
       },
@@ -7095,6 +7146,21 @@
         "properties": {
           "username_format": {
             "$ref": "#/components/schemas/RdpDomainUsernameFormat"
+          }
+        }
+      },
+      "RdpTargetLocalAccountAuth": {
+        "type": "object",
+        "title": "RdpTargetLocalAccountAuth",
+        "description": "Sign in as a Windows account assigned to the connecting user: a local account of the\ntarget (or any account the target accepts), which the user may use only if it is assigned\nto them, and a password they type, used for this one connection only.",
+        "properties": {
+          "accounts": {
+            "type": "array",
+            "description": "The accounts users may sign in as, and who may use each.",
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/RdpLocalAccountAssignment"
+            }
           }
         }
       },

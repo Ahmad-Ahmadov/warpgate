@@ -11,8 +11,9 @@
 //! could not connect at all without "Allow me to save credentials". It now shows this form,
 //! and checks what is typed into it exactly as it checks a password from the Client Info PDU.
 //!
-//! The same form, with the account filled in and fixed, asks for the viewer's own domain
-//! password for a target that signs in with it ([`SignInScreen::for_domain_password`]).
+//! The same form, with the account filled in and fixed, asks for the password of the
+//! account a target signs the viewer in as: their own domain account, or one assigned to
+//! them, which the viewer can step through but not type ([`SignInScreen::for_account_password`]).
 
 use std::time::Duration;
 
@@ -20,9 +21,9 @@ use anyhow::Result;
 use tokio::sync::mpsc::{Sender, UnboundedReceiver};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
 use warpgate_common::consts::TICKET_SELECTOR_PREFIX;
-use warpgate_core::domain_account::{MAX_DOMAIN_PASSWORD_CHARS, Zeroize as _};
+use warpgate_core::rdp_account::{MAX_ACCOUNT_PASSWORD_CHARS, Zeroize as _};
 use warpgate_core::{DesktopInput, Scancode};
-use warpgate_desktop_ui::{self as ui, SignInField, SignInNotice, SignInPrompt};
+use warpgate_desktop_ui::{self as ui, AccountKind, SignInField, SignInNotice, SignInPrompt};
 
 use super::hold_screen::{HOLD_RENDER_INTERVAL, HoldPainter};
 use super::protocol::{Event as ServerEvent, Input as ServerInput};
@@ -44,6 +45,7 @@ const MAX_FIELD_CHARS: usize = 256;
 const REFUSED: &str = "Sign-in failed. Check the username, target and password";
 const CHECKING: &str = "Signing in...";
 const CHECKING_DOMAIN_PASSWORD: &str = "Checking your domain password...";
+const CONNECTING: &str = "Connecting...";
 
 /// Whether the viewer has to sign in on the form: it sent no password, and its username is
 /// not a ticket, which needs none.
@@ -69,9 +71,9 @@ pub(super) enum SignInStep {
 /// The sign-in form on the viewer's screen.
 pub(super) struct SignInScreen {
     form: Form,
-    /// The target, when the form asks for the viewer's domain password to sign in to it
-    /// rather than for Warpgate credentials.
-    domain_target: Option<String>,
+    /// The target, and the kind of account, when the form asks for the password of an
+    /// account to sign in to it with rather than for Warpgate credentials.
+    account_target: Option<(String, AccountKind)>,
     keyboard: Keyboard,
     painter: HoldPainter,
     /// Whether the form has changed since it was last painted. It is painted only then:
@@ -96,21 +98,32 @@ impl SignInScreen {
         Self::with_form(Form::new(username), None, screen)
     }
 
-    /// A form asking for the viewer's own domain password, to sign in to `target` as
-    /// `account`. The account is shown and cannot be edited: it is the directory's, not the
-    /// viewer's to choose. A submission's `username` is that account, unchanged.
-    pub(super) fn for_domain_password(target: &str, account: &str, screen: ui::Screen) -> Self {
+    /// A form asking for the password of an account to sign in to `target` as: the first of
+    /// `accounts`, or another of them that the viewer steps to. The account is shown and
+    /// cannot be edited: the accounts are Warpgate's to give (the directory's, or those
+    /// assigned to the viewer), not the viewer's to type. A submission's `username` is one
+    /// of them, unchanged.
+    pub(super) fn for_account_password(
+        target: &str,
+        kind: AccountKind,
+        accounts: Vec<String>,
+        screen: ui::Screen,
+    ) -> Self {
         Self::with_form(
-            Form::for_domain_password(account),
-            Some(target.to_owned()),
+            Form::for_account_password(accounts, kind),
+            Some((target.to_owned(), kind)),
             screen,
         )
     }
 
-    fn with_form(form: Form, domain_target: Option<String>, screen: ui::Screen) -> Self {
+    fn with_form(
+        form: Form,
+        account_target: Option<(String, AccountKind)>,
+        screen: ui::Screen,
+    ) -> Self {
         Self {
             form,
-            domain_target,
+            account_target,
             keyboard: Keyboard::default(),
             painter: HoldPainter::new(screen),
             dirty: true,
@@ -158,10 +171,10 @@ impl SignInScreen {
     /// Show that the submitted credentials are being checked. That can take a moment (an
     /// LDAP bind, say), and the form is not repainted meanwhile.
     pub(super) async fn show_checking(&mut self, server_in_tx: &Sender<ServerInput>) -> Result<()> {
-        self.form.notice = Some(SignInNotice::Info(if self.domain_target.is_some() {
-            CHECKING_DOMAIN_PASSWORD
-        } else {
-            CHECKING
+        self.form.notice = Some(SignInNotice::Info(match &self.account_target {
+            None => CHECKING,
+            Some((_, AccountKind::Domain)) => CHECKING_DOMAIN_PASSWORD,
+            Some((_, AccountKind::Local)) => CONNECTING,
         }));
         self.paint(server_in_tx).await
     }
@@ -172,9 +185,9 @@ impl SignInScreen {
         self.refused_with(REFUSED)
     }
 
-    /// Report a refused attempt with `notice`, which says why. For the domain password,
-    /// where the directory's answer is the viewer's own business: their password, their
-    /// account. Returns `false` once the viewer has used up its [`MAX_SIGN_IN_ATTEMPTS`].
+    /// Report a refused attempt with `notice`, which says why. For an account's password,
+    /// where the answer is the viewer's own business: their password, an account of theirs.
+    /// Returns `false` once the viewer has used up its [`MAX_SIGN_IN_ATTEMPTS`].
     pub(super) fn refused_with(&mut self, notice: &'static str) -> bool {
         self.failures += 1;
         self.form.focus = SignInField::Password;
@@ -265,15 +278,21 @@ impl SignInScreen {
     async fn paint(&mut self, server_in_tx: &Sender<ServerInput>) -> Result<()> {
         self.dirty = false;
         let prompt = self.form.prompt();
-        let domain_target = self.domain_target.as_deref();
+        let choice = self.form.choice();
+        let account_target = self
+            .account_target
+            .as_ref()
+            .map(|(target, kind)| (target.as_str(), *kind));
         self.painter
-            .paint(server_in_tx, |screen, _tick| match domain_target {
+            .paint(server_in_tx, |screen, _tick| match account_target {
                 None => ui::render_sign_in(screen, &prompt),
-                Some(target) => ui::render_domain_password(
+                Some((target, kind)) => ui::render_account_password(
                     screen,
-                    &ui::DomainPasswordPrompt {
+                    &ui::AccountPasswordPrompt {
                         target,
+                        kind,
                         account: prompt.username,
+                        choice,
                         password_len: prompt.password_len,
                         notice: prompt.notice,
                     },
@@ -303,6 +322,10 @@ enum Edit {
     Clear,
     Next,
     Previous,
+    /// The Up arrow: to the username field, or to the previous account to choose from.
+    Up,
+    /// The Down arrow: to the password field, or to the next account to choose from.
+    Down,
     Focus(SignInField),
     Paste,
     Submit,
@@ -318,6 +341,12 @@ struct Form {
     /// The username is an account the form was given, not one to type: the focus stays on
     /// the password, and only a password is asked for.
     account_fixed: bool,
+    /// With `account_fixed`, the accounts the username may be stepped through, and which of
+    /// them it is. Never anything else: the viewer cannot type one.
+    accounts: Vec<String>,
+    selected: usize,
+    /// What an empty password is told, with `account_fixed`.
+    missing_password: &'static str,
 }
 
 impl Drop for Form {
@@ -342,19 +371,51 @@ impl Form {
             focus,
             notice: None,
             account_fixed: false,
+            accounts: vec![],
+            selected: 0,
+            missing_password: "Enter your password",
         }
     }
 
-    fn for_domain_password(account: &str) -> Self {
+    fn for_account_password(accounts: Vec<String>, kind: AccountKind) -> Self {
         Self {
-            username: account.to_owned(),
+            username: accounts.first().cloned().unwrap_or_default(),
             // Room for the longest password up front, so typing it never reallocates and
             // leaves a copy of its beginning behind in freed memory.
-            password: String::with_capacity(MAX_DOMAIN_PASSWORD_CHARS * 4),
+            password: String::with_capacity(MAX_ACCOUNT_PASSWORD_CHARS * 4),
             focus: SignInField::Password,
             notice: None,
             account_fixed: true,
+            accounts,
+            selected: 0,
+            missing_password: match kind {
+                AccountKind::Domain => "Enter your domain password",
+                AccountKind::Local => "Enter the account's password",
+            },
         }
+    }
+
+    /// Where the account is among those to choose from, counting from 1, and how many
+    /// there are, when there are several.
+    fn choice(&self) -> Option<(usize, usize)> {
+        (self.accounts.len() > 1).then_some((self.selected + 1, self.accounts.len()))
+    }
+
+    /// Step to another of the accounts to choose from. The password typed so far was for
+    /// the account it leaves, so it is wiped.
+    fn choose(&mut self, forward: bool) {
+        let count = self.accounts.len();
+        if count < 2 {
+            return;
+        }
+        self.selected = if forward {
+            (self.selected + 1) % count
+        } else {
+            (self.selected + count - 1) % count
+        };
+        self.username.clone_from(&self.accounts[self.selected]);
+        self.password.zeroize();
+        self.notice = None;
     }
 
     const fn field_mut(&mut self) -> &mut String {
@@ -381,7 +442,13 @@ impl Form {
                 self.notice = None;
                 self.field_mut().clear();
             }
+            Edit::Up if self.account_fixed => self.choose(false),
+            Edit::Down | Edit::Focus(SignInField::Username) if self.account_fixed => {
+                self.choose(true);
+            }
             Edit::Next | Edit::Previous | Edit::Focus(_) if self.account_fixed => {}
+            Edit::Up => self.focus = SignInField::Username,
+            Edit::Down => self.focus = SignInField::Password,
             Edit::Next | Edit::Previous => {
                 self.focus = match self.focus {
                     SignInField::Username => SignInField::Password,
@@ -400,11 +467,11 @@ impl Form {
     fn submit(&mut self) -> Option<Submission> {
         if self.account_fixed {
             if self.password.is_empty() {
-                self.notice = Some(SignInNotice::Error("Enter your domain password"));
+                self.notice = Some(SignInNotice::Error(self.missing_password));
                 return None;
             }
             // Swapped for another buffer with room for a whole password, for a retry.
-            let password = String::with_capacity(MAX_DOMAIN_PASSWORD_CHARS * 4);
+            let password = String::with_capacity(MAX_ACCOUNT_PASSWORD_CHARS * 4);
             return Some(Submission {
                 username: self.username.clone(),
                 password: std::mem::replace(&mut self.password, password),
@@ -563,9 +630,9 @@ impl Keyboard {
             // Enter, on the main block and on the keypad.
             (0x1c, _) => Some(Edit::Submit),
             (0x01, false) => Some(Edit::Clear),
-            // Up and Down move between the fields.
-            (0x48, true) => Some(Edit::Focus(SignInField::Username)),
-            (0x50, true) => Some(Edit::Focus(SignInField::Password)),
+            // Up and Down move between the fields, or choose the account.
+            (0x48, true) => Some(Edit::Up),
+            (0x50, true) => Some(Edit::Down),
             (0x2f, false) if self.ctrl() && !self.alt() => Some(Edit::Paste),
             (0x52, true) if self.shift() => Some(Edit::Paste),
             // A chord types nothing. On a US keyboard Right Alt is Alt, not AltGr.
@@ -908,8 +975,8 @@ mod tests {
         assert_eq!(down(0x1c, false), Some(Edit::Submit));
         assert_eq!(down(0x1c, true), Some(Edit::Submit));
         assert_eq!(down(0x01, false), Some(Edit::Clear));
-        assert_eq!(down(0x48, true), Some(Edit::Focus(SignInField::Username)));
-        assert_eq!(down(0x50, true), Some(Edit::Focus(SignInField::Password)));
+        assert_eq!(down(0x48, true), Some(Edit::Up));
+        assert_eq!(down(0x50, true), Some(Edit::Down));
         assert_eq!(down(0x2a, false), None);
         assert_eq!(down(0x0f, false), Some(Edit::Previous));
         assert_eq!(down(0x52, true), Some(Edit::Paste));
@@ -1241,10 +1308,12 @@ mod tests {
     /// and no key or click moves the focus to it, let alone edits it.
     #[test]
     fn the_domain_account_cannot_be_edited() {
-        let mut form = Form::for_domain_password(r"CORP\alice");
+        let mut form = Form::for_account_password(vec![r"CORP\alice".into()], AccountKind::Domain);
         for edit in [
             Edit::Next,
             Edit::Previous,
+            Edit::Up,
+            Edit::Down,
             Edit::Focus(SignInField::Username),
         ] {
             form.apply(edit);
@@ -1262,13 +1331,58 @@ mod tests {
         assert_eq!(submission.username, r"CORP\alice");
         assert_eq!(submission.password, "s3cret");
         assert!(form.password.is_empty());
-        assert!(form.password.capacity() >= MAX_DOMAIN_PASSWORD_CHARS);
+        assert!(form.password.capacity() >= MAX_ACCOUNT_PASSWORD_CHARS);
+    }
+
+    /// Several assigned accounts are stepped through, never typed: what is submitted is
+    /// always one of them, and a password typed for one is not kept for the next.
+    #[test]
+    fn an_assigned_account_is_chosen_not_typed() {
+        let mut form = Form::for_account_password(
+            vec!["operator".into(), "backup".into(), "auditor".into()],
+            AccountKind::Local,
+        );
+        assert_eq!(form.choice(), Some((1, 3)));
+        for c in "admin".chars() {
+            form.apply(Edit::Type(c));
+        }
+        assert_eq!(
+            form.username, "operator",
+            "typing goes to the password only"
+        );
+        form.apply(Edit::Up);
+        assert_eq!(
+            (form.username.as_str(), form.choice()),
+            ("auditor", Some((3, 3)))
+        );
+        assert!(form.password.is_empty());
+        form.apply(Edit::Down);
+        form.apply(Edit::Focus(SignInField::Username));
+        assert_eq!(form.username, "backup");
+        assert!(form.apply(Edit::Submit).is_none());
+        assert_eq!(
+            form.notice,
+            Some(SignInNotice::Error("Enter the account's password"))
+        );
+        for c in "s3cret".chars() {
+            form.apply(Edit::Type(c));
+        }
+        let submission = form.apply(Edit::Submit).unwrap();
+        assert_eq!(submission.username, "backup");
+        assert_eq!(submission.password, "s3cret");
+
+        let single = Form::for_account_password(vec!["operator".into()], AccountKind::Local);
+        assert_eq!(single.choice(), None);
     }
 
     #[test]
     fn a_refused_domain_password_says_why() {
-        let mut sign_in =
-            SignInScreen::for_domain_password("server", "alice@corp.example.com", screen());
+        let mut sign_in = SignInScreen::for_account_password(
+            "server",
+            AccountKind::Domain,
+            vec!["alice@corp.example.com".into()],
+            screen(),
+        );
         assert!(sign_in.refused_with("The domain password is incorrect"));
         assert_eq!(
             sign_in.form.notice,
@@ -1281,8 +1395,12 @@ mod tests {
     #[tokio::test]
     async fn typing_the_domain_password_submits_it() {
         let (tx, mut events) = unbounded_channel();
-        let mut sign_in =
-            SignInScreen::for_domain_password("server", "alice@corp.example.com", screen());
+        let mut sign_in = SignInScreen::for_account_password(
+            "server",
+            AccountKind::Domain,
+            vec!["alice@corp.example.com".into()],
+            screen(),
+        );
         // Tab first: it must not move the typing into the account.
         press(&tx, 0x0f, false);
         type_text(&tx, "pa55word");

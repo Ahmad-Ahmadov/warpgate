@@ -18,9 +18,9 @@ use anyhow::Context;
 use futures::future::BoxFuture;
 pub use server::bind_server;
 use tokio::sync::mpsc::{channel, unbounded_channel};
-use tracing::{Instrument, error, info_span};
+use tracing::{Instrument, error, info, info_span, warn};
 use warpgate_common::{ListenEndpoint, Protocol, SecretResolver, TargetRdpOptions, WarpgateError};
-use warpgate_core::domain_account::DomainCredentials;
+use warpgate_core::rdp_account::{SignInKind, TargetCredentials, managed_logon_identity};
 use warpgate_core::{
     AdmittedTarget, DESKTOP_INPUT_CHANNEL_CAPACITY, DesktopClientHandles, DesktopEvent,
     DesktopInput, DesktopState, LogonState, ProtocolServer, Services,
@@ -86,16 +86,17 @@ impl std::fmt::Debug for RdpProtocolServer {
 
 /// Start an RDP client for a target and bridge it to normalised desktop streams.
 ///
-/// `domain_credentials` is what a target that signs users in as their own directory account
-/// is signed in to with: the user's account and the password they typed, already checked
-/// against the directory. `None` for a target with a stored password.
+/// `credentials` is what a target that signs users in with an account they type the password
+/// of (their own directory account, or one assigned to them) is signed in to with, from
+/// [`warpgate_core::rdp_account::verify_sign_in`] for the admitted user. `None` for a target
+/// with a stored password.
 pub fn connect(
     admitted: AdmittedTarget<TargetRdpOptions>,
     size: (u16, u16),
     secrets: Arc<dyn SecretResolver>,
-    domain_credentials: Option<DomainCredentials>,
+    credentials: Option<TargetCredentials>,
 ) -> Result<DesktopClientHandles, WarpgateError> {
-    connect_with_keyboard_layout(admitted, size, secrets, 0, domain_credentials)
+    connect_with_keyboard_layout(admitted, size, secrets, 0, credentials)
 }
 
 /// [`connect`], telling the target the viewer's keyboard layout: a Windows KLID such as
@@ -107,18 +108,55 @@ pub fn connect_with_keyboard_layout(
     size: (u16, u16),
     secrets: Arc<dyn SecretResolver>,
     keyboard_layout: u32,
-    domain_credentials: Option<DomainCredentials>,
+    credentials: Option<TargetCredentials>,
 ) -> Result<DesktopClientHandles, WarpgateError> {
     let target_session_id = admitted.id();
     let (user_info, target) = admitted.into_approved().into_parts();
     let (target, options) = target.into_parts();
+
+    // The account is the admitted user's to use, on this target's kind of sign-in: whoever
+    // resolved it resolved it for them. Checked here, where both the browser and the native
+    // client connect, so neither can hand the client someone else's.
+    let kind = SignInKind::of(&options);
+    if let Some(credentials) = &credentials
+        && (credentials.user_id() != user_info.id || credentials.kind() != kind)
+    {
+        warn!(
+            user = %user_info.username,
+            "Refused credentials resolved for another user or another kind of sign-in"
+        );
+        return Err(WarpgateError::InvalidRequest(
+            "The account is not yours to sign in to this target with".into(),
+        ));
+    }
+    if kind.asks_for_password() && credentials.is_none() {
+        return Err(WarpgateError::InvalidRequest(
+            "Enter the account's password to connect to this target".into(),
+        ));
+    }
+    // The account the session must log on as: the one Warpgate signs in with.
+    let allowed = match &credentials {
+        Some(credentials) => Some(credentials.identity().clone()),
+        None => managed_logon_identity(&options),
+    };
+    // Who the target is signed in to as, next to who is signing in, for the audit log.
+    info!(
+        user = %user_info.username,
+        target = %target.name,
+        sign_in = kind.as_str(),
+        target_account = allowed.as_ref().map(|identity| identity.account()),
+        "Connecting to the RDP target"
+    );
     let (event_tx, event_rx) = channel::<DesktopEvent>(EVENT_CHANNEL_CAPACITY);
     let (input_tx, input_rx) = channel::<DesktopInput>(DESKTOP_INPUT_CHANNEL_CAPACITY);
     let (abort_tx, abort_rx) = unbounded_channel::<()>();
 
     // Autologon passes the credentials over CredSSP, so the session is logged on by the
-    // time it is active; only an interactive-logon target starts at its sign-in screen.
-    let sign_in = if options.interactive_logon {
+    // time it is active; only an interactive-logon target starts at its sign-in screen. So
+    // does one signed in with a password the user typed: should the target show its own
+    // sign-in screen anyway, what is typed there is the user's password, which the
+    // recording must not keep, until the target reports the logon.
+    let sign_in = if options.interactive_logon || kind.asks_for_password() {
         LogonState::at_logon_screen()
     } else {
         LogonState::logged_on()
@@ -130,6 +168,7 @@ pub fn connect_with_keyboard_layout(
         user_id: user_info.id,
         username: user_info.username,
         sign_in: sign_in.clone(),
+        allowed,
     };
 
     let span = info_span!("RDP-client", host = %options.host, port = options.port);
@@ -144,7 +183,7 @@ pub fn connect_with_keyboard_layout(
                 abort_rx,
                 logon,
                 secrets,
-                domain_credentials,
+                credentials,
             )
             .await
             {

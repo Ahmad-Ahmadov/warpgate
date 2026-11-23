@@ -18,14 +18,9 @@
     import Fa from 'svelte-fa'
     import { loadTheme } from 'theme'
     import Button from 'ui/Button.svelte'
-    import Callout from 'ui/Callout.svelte'
     import Input from 'ui/Input.svelte'
-    import {
-        api,
-        ResponseError,
-        type WebClientSessionInfo,
-        type WebDesktopTargetAccount,
-    } from './lib/api'
+    import Select from 'ui/Select.svelte'
+    import { api, ResponseError, type WebClientSessionInfo } from './lib/api'
     import {
         ReconnectingWebSocket,
         SocketState,
@@ -47,6 +42,20 @@
         | { type: 'cursor'; rect: Rect; data: string }
         | { type: 'clipboard'; text: string }
         | { type: 'bell' }
+        | ({ type: 'sign_in' } & SignInRequest)
+
+    /**
+     * The server asking for the password of the Windows account to sign in to
+     * the target as, once the session is approved: the user's own domain
+     * account, or one of the accounts assigned to them. The accounts are the
+     * server's to offer; the server checks the answer against them again.
+     */
+    interface SignInRequest {
+        kind: 'domain_account' | 'local_account'
+        target: string
+        accounts: string[]
+        error?: string | null
+    }
 
     // svelte-ignore state_referenced_locally
     let sessionId = $state(params.sessionId)
@@ -66,18 +75,14 @@
     let opening = $state(false)
     let sessionInfo = $state<WebClientSessionInfo | null>(null)
 
-    // A target that signs in with the user's own domain account asks for its
-    // password before the session starts. The account comes from the directory,
-    // through the server, and is shown, not typed. The password lives in this
-    // field only until it is sent, and is never stored.
-    let domainPrompt = $state<{
-        targetId: string
-        username?: string
-        problem?: string
-    } | null>(null)
-    let domainPassword = $state('')
-    let domainError = $state<string | undefined>()
-    let domainChecking = $state(false)
+    // A target that signs in with an account the user types the password of
+    // asks for it over the session's stream, once the session is approved. The
+    // account is chosen from what the server offers, never typed. The password
+    // lives in this field only until it is sent, and is never stored.
+    let signIn = $state<SignInRequest | null>(null)
+    let signInAccount = $state('')
+    let signInPassword = $state('')
+    let signInChecking = $state(false)
 
     // Framebuffer messages are queued off the WS thread and painted in a rAF loop so a
     // burst of updates (e.g. dragging a window) can never block the main thread. Beyond
@@ -167,8 +172,20 @@
         }
         const msg = JSON.parse(data) as ServerMessage
         switch (msg.type) {
+            case 'sign_in':
+                signIn = msg
+                signInChecking = false
+                if (!msg.accounts.includes(signInAccount)) {
+                    signInAccount = msg.accounts[0] ?? ''
+                }
+                break
             case 'state':
                 phase = msg
+                // The answer was taken: the session goes on, or is over.
+                if (msg.phase !== 'awaiting_approval') {
+                    signIn = null
+                    signInPassword = ''
+                }
                 if (msg.phase === 'connected') {
                     const size = viewportSize()
                     if (size) {
@@ -393,7 +410,7 @@
     // RDP uses scancodes and VNC uses the keysym since RFB has no scancodes
     function onKey(e: KeyboardEvent, down: boolean) {
         // The password prompt types into its own field, not the desktop.
-        if (domainPrompt) {
+        if (signIn) {
             return
         }
         clipboard.onKey(e, down)
@@ -437,76 +454,33 @@
         window.close()
     }
 
-    async function startSession(
-        targetId: string,
-        domainPassword?: string,
-    ): Promise<void> {
+    async function startSession(targetId: string): Promise<void> {
         const size = viewportSize()
         const { sessionId: id } = await api.createWebDesktopSession({
             createWebDesktopSessionBody: {
                 targetId,
                 width: size?.width,
                 height: size?.height,
-                domainPassword,
             },
         })
         sessionId = id
         history.replaceState(history.state, '', `#/web-desktop/${id}`)
     }
 
-    /**
-     * Whether the target signs in with the user's own domain account; if so,
-     * the password prompt is shown and connecting goes on from there. Anything
-     * short of a clear answer leaves it to starting the session, which reports
-     * a lapsed login or a refused target as it always has.
-     */
-    async function asksForDomainPassword(targetId: string): Promise<boolean> {
-        let account: WebDesktopTargetAccount
-        try {
-            account = await api.getWebDesktopTargetAccount({ targetId })
-        } catch {
-            return false
-        }
-        if (!account.domainAccount) {
-            return false
-        }
-        domainPrompt = {
-            targetId,
-            username: account.username,
-            problem: account.problem,
-        }
-        return true
-    }
-
-    async function submitDomainPassword(e: SubmitEvent) {
+    function submitSignIn(e: SubmitEvent) {
         e.preventDefault()
-        if (!domainPrompt || domainChecking) {
+        if (!signIn || signInChecking) {
             return
         }
-        const password = domainPassword
-        // Cleared at once: a wrong password is typed again, not edited.
-        domainPassword = ''
+        const password = signInPassword
+        // Cleared at once: a refused password is typed again, not edited.
+        signInPassword = ''
         if (!password) {
-            domainError = 'Enter your domain password'
+            signIn = { ...signIn, error: "Enter the account's password" }
             return
         }
-        domainChecking = true
-        domainError = undefined
-        try {
-            await startSession(domainPrompt.targetId, password)
-        } catch (err) {
-            if (await handleReauthError(err)) {
-                return
-            }
-            // The directory's answer: a wrong password, a locked or disabled
-            // account, and so on.
-            domainError = await stringifyError(err)
-            return
-        } finally {
-            domainChecking = false
-        }
-        domainPrompt = null
-        await attach()
+        signInChecking = true
+        send({ type: 'sign_in', account: signInAccount, password })
     }
 
     /** Join the session that was started, and stream it. */
@@ -550,9 +524,6 @@
         if (!sessionId && params.targetId) {
             opening = true
             try {
-                if (await asksForDomainPassword(params.targetId)) {
-                    return
-                }
                 await startSession(params.targetId)
             } catch (e) {
                 if (await handleReauthError(e)) {
@@ -607,7 +578,7 @@
         <span class="me-auto text-muted small"
             >{sessionInfo?.targetName ?? ''}</span
         >
-        {#if !opening && !domainPrompt}
+        {#if !opening && !signIn}
             <div class="me-3">
                 <WebClientStatus
                     {phase}
@@ -645,56 +616,66 @@
             oncontextmenu={e => e.preventDefault()}
         ></canvas>
 
-        {#if domainPrompt}
+        {#if signIn}
             <form
-                class="domain-prompt"
+                class="sign-in-prompt"
                 autocomplete="off"
-                aria-labelledby="domain-prompt-title"
-                onsubmit={submitDomainPassword}
+                aria-labelledby="sign-in-prompt-title"
+                onsubmit={submitSignIn}
             >
-                <h1 id="domain-prompt-title">
-                    Connect with your domain account
+                <h1 id="sign-in-prompt-title">
+                    {signIn.kind === 'domain_account'
+                        ? 'Connect with your domain account'
+                        : `Sign in to ${signIn.target}`}
                 </h1>
-                {#if domainPrompt.problem || !domainPrompt.username}
-                    <Callout tone="danger" title="You cannot connect to this target">
-                        {domainPrompt.problem ??
-                            'No domain account was found for you.'}
-                    </Callout>
-                    <div class="domain-actions">
-                        <Button onclick={disconnect}>Close</Button>
-                    </div>
-                {:else}
-                    <p class="domain-lede">
+                <p class="sign-in-lede">
+                    {#if signIn.kind === 'domain_account'}
                         This target signs you in to Windows as yourself. Enter
                         your domain password to connect: it is used for this
                         connection only and is never saved.
-                    </p>
-                    <div class="domain-account">
-                        <span class="domain-account-label">Account</span>
-                        <span class="wg-mono">{domainPrompt.username}</span>
-                    </div>
-                    <Input
-                        type="password"
-                        label="Domain password"
-                        bind:value={domainPassword}
-                        autocomplete="off"
-                        autofocus
-                        disabled={domainChecking}
-                        error={domainError}
+                    {:else}
+                        Choose one of the Windows accounts assigned to you, and
+                        enter its password to connect: it is used for this
+                        connection only and is never saved.
+                    {/if}
+                </p>
+                {#if signIn.accounts.length > 1}
+                    <Select
+                        label="Account"
+                        options={signIn.accounts.map(a => ({
+                            value: a,
+                            label: a,
+                        }))}
+                        bind:value={signInAccount}
+                        disabled={signInChecking}
                     />
-                    <div class="domain-actions">
-                        <Button variant="ghost" onclick={disconnect}>
-                            Cancel
-                        </Button>
-                        <Button
-                            variant="primary"
-                            type="submit"
-                            disabled={domainChecking}
-                        >
-                            {domainChecking ? 'Connecting...' : 'Connect'}
-                        </Button>
+                {:else}
+                    <div class="sign-in-account">
+                        <span class="sign-in-account-label">Account</span>
+                        <span class="wg-mono">{signInAccount}</span>
                     </div>
                 {/if}
+                <Input
+                    type="password"
+                    label={signIn.kind === 'domain_account'
+                        ? 'Domain password'
+                        : 'Password'}
+                    bind:value={signInPassword}
+                    autocomplete="off"
+                    autofocus
+                    disabled={signInChecking}
+                    error={signIn.error ?? undefined}
+                />
+                <div class="sign-in-actions">
+                    <Button variant="ghost" onclick={disconnect}>Cancel</Button>
+                    <Button
+                        variant="primary"
+                        type="submit"
+                        disabled={signInChecking}
+                    >
+                        {signInChecking ? 'Connecting...' : 'Connect'}
+                    </Button>
+                </div>
             </form>
         {/if}
     </div>
@@ -723,7 +704,7 @@
         overflow: auto;
     }
 
-    .domain-prompt {
+    .sign-in-prompt {
         position: absolute;
         top: 50%;
         left: 50%;
@@ -744,24 +725,24 @@
         }
     }
 
-    .domain-lede {
+    .sign-in-lede {
         margin: 0;
         color: var(--wg-text-muted);
         font: var(--wg-text-body-md);
     }
 
-    .domain-account {
+    .sign-in-account {
         display: flex;
         flex-direction: column;
         gap: var(--wg-space-xs);
     }
 
-    .domain-account-label {
+    .sign-in-account-label {
         color: var(--wg-text-muted);
         font: var(--wg-text-label-md);
     }
 
-    .domain-actions {
+    .sign-in-actions {
         display: flex;
         justify-content: flex-end;
         gap: var(--wg-space-sm);

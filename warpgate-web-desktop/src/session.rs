@@ -2,7 +2,7 @@ use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use tokio::sync::Mutex;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
@@ -11,7 +11,7 @@ use warpgate_core::recordings::DesktopRecorder;
 use warpgate_core::{DesktopEvent, DesktopInput, DesktopRect, Framebuffer, Rect};
 use warpgate_web_clients_common::{ManagedSession, Sheddable, WebSession};
 
-use crate::protocol::{ServerMessage, WsRect};
+use crate::protocol::{ServerMessage, SignInPassword, SignInRequest, WsRect};
 
 /// Initial output-buffer allocation. Not a hard cap: incremental frames are bounded by
 /// [`MAX_BUFFERED_INCREMENTAL`] and structural messages are rare, so the buffer stays small.
@@ -34,6 +34,23 @@ pub struct DesktopBackend {
     pub recorder: Option<Arc<DesktopRecorder>>,
 }
 
+/// The browser's answer to a [`SignInRequest`]: the account it chose (only ever looked up
+/// among the ones the request offered) and the password typed for it.
+pub struct SignInSubmission {
+    pub account: Option<String>,
+    pub password: SignInPassword,
+}
+
+/// The sign-in a session may be waiting for, between its approval and dialing the target.
+struct SignIn {
+    tx: Sender<SignInSubmission>,
+    rx: std::sync::Mutex<Option<Receiver<SignInSubmission>>>,
+    /// The request the browser has to answer, asked again of a browser that attaches (a
+    /// reload, say) while it is open. `None` when no answer is wanted, so one sent then is
+    /// dropped.
+    open: std::sync::Mutex<Option<SignInRequest>>,
+}
+
 pub struct WebDesktopSession {
     core: WebSession<ServerMessage>,
     backend: OnceLock<DesktopBackend>,
@@ -41,6 +58,7 @@ pub struct WebDesktopSession {
     /// Separate from the recorder's: that one must only see events it actually wrote.
     /// Holds the refinement scratch too, so encoding one region needs a single lock.
     framebuffer: Mutex<(Framebuffer, RefineScratch)>,
+    sign_in: SignIn,
 }
 
 /// Buffers reused across refinement encodes. A settling screen refines many regions back to
@@ -74,6 +92,72 @@ impl WebDesktopSession {
             ),
             backend: OnceLock::new(),
             framebuffer: Mutex::new((Framebuffer::default(), RefineScratch::default())),
+            sign_in: {
+                // One answer at a time: the request is answered, checked, then asked again.
+                let (tx, rx) = channel(1);
+                SignIn {
+                    tx,
+                    rx: std::sync::Mutex::new(Some(rx)),
+                    open: std::sync::Mutex::new(None),
+                }
+            },
+        }
+    }
+
+    /// Where the browser's answers to sign-in requests arrive. Taken once, by the task that
+    /// connects the session.
+    pub fn take_sign_in_answers(&self) -> Option<Receiver<SignInSubmission>> {
+        self.sign_in
+            .rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Ask the browser for the password of the account to sign in to the target as.
+    pub async fn ask_sign_in(&self, request: SignInRequest) {
+        *self
+            .sign_in
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request.clone());
+        self.push(ServerMessage::SignIn(request)).await;
+    }
+
+    /// Stop taking answers: one came, or none is wanted any more.
+    pub fn close_sign_in(&self) {
+        *self
+            .sign_in
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// Ask a browser that just attached the request still open, if one is.
+    pub async fn replay_sign_in(&self) {
+        let open = self
+            .sign_in
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(request) = open {
+            self.push(ServerMessage::SignIn(request)).await;
+        }
+    }
+
+    /// The browser's answer to the open sign-in request. Dropped when none is open, or one
+    /// answer is already waiting to be checked.
+    pub fn answer_sign_in(&self, submission: SignInSubmission) {
+        let open = self
+            .sign_in
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .is_some();
+        if open {
+            let _ = self.sign_in.tx.try_send(submission);
         }
     }
 
