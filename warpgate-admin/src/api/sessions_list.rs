@@ -8,7 +8,7 @@ use poem_openapi::param::Query;
 use poem_openapi::payload::Json;
 use poem_openapi::{ApiResponse, OpenApi};
 use sea_orm::prelude::Expr;
-use sea_orm::sea_query::{Func, Query, SelectStatement};
+use sea_orm::sea_query::{Func, SelectStatement};
 use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
     QuerySelect, Select,
@@ -156,13 +156,15 @@ fn sessions_query(
 }
 
 /// The user sessions with at least one recording, on any of their target connections.
+///
+/// `sea_query::Query` is spelled out: `Query` here is poem's query parameter.
 fn recorded_sessions() -> SelectStatement {
-    Query::select()
+    sea_orm::sea_query::Query::select()
         .column(TargetSession::Column::UserSessionId)
         .from(TargetSession::Entity)
         .and_where(
-            Expr::col(TargetSession::Column::Id).in_subquery(
-                Query::select()
+            TargetSession::Column::Id.in_subquery(
+                sea_orm::sea_query::Query::select()
                     .column(Recording::Column::SessionId)
                     .from(Recording::Entity)
                     .to_owned(),

@@ -59,8 +59,12 @@
         | 'failed'
 
     let error: string | null = $state(null)
-    let recording: Recording | null = $state(null)
-    let session: UserSessionSnapshot | null = $state(null)
+    // Typed through `$state<…>` rather than an annotation: an annotated `let`
+    // initialised to null narrows to `null` for TypeScript, which never sees
+    // the assignments made in `load()` and its callbacks, so `session?.…` in
+    // the `$derived`s below would be typed `never`.
+    let recording = $state<Recording | null>(null)
+    let session = $state<UserSessionSnapshot | null>(null)
     let availability: Availability = $state('checking')
     let failure = $state('')
 

@@ -963,6 +963,7 @@
         overflow-wrap: anywhere;
         -webkit-box-orient: vertical;
         -webkit-line-clamp: 2;
+        line-clamp: 2;
     }
 
     /* At the foot of the card whatever is above it, so a row of cards has
