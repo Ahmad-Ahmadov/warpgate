@@ -86,7 +86,7 @@
             value: 'Password',
             label: 'Managed account (stored password or Vault)',
         },
-        { value: 'DomainAccount', label: 'My domain account' },
+        { value: 'DomainAccount', label: 'Active Directory Authentication' },
         { value: 'LocalAccount', label: 'Assigned Windows account' },
     ]
 
@@ -239,10 +239,11 @@
 />
 
 {#if options.auth.kind === 'DomainAccount'}
-    <Callout title="Each user signs in as their own domain account">
-        Users linked to an LDAP / Active Directory server type their domain
-        password once, after any second factor and approval, in the browser or
-        in their RDP client, and Windows signs them in with it. The account
+    <Callout title="Active Directory Authentication">
+        Each user signs in as their own domain account. Users linked to an LDAP
+        / Active Directory server type their domain password once, after any
+        second factor and approval, in the browser or in their RDP client, and
+        Windows signs them in with it. The account
         comes from the directory, not from the user, and the password is
         checked with the directory, used for that one connection and never
         stored. Users who are not linked to a directory cannot connect, and a
@@ -387,8 +388,8 @@
         <Callout tone="warning" title="Any account can be signed in to">
             Users sign in on Windows' own screen, as any account whose password
             they know. Warpgate records which account, but cannot restrict it.
-            To hold users to particular accounts, sign in with their domain
-            account or assigned Windows accounts instead.
+            To hold users to particular accounts, use Active Directory
+            Authentication or assigned Windows accounts instead.
         </Callout>
     {/if}
 {/if}

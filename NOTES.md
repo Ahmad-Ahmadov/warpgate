@@ -3002,7 +3002,7 @@ shared code (`warpgate-core/src/rdp_account.rs` and the RDP client in
 
 - **Managed account**: `auth.kind = "password"`, as before. The stored username and the
   stored or Vault password; users never see the password.
-- **My domain account**: `auth.kind = "domain_account"`. The account is the directory entry
+- **Active Directory Authentication** (formerly "My domain account"): `auth.kind = "domain_account"`. The account is the directory entry
   the Warpgate user is linked to (`ldap_server_id` + `ldap_object_uuid`), never one a client
   names. The user types its password once; it is checked by an LDAP bind as that entry
   (LDAPS/StartTLS only) before the target is dialed. Users not linked to a directory are

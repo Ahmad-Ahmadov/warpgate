@@ -625,7 +625,7 @@
             >
                 <h1 id="sign-in-prompt-title">
                     {signIn.kind === 'domain_account'
-                        ? 'Connect with your domain account'
+                        ? 'Active Directory Authentication'
                         : `Sign in to ${signIn.target}`}
                 </h1>
                 <p class="sign-in-lede">
