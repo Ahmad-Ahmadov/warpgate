@@ -7,7 +7,7 @@ use anyhow::Result;
 use tokio::sync::mpsc::Sender;
 use tracing::{Instrument as _, info, warn};
 use warpgate_common::TargetRdpOptions;
-use warpgate_core::rdp_account::TargetCredentials;
+use warpgate_core::rdp_account::AuthorizedSignIn;
 use warpgate_core::recordings::DesktopRecorder;
 use warpgate_core::{
     AdmittedTarget, DesktopClientHandles, DesktopConnectionError, DesktopEvent, DesktopState,
@@ -110,8 +110,8 @@ async fn frame_bridge(
 
 /// Connect to the target and start bridging its framebuffer, once auth is complete.
 /// `keyboard_layout` is the viewer's (a Windows KLID), or `0` for the target's default.
-/// `credentials` signs in to a target that uses an account the viewer typed the password of
-/// (their own domain account, or one assigned to them), and is consumed (and wiped) once the
+/// `sign_in` is what the target is signed in to with, decided for the viewer's user by
+/// [`warpgate_core::rdp_account`]; a password it holds is consumed (and wiped) once the
 /// connection is configured.
 pub(super) async fn connect_backend(
     services: &Services,
@@ -119,7 +119,7 @@ pub(super) async fn connect_backend(
     admitted: AdmittedTarget<TargetRdpOptions>,
     screen: warpgate_desktop_ui::Screen,
     keyboard_layout: u32,
-    credentials: Option<TargetCredentials>,
+    sign_in: AuthorizedSignIn,
 ) -> Result<BackendBridge> {
     info!(
         target = %admitted.target().name,
@@ -141,7 +141,7 @@ pub(super) async fn connect_backend(
         (screen.width, screen.height),
         services.secret_backends.clone(),
         keyboard_layout,
-        credentials,
+        sign_in,
     )?;
     if let Some(recorder) = &recorder {
         recorder.track_logon_state(logon_state);

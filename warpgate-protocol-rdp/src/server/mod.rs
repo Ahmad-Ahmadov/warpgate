@@ -39,8 +39,10 @@ use tokio::time::{Instant, sleep, timeout, timeout_at};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 use warpgate_common::helpers::net::accept_loop;
 use warpgate_common::{ListenEndpoint, TargetRdpOptions, WarpgateError};
+use warpgate_core::account_binding::BoundUser;
 use warpgate_core::rdp_account::{
-    SignInError, SignInKind, SignInPlan, TargetCredentials, Zeroizing, plan_sign_in, verify_sign_in,
+    AuthorizedSignIn, SignInAnswer, SignInError, SignInKind, SignInPlan, Zeroizing, plan_sign_in,
+    reuse_sign_in_password, verify_sign_in,
 };
 use warpgate_core::recordings::DesktopRecorder;
 use warpgate_core::{
@@ -63,7 +65,7 @@ mod sign_in;
 use bridge::connect_backend;
 use hold_screen::{hold_while, run_banner_screen, run_hold_screen};
 use protocol::{AuthVerdict, Event as ServerEvent, Input as ServerInput, Refusal};
-use sign_in::{SignInScreen, SignInStep, Submission, needs_sign_in};
+use sign_in::{AccountEntry, PasswordNeed, SignInScreen, SignInStep, Submission, needs_sign_in};
 use warpgate_desktop_auth::{
     AdmissionHold, DesktopAuthOutcome, InteractiveAuth, admit_desktop_session, authenticate,
     finalize_user_auth,
@@ -97,6 +99,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 /// server's last PDUs to reach the viewer and the viewer to hang up. Generous: a viewer
 /// that has them disconnects within a round trip.
 const RELAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the password a viewer signed in to Warpgate with may still sign the target in:
+/// enough for a second factor and a prompt approval. Past it (an approval left waiting), the
+/// password is wiped and the viewer types the account's password instead.
+const SIGN_IN_PASSWORD_REUSE_WINDOW: Duration = Duration::from_secs(300);
 
 /// How long the account password screen shows why the connection cannot go on (a disabled
 /// or locked account, or none assigned, say) before the viewer is disconnected, for the
@@ -575,6 +582,11 @@ enum Admission {
 /// Settle the viewer's credentials: check the ones its Client Info PDU carried or, without
 /// a password, ask for them on the sign-in screen; then collect any second factor and show
 /// the login banner.
+///
+/// The password that signed the viewer in is kept with the authorization, in memory and for
+/// this connection only ([`SignInPassword`]): when the target signs the user in as their own
+/// directory account, and their directory is what checked that password, it signs the
+/// target in too, so the user types it once.
 async fn admit(
     viewer: &Viewer<'_>,
     username: &str,
@@ -588,7 +600,7 @@ async fn admit(
     let signing_in = needs_sign_in(username, &password);
     let mut screen_shown = signing_in;
 
-    let (outcome, clipboard) = if signing_in {
+    let (outcome, clipboard, sign_in_password) = if signing_in {
         // mstsc connects like this whenever it holds no saved credential: over TLS-only
         // security it asks for nothing and expects the server to sign the user in on
         // screen. Let the connection sequence finish, so there is a screen to do that on.
@@ -601,6 +613,9 @@ async fn admit(
         };
         signed_in
     } else {
+        // Kept before it is checked, as the check takes it; dropped, and wiped, unless the
+        // check accepts it.
+        let kept = SignInPassword::keep(&password);
         match authenticate::<TargetRdpOptions>(
             viewer.services,
             viewer.server_handle,
@@ -626,7 +641,7 @@ async fn admit(
                 if reply.send(AuthVerdict::StartSession).is_err() {
                     return Ok(Admission::Ended);
                 }
-                (outcome, None)
+                (outcome, None, kept)
             }
         }
     };
@@ -648,31 +663,44 @@ async fn admit(
             return Ok(Admission::Ended);
         }
     };
+    let pending = PendingDial {
+        authorization,
+        sign_in_password,
+    };
 
     Ok(
         match acknowledge_banner(viewer.services, events, viewer.server_in_tx, screen).await? {
             BannerOutcome::Disconnected => Admission::Ended,
-            BannerOutcome::NotShown if !screen_shown => Admission::DialOnSize(authorization),
+            BannerOutcome::NotShown if !screen_shown => Admission::DialOnSize(pending),
             BannerOutcome::NotShown | BannerOutcome::Acknowledged => Admission::DialNow {
-                authorization,
+                authorization: pending,
                 clipboard,
             },
         },
     )
 }
 
+/// The outcome of the sign-in screen: the check's, the viewer's clipboard text, and the
+/// password that signed it in.
+type SignedIn = (
+    DesktopAuthOutcome<TargetRdpOptions>,
+    Option<String>,
+    Option<SignInPassword>,
+);
+
 /// Show the sign-in screen until the viewer signs in. Each submission is checked exactly as
 /// a password from the Client Info PDU is, lockout and failed-attempt accounting included.
 ///
 /// `None` once the session is over: the viewer left, or was refused (and told why) after
 /// [`sign_in::MAX_SIGN_IN_ATTEMPTS`] refused attempts or [`sign_in::SIGN_IN_TIMEOUT`]. With
-/// the outcome comes the viewer's clipboard text, if it sent any, for the target.
+/// the outcome comes the viewer's clipboard text, if it sent any, for the target, and the
+/// password it signed in with.
 async fn sign_in(
     viewer: &Viewer<'_>,
     username: &str,
     events: &mut UnboundedReceiver<ServerEvent>,
     screen: &mut warpgate_desktop_ui::Screen,
-) -> Result<Option<(DesktopAuthOutcome<TargetRdpOptions>, Option<String>)>> {
+) -> Result<Option<SignedIn>> {
     let mut form = SignInScreen::new(username, *screen);
     loop {
         let Submission { username, password } = match form
@@ -688,6 +716,7 @@ async fn sign_in(
             }
         };
         form.show_checking(viewer.server_in_tx).await?;
+        let kept = SignInPassword::keep(&password);
         match authenticate::<TargetRdpOptions>(
             viewer.services,
             viewer.server_handle,
@@ -698,7 +727,7 @@ async fn sign_in(
         .await
         {
             Ok(DesktopAuthOutcome::Failed) => warn!("Authentication failed"),
-            Ok(outcome) => return Ok(Some((outcome, form.into_clipboard()))),
+            Ok(outcome) => return Ok(Some((outcome, form.into_clipboard(), kept))),
             // A wrong target, or the check itself failing. The viewer is told the same as
             // for a wrong password, see `sign_in::REFUSED`.
             Err(error) => warn!(%error, "Authentication error"),
@@ -719,7 +748,7 @@ async fn second_factor(
     interactive: &InteractiveAuth,
     events: &mut UnboundedReceiver<ServerEvent>,
     screen: &mut warpgate_desktop_ui::Screen,
-) -> Option<PendingDial> {
+) -> Option<TargetAuthorization<TargetRdpOptions>> {
     // `screen` is kept up to date by `run_hold_screen` as the viewer negotiates its size
     // during the prompt.
     match run_hold_screen(
@@ -750,8 +779,36 @@ async fn second_factor(
     None
 }
 
-/// An authorized target held until the viewer's negotiated size is known.
-type PendingDial = TargetAuthorization<TargetRdpOptions>;
+/// An authorized target held until the viewer's negotiated size is known, with the password
+/// the viewer signed in with.
+struct PendingDial {
+    authorization: TargetAuthorization<TargetRdpOptions>,
+    sign_in_password: Option<SignInPassword>,
+}
+
+/// The password a viewer signed in to Warpgate with, kept for its connection only: in
+/// memory, never logged or stored, wiped when dropped, and good for
+/// [`SIGN_IN_PASSWORD_REUSE_WINDOW`]. It is only ever offered to the user's own directory
+/// account on the target, by [`reuse_sign_in_password`], which checks it with the directory
+/// again; any other account takes its own password.
+struct SignInPassword {
+    password: Zeroizing<String>,
+    kept_at: Instant,
+}
+
+impl SignInPassword {
+    fn keep(password: &str) -> Option<Self> {
+        (!password.is_empty()).then(|| Self {
+            password: Zeroizing::new(password.to_owned()),
+            kept_at: Instant::now(),
+        })
+    }
+
+    /// The password, if it is still recent enough to use; dropped, and wiped, otherwise.
+    fn fresh(self) -> Option<Zeroizing<String>> {
+        (self.kept_at.elapsed() <= SIGN_IN_PASSWORD_REUSE_WINDOW).then_some(self.password)
+    }
+}
 
 enum BannerOutcome {
     /// No banner is configured, so nothing was rendered and no events were consumed.
@@ -795,19 +852,31 @@ async fn dial_if_pending(
     screen: &mut warpgate_desktop_ui::Screen,
 ) -> Result<bool> {
     if backend.is_none()
-        && let Some(authorization) = pending.take()
+        && let Some(PendingDial {
+            authorization,
+            sign_in_password,
+        }) = pending.take()
     {
         // Who the viewer signs in to the target as is settled before an approval is asked
-        // for: a user with no account to use there (not linked to a directory, or assigned
-        // none) is turned away now, not once an administrator has approved a session that
-        // cannot sign in.
-        let plan = match plan_sign_in(
-            &viewer.services.db,
-            authorization.user_info().id,
-            authorization.options(),
-        )
-        .await
-        {
+        // for: a user with no account to use there (not linked to a directory, assigned
+        // none, or none of theirs usable) is turned away now, not once an administrator has
+        // approved a session that cannot sign in.
+        let plan = {
+            let user_info = authorization.user_info();
+            let target = authorization.target();
+            plan_sign_in(
+                &viewer.services.db,
+                BoundUser {
+                    id: user_info.id,
+                    username: &user_info.username,
+                },
+                target.id,
+                &target.name,
+                authorization.options(),
+            )
+            .await
+        };
+        let plan = match plan {
             Ok(plan) => plan,
             Err(error) => {
                 warn!(%error, "No account to sign in to the target with");
@@ -847,17 +916,23 @@ async fn dial_if_pending(
             Err(error) => return Err(error.into()),
         };
 
-        // A target that signs in with an account the viewer types the password of asks for
-        // it now: after admission (sign-in, second factor, approval), so nobody types one for
-        // a session that is not approved, and before the recording starts, so the keystrokes
-        // are never recorded. It is asked for once, and the target is signed in with it.
-        let (credentials, clipboard) = if plan.kind().asks_for_password() {
-            match ask_account_password(viewer, &admitted, &plan, events, screen).await? {
-                Some((credentials, clipboard)) => (Some(credentials), clipboard),
-                None => return Ok(false),
+        // Who the target is signed in to as. The managed account alone needs nothing from
+        // the viewer. Any other account is settled now: after admission (sign-in, second
+        // factor, approval), so nobody types a password for a session that is not approved,
+        // and before the recording starts, so the keystrokes are never recorded.
+        let (sign_in, clipboard) = match plan.stored_sign_in() {
+            Some(stored) => {
+                drop(sign_in_password);
+                (stored, None)
             }
-        } else {
-            (None, None)
+            None => {
+                match authorize_account(viewer, &admitted, &plan, sign_in_password, events, screen)
+                    .await?
+                {
+                    Some(answer) => answer,
+                    None => return Ok(false),
+                }
+            }
         };
 
         let connected = connect_backend(
@@ -866,7 +941,7 @@ async fn dial_if_pending(
             admitted,
             *screen,
             viewer.keyboard_layout.load(Ordering::Relaxed),
-            credentials,
+            sign_in,
         )
         .await?;
 
@@ -911,6 +986,52 @@ async fn end_on_account_screen(
     Ok(())
 }
 
+/// The account the viewer signs in to the target as, and its password, entered once.
+///
+/// When the only account is the viewer's own directory account and the password it signed in
+/// to Warpgate with was the directory's ([`reuse_sign_in_password`]), that password signs the
+/// target in and nothing is asked. Otherwise the password screen asks; with several accounts,
+/// choosing the directory one and leaving the password empty uses the sign-in password.
+///
+/// `None` once the session is over: the viewer left, or was refused (and told why).
+async fn authorize_account(
+    viewer: &Viewer<'_>,
+    admitted: &AdmittedTarget<TargetRdpOptions>,
+    plan: &SignInPlan,
+    sign_in_password: Option<SignInPassword>,
+    events: &mut UnboundedReceiver<ServerEvent>,
+    screen: &mut warpgate_desktop_ui::Screen,
+) -> Result<Option<(AuthorizedSignIn, Option<String>)>> {
+    let mut reusable = sign_in_password.and_then(SignInPassword::fresh);
+    if let [only] = plan.choices()
+        && only.kind == SignInKind::DomainAccount
+        && let Some(password) = reusable.take()
+    {
+        match reuse_sign_in_password(
+            &viewer.services.db,
+            plan,
+            admitted.options(),
+            None,
+            password,
+        )
+        .await
+        {
+            Ok(sign_in) => {
+                info!(
+                    account = %sign_in.account(),
+                    "Signing in to the target with the password the viewer signed in with"
+                );
+                return Ok(Some((sign_in, None)));
+            }
+            Err(error) => warn!(
+                %error,
+                "The sign-in password cannot sign in to the target; asking for the account's password"
+            ),
+        }
+    }
+    ask_account_password(viewer, admitted, plan, reusable, events, screen).await
+}
+
 /// Ask the viewer for the password of the account it signs in to the target as, and check it
 /// with [`verify_sign_in`], which takes only an account `plan` allows: the viewer's own
 /// directory account, shown read-only, or one of the accounts assigned to it, which the
@@ -920,27 +1041,49 @@ async fn end_on_account_screen(
 /// does the third refused one, well before a typical lockout threshold. A clipboard pasted
 /// into the form is not passed on.
 ///
+/// `reusable` is the password the viewer signed in with, still usable: an empty password for
+/// the directory account uses it.
+///
 /// `None` once the session is over: the viewer left, or was refused (and told why).
 async fn ask_account_password(
     viewer: &Viewer<'_>,
     admitted: &AdmittedTarget<TargetRdpOptions>,
     plan: &SignInPlan,
+    mut reusable: Option<Zeroizing<String>>,
     events: &mut UnboundedReceiver<ServerEvent>,
     screen: &mut warpgate_desktop_ui::Screen,
-) -> Result<Option<(TargetCredentials, Option<String>)>> {
+) -> Result<Option<(AuthorizedSignIn, Option<String>)>> {
     let db = &viewer.services.db;
-    let user_id = admitted.user_info().id;
+    let user_info = admitted.user_info();
+    let user = BoundUser {
+        id: user_info.id,
+        username: &user_info.username,
+    };
     let options = admitted.options();
-    let target = admitted.target().name.as_str();
-    let accounts = plan.account_names();
+    let target = admitted.target();
+    let accounts: Vec<AccountEntry> = plan
+        .choices()
+        .iter()
+        .map(|choice| AccountEntry {
+            name: choice.label(),
+            password: match choice.kind {
+                SignInKind::Managed => PasswordNeed::NotNeeded,
+                SignInKind::DomainAccount if reusable.is_some() => PasswordNeed::SignInPassword,
+                SignInKind::DomainAccount | SignInKind::LocalAccount => PasswordNeed::Required,
+            },
+        })
+        .collect();
 
     info!(
-        sign_in = plan.kind().as_str(),
-        accounts = %accounts.join(", "),
-        "Asking for the password of the account to sign in to the target as"
+        accounts = %plan.account_names().join(", "),
+        "Asking for the account to sign in to the target as, and its password"
     );
-    let mut form =
-        SignInScreen::for_account_password(target, account_kind(plan.kind()), accounts, *screen);
+    let mut form = SignInScreen::for_account_password(
+        &target.name,
+        account_kind(plan.prompt_kind()),
+        accounts,
+        *screen,
+    );
     loop {
         let (account, password) = match form
             .next_submission(events, viewer.server_in_tx, screen)
@@ -957,12 +1100,35 @@ async fn ask_account_password(
             }
         };
         form.show_checking(viewer.server_in_tx).await?;
-        // `verify_sign_in` logs its answer, without the password.
-        let error =
-            match verify_sign_in(db, user_id, options, Some(account.as_str()), password).await {
-                Ok(credentials) => return Ok(Some((credentials, form.into_clipboard()))),
-                Err(error) => error,
-            };
+        let chosen = plan
+            .choices()
+            .iter()
+            .find(|choice| choice.label() == account)
+            .map(|choice| choice.kind);
+        let reuse = password.is_empty() && chosen == Some(SignInKind::DomainAccount);
+        // `verify_sign_in` and `reuse_sign_in_password` log their answer, without the
+        // password.
+        let result = if reuse && let Some(kept) = reusable.take() {
+            reuse_sign_in_password(db, plan, options, Some(account.as_str()), kept).await
+        } else {
+            verify_sign_in(
+                db,
+                user,
+                target.id,
+                &target.name,
+                options,
+                SignInAnswer {
+                    binding_id: None,
+                    account: Some(account.as_str()),
+                },
+                password,
+            )
+            .await
+        };
+        let error = match result {
+            Ok(sign_in) => return Ok(Some((sign_in, form.into_clipboard()))),
+            Err(error) => error,
+        };
         if !error.may_retry() {
             form.show_final_error(viewer.server_in_tx, error.user_message())
                 .await?;

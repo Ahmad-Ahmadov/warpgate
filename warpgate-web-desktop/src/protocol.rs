@@ -106,6 +106,9 @@ pub struct SignInRequest {
     /// The accounts the user may sign in as, to choose from: one for a domain account. The
     /// browser shows them; it cannot add to them.
     pub accounts: Vec<String>,
+    /// Those of `accounts` that take no password: the target's managed account, signed in
+    /// with its stored credential.
+    pub passwordless: Vec<String>,
     /// Why the last attempt was refused.
     pub error: Option<String>,
 }

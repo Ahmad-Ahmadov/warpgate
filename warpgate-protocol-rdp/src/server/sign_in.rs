@@ -53,6 +53,35 @@ pub(super) fn needs_sign_in(username: &str, password: &str) -> bool {
     password.is_empty() && !username.starts_with(TICKET_SELECTOR_PREFIX)
 }
 
+/// Whether an account on the password screen needs a password typed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PasswordNeed {
+    /// The account's password.
+    Required,
+    /// The account's password, or nothing, for the password the viewer signed in to Warpgate
+    /// with: the viewer's own directory account.
+    SignInPassword,
+    /// Nothing: the target's stored credential signs the account in.
+    NotNeeded,
+}
+
+impl PasswordNeed {
+    /// What the screen says about it, in place of its first hint.
+    const fn note(self) -> Option<&'static str> {
+        match self {
+            Self::Required => None,
+            Self::SignInPassword => Some("Leave it empty to use the password you signed in with"),
+            Self::NotNeeded => Some("No password needed: Warpgate signs this account in"),
+        }
+    }
+}
+
+/// An account the password screen offers.
+pub(super) struct AccountEntry {
+    pub name: String,
+    pub password: PasswordNeed,
+}
+
 /// The credentials submitted on the form.
 pub(super) struct Submission {
     pub username: String,
@@ -106,7 +135,7 @@ impl SignInScreen {
     pub(super) fn for_account_password(
         target: &str,
         kind: AccountKind,
-        accounts: Vec<String>,
+        accounts: Vec<AccountEntry>,
         screen: ui::Screen,
     ) -> Self {
         Self::with_form(
@@ -279,6 +308,7 @@ impl SignInScreen {
         self.dirty = false;
         let prompt = self.form.prompt();
         let choice = self.form.choice();
+        let note = self.form.need().note();
         let account_target = self
             .account_target
             .as_ref()
@@ -293,6 +323,7 @@ impl SignInScreen {
                         kind,
                         account: prompt.username,
                         choice,
+                        note,
                         password_len: prompt.password_len,
                         notice: prompt.notice,
                     },
@@ -344,6 +375,8 @@ struct Form {
     /// With `account_fixed`, the accounts the username may be stepped through, and which of
     /// them it is. Never anything else: the viewer cannot type one.
     accounts: Vec<String>,
+    /// Whether each of `accounts` needs a password typed.
+    needs: Vec<PasswordNeed>,
     selected: usize,
     /// What an empty password is told, with `account_fixed`.
     missing_password: &'static str,
@@ -372,12 +405,17 @@ impl Form {
             notice: None,
             account_fixed: false,
             accounts: vec![],
+            needs: vec![],
             selected: 0,
             missing_password: "Enter your password",
         }
     }
 
-    fn for_account_password(accounts: Vec<String>, kind: AccountKind) -> Self {
+    fn for_account_password(entries: Vec<AccountEntry>, kind: AccountKind) -> Self {
+        let (accounts, needs): (Vec<String>, Vec<PasswordNeed>) = entries
+            .into_iter()
+            .map(|entry| (entry.name, entry.password))
+            .unzip();
         Self {
             username: accounts.first().cloned().unwrap_or_default(),
             // Room for the longest password up front, so typing it never reallocates and
@@ -387,12 +425,24 @@ impl Form {
             notice: None,
             account_fixed: true,
             accounts,
+            needs,
             selected: 0,
             missing_password: match kind {
                 AccountKind::Domain => "Enter your domain password",
                 AccountKind::Local => "Enter the account's password",
             },
         }
+    }
+
+    /// Whether the account shown needs a password typed.
+    fn need(&self) -> PasswordNeed {
+        if !self.account_fixed {
+            return PasswordNeed::Required;
+        }
+        self.needs
+            .get(self.selected)
+            .copied()
+            .unwrap_or(PasswordNeed::Required)
     }
 
     /// Where the account is among those to choose from, counting from 1, and how many
@@ -466,7 +516,7 @@ impl Form {
     /// The credentials to check, or `None` with the form told what is missing.
     fn submit(&mut self) -> Option<Submission> {
         if self.account_fixed {
-            if self.password.is_empty() {
+            if self.password.is_empty() && self.need() == PasswordNeed::Required {
                 self.notice = Some(SignInNotice::Error(self.missing_password));
                 return None;
             }
@@ -1308,7 +1358,7 @@ mod tests {
     /// and no key or click moves the focus to it, let alone edits it.
     #[test]
     fn the_domain_account_cannot_be_edited() {
-        let mut form = Form::for_account_password(vec![r"CORP\alice".into()], AccountKind::Domain);
+        let mut form = Form::for_account_password(required(&[r"CORP\alice"]), AccountKind::Domain);
         for edit in [
             Edit::Next,
             Edit::Previous,
@@ -1339,7 +1389,7 @@ mod tests {
     #[test]
     fn an_assigned_account_is_chosen_not_typed() {
         let mut form = Form::for_account_password(
-            vec!["operator".into(), "backup".into(), "auditor".into()],
+            required(&["operator", "backup", "auditor"]),
             AccountKind::Local,
         );
         assert_eq!(form.choice(), Some((1, 3)));
@@ -1371,8 +1421,56 @@ mod tests {
         assert_eq!(submission.username, "backup");
         assert_eq!(submission.password, "s3cret");
 
-        let single = Form::for_account_password(vec!["operator".into()], AccountKind::Local);
+        let single = Form::for_account_password(required(&["operator"]), AccountKind::Local);
         assert_eq!(single.choice(), None);
+    }
+
+    fn required(names: &[&str]) -> Vec<AccountEntry> {
+        names
+            .iter()
+            .map(|name| AccountEntry {
+                name: (*name).to_owned(),
+                password: PasswordNeed::Required,
+            })
+            .collect()
+    }
+
+    /// 20, 22: the viewer's own directory account takes the password it signed in with when
+    /// the password is left empty, and the managed account takes none; any other account
+    /// still needs its own.
+    #[test]
+    fn only_some_accounts_go_without_a_typed_password() {
+        let mut form = Form::for_account_password(
+            vec![
+                AccountEntry {
+                    name: "ahmad@corp.example.com".into(),
+                    password: PasswordNeed::SignInPassword,
+                },
+                AccountEntry {
+                    name: "support".into(),
+                    password: PasswordNeed::Required,
+                },
+                AccountEntry {
+                    name: "operator".into(),
+                    password: PasswordNeed::NotNeeded,
+                },
+            ],
+            AccountKind::Local,
+        );
+        let reused = form.apply(Edit::Submit).unwrap();
+        assert_eq!(reused.username, "ahmad@corp.example.com");
+        assert!(reused.password.is_empty());
+
+        form.apply(Edit::Down);
+        assert!(
+            form.apply(Edit::Submit).is_none(),
+            "a local account needs its password"
+        );
+
+        form.apply(Edit::Down);
+        assert_eq!(form.need().note(), PasswordNeed::NotNeeded.note());
+        let managed = form.apply(Edit::Submit).unwrap();
+        assert_eq!(managed.username, "operator");
     }
 
     #[test]
@@ -1380,7 +1478,7 @@ mod tests {
         let mut sign_in = SignInScreen::for_account_password(
             "server",
             AccountKind::Domain,
-            vec!["alice@corp.example.com".into()],
+            required(&["alice@corp.example.com"]),
             screen(),
         );
         assert!(sign_in.refused_with("The domain password is incorrect"));
@@ -1398,7 +1496,7 @@ mod tests {
         let mut sign_in = SignInScreen::for_account_password(
             "server",
             AccountKind::Domain,
-            vec!["alice@corp.example.com".into()],
+            required(&["alice@corp.example.com"]),
             screen(),
         );
         // Tab first: it must not move the typing into the account.

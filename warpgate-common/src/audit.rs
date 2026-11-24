@@ -116,6 +116,54 @@ pub enum AuditEvent {
         target_account: Option<String>,
         target_session_id: Option<u32>,
     },
+    /// An administrator assigned a remote account to a user on a target.
+    AccountBindingCreated {
+        binding_id: Uuid,
+        user_id: Uuid,
+        username: String,
+        target_id: Uuid,
+        target_name: String,
+        /// `directory`, `local` or `managed`.
+        account_kind: String,
+        /// The account, as written (a local or managed account), or the directory entry.
+        account: String,
+        auth_method: String,
+        actor_user_id: Uuid,
+    },
+    /// An administrator changed an assignment (enabled it, disabled it, changed its expiry
+    /// or how it signs in).
+    AccountBindingUpdated {
+        binding_id: Uuid,
+        user_id: Uuid,
+        username: String,
+        target_id: Uuid,
+        target_name: String,
+        account: String,
+        enabled: bool,
+        auth_method: String,
+        actor_user_id: Uuid,
+    },
+    /// An administrator revoked an assignment.
+    AccountBindingRevoked {
+        binding_id: Uuid,
+        user_id: Uuid,
+        username: String,
+        target_id: Uuid,
+        target_name: String,
+        account: String,
+        actor_user_id: Uuid,
+    },
+    /// A connection asked for an account the user may not use on the target, or the user
+    /// has no usable assignment there.
+    AccountBindingRefused {
+        user_id: Uuid,
+        username: String,
+        target_id: Uuid,
+        target_name: String,
+        binding_id: Option<Uuid>,
+        requested_account: Option<String>,
+        reason: String,
+    },
     /// The target logged a session on as an account the user may not use there (an account
     /// typed into the target's own sign-in screen, say), so Warpgate ended the session.
     TargetLogonRefused {
@@ -468,6 +516,106 @@ impl AuditEvent {
                     target_session_id = *target_session_id,
                     related_users = %format_related_ids(&[*user_id]),
                     "Logged on to target"
+                );
+            }
+            Self::AccountBindingCreated {
+                binding_id,
+                user_id,
+                username,
+                target_id,
+                target_name,
+                account_kind,
+                account,
+                auth_method,
+                actor_user_id,
+            } => {
+                info!(
+                    target: "audit",
+                    _type = "AccountBindingCreated1",
+                    binding_id = %binding_id,
+                    user_id = %user_id,
+                    username = %username,
+                    target_id = %target_id,
+                    target_name = %target_name,
+                    account_kind = %account_kind,
+                    account = %account,
+                    auth_method = %auth_method,
+                    actor_user_id = %actor_user_id,
+                    related_users = %format_related_ids(&[*user_id, *actor_user_id]),
+                    "Remote account assigned"
+                );
+            }
+            Self::AccountBindingUpdated {
+                binding_id,
+                user_id,
+                username,
+                target_id,
+                target_name,
+                account,
+                enabled,
+                auth_method,
+                actor_user_id,
+            } => {
+                info!(
+                    target: "audit",
+                    _type = "AccountBindingUpdated1",
+                    binding_id = %binding_id,
+                    user_id = %user_id,
+                    username = %username,
+                    target_id = %target_id,
+                    target_name = %target_name,
+                    account = %account,
+                    enabled = *enabled,
+                    auth_method = %auth_method,
+                    actor_user_id = %actor_user_id,
+                    related_users = %format_related_ids(&[*user_id, *actor_user_id]),
+                    "Remote account assignment changed"
+                );
+            }
+            Self::AccountBindingRevoked {
+                binding_id,
+                user_id,
+                username,
+                target_id,
+                target_name,
+                account,
+                actor_user_id,
+            } => {
+                info!(
+                    target: "audit",
+                    _type = "AccountBindingRevoked1",
+                    binding_id = %binding_id,
+                    user_id = %user_id,
+                    username = %username,
+                    target_id = %target_id,
+                    target_name = %target_name,
+                    account = %account,
+                    actor_user_id = %actor_user_id,
+                    related_users = %format_related_ids(&[*user_id, *actor_user_id]),
+                    "Remote account assignment revoked"
+                );
+            }
+            Self::AccountBindingRefused {
+                user_id,
+                username,
+                target_id,
+                target_name,
+                binding_id,
+                requested_account,
+                reason,
+            } => {
+                tracing::warn!(
+                    target: "audit",
+                    _type = "AccountBindingRefused1",
+                    user_id = %user_id,
+                    username = %username,
+                    target_id = %target_id,
+                    target_name = %target_name,
+                    binding_id = binding_id.map(|id| id.to_string()),
+                    requested_account = requested_account.as_deref(),
+                    reason = %reason,
+                    related_users = %format_related_ids(&[*user_id]),
+                    "Refused a remote account the user may not use"
                 );
             }
             Self::TargetLogonRefused {

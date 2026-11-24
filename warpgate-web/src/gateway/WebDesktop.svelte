@@ -18,6 +18,7 @@
     import Fa from 'svelte-fa'
     import { loadTheme } from 'theme'
     import Button from 'ui/Button.svelte'
+    import Callout from 'ui/Callout.svelte'
     import Input from 'ui/Input.svelte'
     import Select from 'ui/Select.svelte'
     import { api, ResponseError, type WebClientSessionInfo } from './lib/api'
@@ -54,6 +55,8 @@
         kind: 'domain_account' | 'local_account'
         target: string
         accounts: string[]
+        /** Accounts signed in with the target's stored credential: no password. */
+        passwordless?: string[]
         error?: string | null
     }
 
@@ -83,6 +86,9 @@
     let signInAccount = $state('')
     let signInPassword = $state('')
     let signInChecking = $state(false)
+    const signInNeedsPassword = $derived(
+        !signIn?.passwordless?.includes(signInAccount),
+    )
 
     // Framebuffer messages are queued off the WS thread and painted in a rAF loop so a
     // burst of updates (e.g. dragging a window) can never block the main thread. Beyond
@@ -475,7 +481,7 @@
         const password = signInPassword
         // Cleared at once: a refused password is typed again, not edited.
         signInPassword = ''
-        if (!password) {
+        if (!password && signInNeedsPassword) {
             signIn = { ...signIn, error: "Enter the account's password" }
             return
         }
@@ -655,17 +661,29 @@
                         <span class="wg-mono">{signInAccount}</span>
                     </div>
                 {/if}
-                <Input
-                    type="password"
-                    label={signIn.kind === 'domain_account'
-                        ? 'Domain password'
-                        : 'Password'}
-                    bind:value={signInPassword}
-                    autocomplete="off"
-                    autofocus
-                    disabled={signInChecking}
-                    error={signIn.error ?? undefined}
-                />
+                {#if signInNeedsPassword}
+                    <Input
+                        type="password"
+                        label={signIn.kind === 'domain_account'
+                            ? 'Domain password'
+                            : 'Password'}
+                        bind:value={signInPassword}
+                        autocomplete="off"
+                        autofocus
+                        disabled={signInChecking}
+                        error={signIn.error ?? undefined}
+                    />
+                {:else}
+                    <p class="sign-in-lede">
+                        No password needed: Warpgate signs this account in with
+                        the target's stored credential.
+                    </p>
+                    {#if signIn.error}
+                        <Callout tone="danger" title="Could not connect">
+                            {signIn.error}
+                        </Callout>
+                    {/if}
+                {/if}
                 <div class="sign-in-actions">
                     <Button variant="ghost" onclick={disconnect}>Cancel</Button>
                     <Button

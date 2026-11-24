@@ -394,6 +394,14 @@
     {/if}
 {/if}
 
+<div class="check">
+    <Checkbox
+        label="Require an account assignment"
+        hint="Users may sign in only as accounts assigned to them on this target (Access, Account access); a user with none is refused. Without it, users with assignments are still held to them, whatever is chosen above."
+        bind:checked={options.requireAccountBinding}
+    />
+</div>
+
 <h5>TLS</h5>
 
 <Select

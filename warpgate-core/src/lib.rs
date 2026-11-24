@@ -1,5 +1,6 @@
 #![feature(gethostname)]
 
+pub mod account_binding;
 pub mod analytics;
 pub mod approvals;
 pub mod auth;

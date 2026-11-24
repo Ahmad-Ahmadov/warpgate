@@ -100,6 +100,7 @@ mod m00093_log_session_id_nullable;
 mod m00094_unique_role_names;
 mod m00095_kubernetes_sessions;
 mod m00096_ldap_authenticate_users;
+mod m00097_target_account_bindings;
 
 pub(crate) mod helpers;
 
@@ -205,6 +206,7 @@ impl MigratorTrait for Migrator {
             Box::new(m00094_unique_role_names::Migration),
             Box::new(m00095_kubernetes_sessions::Migration),
             Box::new(m00096_ldap_authenticate_users::Migration),
+            Box::new(m00097_target_account_bindings::Migration),
         ]
     }
 }

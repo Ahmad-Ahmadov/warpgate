@@ -42,6 +42,12 @@ pub struct TargetSSHOptions {
     pub auth: SSHTargetAuth,
     #[serde(default)]
     pub jump_host: Option<Uuid>,
+    /// Users may sign in only as accounts assigned to them on this target (Access Control,
+    /// account access); a user with none is refused. Without it, a user with assigned
+    /// accounts is still held to them, and one with none signs in as the target is set up.
+    #[serde(default)]
+    #[oai(default)]
+    pub require_account_binding: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Union)]
@@ -328,6 +334,13 @@ pub struct TargetRdpOptions {
     // description wraps the enum in allOf, which typescript-fetch misgenerates.
     #[serde(default)]
     pub tls_security: RdpTlsSecurity,
+
+    /// Users may sign in only as accounts assigned to them on this target (Access Control,
+    /// account access); a user with none is refused. Without it, a user with assigned
+    /// accounts is still held to them, and one with none signs in as the target is set up.
+    #[serde(default)]
+    #[oai(default)]
+    pub require_account_binding: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default, Enum)]

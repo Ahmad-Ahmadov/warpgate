@@ -166,6 +166,9 @@ pub struct AccountPasswordPrompt<'a> {
     /// Where `account` is among the accounts the viewer may choose from, and how many there
     /// are, counting from 1, when there are several.
     pub choice: Option<(usize, usize)>,
+    /// What to say about the account's password, in place of the first hint: that it may be
+    /// left empty, say.
+    pub note: Option<&'a str>,
     pub password_len: usize,
     pub notice: Option<SignInNotice<'a>>,
 }
@@ -360,6 +363,10 @@ pub fn render_account_password(
         (AccountKind::Local, None) => (["Windows account", "Password"], &LOCAL_PASSWORD_HINTS),
         (AccountKind::Local, Some(_)) => (["Windows account", "Password"], &ACCOUNT_CHOICE_HINTS),
     };
+    let mut hints = *hints;
+    if let Some(note) = prompt.note {
+        hints[0] = note;
+    }
     render_form(
         screen,
         &FormContent {
@@ -369,7 +376,7 @@ pub fn render_account_password(
             password_len: prompt.password_len,
             focus: SignInField::Password,
             notice: prompt.notice,
-            hints,
+            hints: &hints,
         },
     )
 }
@@ -643,6 +650,8 @@ mod sign_in_tests {
                         kind,
                         account: "alice.longname@corp.example.com",
                         choice,
+                        note: choice
+                            .map(|_| "Leave it empty to use the password you signed in with"),
                         password_len: 256,
                         notice: Some(SignInNotice::Error("The domain account is locked out")),
                     },

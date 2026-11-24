@@ -5059,10 +5059,460 @@
         ],
         "operationId": "get_secret_reference_usage"
       }
+    },
+    "/account-bindings": {
+      "get": {
+        "summary": "The remote accounts assigned to users on targets, filtered by user or target.",
+        "parameters": [
+          {
+            "name": "user_id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "query",
+            "required": false,
+            "deprecated": false,
+            "explode": true
+          },
+          {
+            "name": "target_id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "query",
+            "required": false,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AccountBinding"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "list_account_bindings"
+      },
+      "post": {
+        "summary": "Assign a remote account to a user on a target.",
+        "requestBody": {
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAccountBindingRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountBinding"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "create_account_binding"
+      }
+    },
+    "/account-bindings/options": {
+      "get": {
+        "summary": "What can be assigned to a user on a target: the user's directory account as the\ndirectory names it now, the target's configured local and managed accounts, and the\nauthentication methods each kind can use there.",
+        "parameters": [
+          {
+            "name": "user_id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "query",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          },
+          {
+            "name": "target_id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "query",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountBindingOptions"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "get_account_binding_options"
+      }
+    },
+    "/account-bindings/{id}": {
+      "put": {
+        "summary": "Change an assignment: its local account name, directory name format, authentication,\nwhether it is enabled, and its expiry. The user's live sessions on the target end.",
+        "parameters": [
+          {
+            "name": "id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateAccountBindingRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountBinding"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "update_account_binding"
+      },
+      "delete": {
+        "summary": "Revoke an assignment. The user's live sessions on the target end.",
+        "parameters": [
+          {
+            "name": "id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "delete_account_binding"
+      }
     }
   },
   "components": {
     "schemas": {
+      "AccountBinding": {
+        "type": "object",
+        "title": "AccountBinding",
+        "description": "A remote account assigned to a user on a target.",
+        "required": [
+          "id",
+          "user_id",
+          "username",
+          "target_id",
+          "target_name",
+          "protocol",
+          "account_kind",
+          "auth_method",
+          "enabled",
+          "created_at",
+          "updated_at",
+          "has_target_access"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "username": {
+            "type": "string",
+            "description": "Empty if the user has been deleted."
+          },
+          "target_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "target_name": {
+            "type": "string",
+            "description": "Empty if the target has been deleted."
+          },
+          "protocol": {
+            "type": "string",
+            "description": "`rdp` or `ssh`."
+          },
+          "account_kind": {
+            "$ref": "#/components/schemas/TargetAccountKind"
+          },
+          "account_name": {
+            "type": "string",
+            "description": "A local account's name, as configured. Directory accounts are read from the\ndirectory, and managed ones are the target's."
+          },
+          "managed_account": {
+            "type": "string",
+            "description": "The target's configured account, for a managed assignment."
+          },
+          "username_format": {
+            "$ref": "#/components/schemas/DirectoryUsernameFormat"
+          },
+          "auth_method": {
+            "$ref": "#/components/schemas/TargetAccountAuthMethod"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "created_by": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "problem": {
+            "type": "string",
+            "description": "Why the assignment cannot be used now (disabled, expired, the user's directory link\nchanged, the target no longer authenticates this way), if it cannot."
+          },
+          "has_target_access": {
+            "type": "boolean",
+            "description": "Whether the user's roles let them reach the target at all. An assignment does not."
+          }
+        }
+      },
+      "AccountBindingOptions": {
+        "type": "object",
+        "title": "AccountBindingOptions",
+        "description": "What can be assigned to a user on a target.",
+        "required": [
+          "protocol",
+          "has_target_access",
+          "directory_linked",
+          "directory_accounts",
+          "local_accounts",
+          "kinds"
+        ],
+        "properties": {
+          "protocol": {
+            "type": "string",
+            "description": "`rdp` or `ssh`."
+          },
+          "has_target_access": {
+            "type": "boolean"
+          },
+          "directory_linked": {
+            "type": "boolean",
+            "description": "Whether the user is linked to a directory entry."
+          },
+          "directory_accounts": {
+            "type": "array",
+            "description": "The user's directory account, as each format names it, read from the directory now.",
+            "items": {
+              "$ref": "#/components/schemas/DirectoryAccountName"
+            }
+          },
+          "directory_problem": {
+            "type": "string",
+            "description": "Why the directory account could not be read, when it could not."
+          },
+          "local_accounts": {
+            "type": "array",
+            "description": "Local accounts configured for this target: an RDP target's assignable accounts, and\nnames already assigned to someone on it. Configured, not checked on the server.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "managed_account": {
+            "type": "string",
+            "description": "The target's own account, for a managed assignment."
+          },
+          "kinds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccountKindOption"
+            }
+          }
+        }
+      },
+      "AccountKindOption": {
+        "type": "object",
+        "title": "AccountKindOption",
+        "description": "A way an account of some kind can sign in to a target.",
+        "required": [
+          "account_kind",
+          "auth_methods"
+        ],
+        "properties": {
+          "account_kind": {
+            "$ref": "#/components/schemas/TargetAccountKind"
+          },
+          "auth_methods": {
+            "type": "array",
+            "description": "The authentication methods it can use there; empty when the kind cannot be used.",
+            "items": {
+              "$ref": "#/components/schemas/TargetAccountAuthMethod"
+            }
+          },
+          "problem": {
+            "type": "string",
+            "description": "Why it cannot be used, when it cannot."
+          }
+        }
+      },
       "AddSshKnownHostRequest": {
         "type": "object",
         "title": "AddSshKnownHostRequest",
@@ -5603,6 +6053,48 @@
           }
         }
       },
+      "CreateAccountBindingRequest": {
+        "type": "object",
+        "title": "CreateAccountBindingRequest",
+        "required": [
+          "user_id",
+          "target_id",
+          "account_kind",
+          "auth_method"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "target_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "account_kind": {
+            "$ref": "#/components/schemas/TargetAccountKind"
+          },
+          "account_name": {
+            "type": "string",
+            "description": "A local account's name: `name`, or `COMPUTER\\name` on a Windows target. Not taken for\na directory or managed account.",
+            "maxLength": 256
+          },
+          "username_format": {
+            "$ref": "#/components/schemas/DirectoryUsernameFormat"
+          },
+          "auth_method": {
+            "$ref": "#/components/schemas/TargetAccountAuthMethod"
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
       "CreateLdapServerRequest": {
         "type": "object",
         "title": "CreateLdapServerRequest",
@@ -5833,6 +6325,33 @@
       "DeveloperToolsCredentials": {
         "type": "object",
         "title": "DeveloperToolsCredentials"
+      },
+      "DirectoryAccountName": {
+        "type": "object",
+        "title": "DirectoryAccountName",
+        "description": "A directory account name in one of the formats a target may know it by.",
+        "required": [
+          "format",
+          "account"
+        ],
+        "properties": {
+          "format": {
+            "$ref": "#/components/schemas/DirectoryUsernameFormat"
+          },
+          "account": {
+            "type": "string"
+          }
+        }
+      },
+      "DirectoryUsernameFormat": {
+        "type": "string",
+        "description": "How a directory account is named to the target.",
+        "enum": [
+          "upn",
+          "down_level",
+          "account_name",
+          "account_at_domain"
+        ]
       },
       "ExistingCertificateCredential": {
         "type": "object",
@@ -8321,6 +8840,24 @@
           }
         }
       },
+      "TargetAccountAuthMethod": {
+        "type": "string",
+        "description": "How Warpgate authenticates a bound account to the target.",
+        "enum": [
+          "directory_password",
+          "typed_password",
+          "target_credential"
+        ]
+      },
+      "TargetAccountKind": {
+        "type": "string",
+        "description": "What kind of remote account a binding names.",
+        "enum": [
+          "directory",
+          "local",
+          "managed"
+        ]
+      },
       "TargetClickAction": {
         "type": "string",
         "enum": [
@@ -8780,6 +9317,11 @@
           },
           "tls_security": {
             "$ref": "#/components/schemas/RdpTlsSecurity"
+          },
+          "require_account_binding": {
+            "type": "boolean",
+            "description": "Users may sign in only as accounts assigned to them on this target (Access Control,\naccount access); a user with none is refused. Without it, a user with assigned\naccounts is still held to them, and one with none signs in as the target is set up.",
+            "default": false
           }
         }
       },
@@ -8814,6 +9356,11 @@
           "jump_host": {
             "type": "string",
             "format": "uuid"
+          },
+          "require_account_binding": {
+            "type": "boolean",
+            "description": "Users may sign in only as accounts assigned to them on this target (Access Control,\naccount access); a user with none is refused. Without it, a user with assigned\naccounts is still held to them, and one with none signs in as the target is set up.",
+            "default": false
           }
         }
       },
@@ -9172,6 +9719,33 @@
           "ip": {
             "type": "string",
             "description": "IP address to unblock (IPv4 or IPv6)."
+          }
+        }
+      },
+      "UpdateAccountBindingRequest": {
+        "type": "object",
+        "title": "UpdateAccountBindingRequest",
+        "required": [
+          "auth_method",
+          "enabled"
+        ],
+        "properties": {
+          "account_name": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "username_format": {
+            "$ref": "#/components/schemas/DirectoryUsernameFormat"
+          },
+          "auth_method": {
+            "$ref": "#/components/schemas/TargetAccountAuthMethod"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
           }
         }
       },

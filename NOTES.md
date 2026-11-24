@@ -3133,3 +3133,198 @@ Then test by hand, in the browser and in mstsc/MobaXterm:
   account. Warpgate ends the session, and the audit log shows `TargetLogonRefused`.
 - **Logs and recordings.** The recording and logs contain no password. `TargetLogon`
   shows both the Warpgate user and the Windows account.
+
+## Account access: user, target and remote account
+
+Administrators can now assign which remote account a Warpgate user may sign in to an RDP or
+SSH target as. The UI is **Access → Account access**. The data model is
+`target_account_bindings`, added by migration `m00097`. Every connection resolves the account
+on the server, from the admitted user and target, in shared code: `warpgate-core/src/account_binding.rs`
+and `warpgate-core/src/rdp_account.rs`.
+
+### The model
+
+- **One row per assignment** (`warpgate-db-entities/src/TargetAccountBinding.rs`).
+  - Fields: `user_id` and `target_id` (both cascade on delete), `account_kind`,
+    `account_name`, `ldap_server_id` and `ldap_object_uuid`, `username_format`,
+    `auth_method`, `enabled`, `expires_at`, `created_by`, `created_at`, `updated_at` and
+    `account_key`.
+  - A unique index on `(user_id, target_id, account_key)` stops an account being assigned
+    twice. A second index is on `target_id`.
+  - No row ever holds a password.
+- **Account kinds.**
+  - `directory`: the user's linked LDAP/AD account.
+  - `local`: a named account of the target, such as `WIN-SRV-01\support` or `deploy`.
+  - `managed`: the target's configured account, with its stored or Vault credential.
+- **Directory accounts are not stored by name.** The row records the user's LDAP link at
+  assignment time. It works only while the user is linked to that same entry on that same
+  directory, so relinking the user, or a second directory with the same entry UUID, does not
+  carry it over. The name used to sign in is read from the directory each time, in the
+  chosen format:
+  - `upn`;
+  - `down_level` (`CORP\name`);
+  - `account_name` (`name`);
+  - `account_at_domain` (`name@dns.domain`, SSSD's fully-qualified form).
+- **Combinations** are checked in `check_combination`, both when an assignment is saved and
+  when it is used:
+  - RDP directory account: `directory_password`.
+  - RDP local account: `typed_password`.
+  - RDP managed account: `target_credential`, only on a target with a stored password.
+  - SSH: `target_credential` only. A local or directory account also needs the target to
+    authenticate with Warpgate's keys, a Vault-signed certificate or an AWS role, because
+    an SSH target's stored password belongs to its configured account.
+  - Typed or forwarded passwords are refused for SSH (see "Not supported" below).
+- **Enforcement policy.** This never widens access, and existing targets behave as before.
+  - A user with assignments on a target may use only their active ones: enabled, not
+    expired, and with an unchanged link.
+  - A user with assignments of which none is active is refused.
+  - A user with none signs in as the target is set up, unless the target has
+    `require_account_binding` set. That is the new "Require an account assignment"
+    checkbox on the RDP and SSH options, and with it such a user is refused.
+  - An assignment never grants access to a target. The user's roles still decide that, and
+    the admin UI warns when they do not.
+
+### Backend
+
+- **Admin API** (needs the `AccessRolesAssign` permission):
+  - `GET /account-bindings?user_id&target_id`
+  - `POST /account-bindings`
+  - `PUT /account-bindings/{id}`
+  - `DELETE /account-bindings/{id}`
+  - `GET /account-bindings/options?user_id&target_id`: the user's directory account as
+    each format names it, read live; the target's configured local accounts and managed
+    account; and the methods each kind can use.
+  - Changing, disabling or revoking an assignment ends the user's live sessions on that
+    target (`close_sessions_on_target`).
+  - Audit events: `AccountBindingCreated1`, `AccountBindingUpdated1`,
+    `AccountBindingRevoked1` and `AccountBindingRefused1`. The last is emitted for a
+    forged or foreign binding id, an account not assigned to the user, or no usable
+    assignment.
+- **Gateway API:** `GET /targets/{id}/accounts` returns only the signed-in user's own accounts
+  on a target, authorized as starting a web session is. `POST /web-ssh/sessions` takes an
+  optional `account_binding_id`, which is looked up only among the caller's own bindings
+  on that target.
+- **RDP** (`rdp_account.rs`).
+  - `plan_sign_in` turns the user's bindings, or the target's own setup when they have
+    none, into a list of choices.
+  - `verify_sign_in` rebuilds that list on the server and accepts a choice only from it.
+    The choice is named by binding id or by account name.
+  - The result is an `AuthorizedSignIn`, which only this module can create.
+    `warpgate_protocol_rdp::connect` takes it and refuses one made for another user or
+    target.
+  - The logon check from the previous section (Save Session Info) applies to whichever
+    account was chosen.
+- **SSH.** `resolve_approved_ssh_chain` is the single place where both browser and native
+  SSH connect.
+  - It sets the destination's username to the bound account, and leaves jump hosts with
+    their own accounts.
+  - SCP, SFTP and port forwarding all run over that same connection, so the binding covers
+    them too.
+  - Browser SSH lets the user choose when they have several accounts. Native SSH uses the
+    first one assigned (see "Not supported").
+
+### Native RDP: one password per connection
+
+- The password the viewer signs in to Warpgate with is kept for that connection only. It
+  comes either from the Client Info PDU or from Warpgate's sign-in screen.
+  - It is held in memory as `SignInPassword` (`Zeroizing<String>`) and wiped when dropped.
+  - It is never logged, stored or recorded.
+  - It is usable for 5 minutes (`SIGN_IN_PASSWORD_REUSE_WINDOW`).
+  - It is dropped if sign-in fails, approval is denied, or the viewer leaves.
+- After MFA and approval, if the user's only choice is their own directory account,
+  `reuse_sign_in_password` signs the target in with that password, and nothing more is
+  asked. This happens only when:
+  - the user's LDAP server has `authenticate_users` on, which means that password was
+    checked by binding as this very entry;
+  - the password is checked with the directory again at that point.
+  - It is never offered to a local account or to anyone else's account.
+- If there are several choices, the password screen offers them: the user steps with Up and
+  Down and cannot type a name.
+  - Leaving the password empty on the directory account uses the sign-in password.
+  - The managed account needs no password.
+- If the password cannot be reused, Warpgate asks for the account's password once, on its
+  own screen. Reasons: the approval took more than 5 minutes, the server does not check
+  Warpgate passwords against LDAP, or a ticket was used.
+- Windows then signs in with NLA/CredSSP and autologon, so it does not prompt again, unless
+  its own policy forces it (see "Prerequisites").
+- The browser asks for the directory password once, after approval, over the session
+  websocket. A browser login is a separate session, so its password is not kept.
+
+### Prerequisites on the targets
+
+- **Windows.**
+  - Turn off "Always prompt for password upon connection" (`fPromptForPassword`). With it
+    on, Windows shows its own prompt whatever Warpgate does.
+  - Limit "Allow log on through Remote Desktop Services" to the intended accounts.
+  - Hide Fast User Switching.
+  - Set "End a disconnected session".
+  - Warpgate ends any session that logs on as an account other than the chosen one
+    (Save Session Info). It cannot stop that logon from happening on the server.
+- **Linux (SSSD / realmd).**
+  - The server must know the directory user under the chosen name format.
+    `account_at_domain` is realmd's default; use `account_name` with
+    `use_fully_qualified_names = False`.
+  - It must also trust Warpgate's credential for that user: Warpgate's SSH public key in
+    the user's keys (for example SSSD with `ldap_user_ssh_public_key`), or the Vault SSH
+    CA with a matching principal.
+  - `sudo`, `su` and similar remain under the server's own policy.
+
+### Not supported, and why
+
+- **Choosing among several accounts in native SSH.** The SSH username has no room for an
+  account (`user:target` is already parsed everywhere), so native SSH uses the first account
+  assigned. Browser SSH lets the user choose.
+- **Forwarding a user's password to SSH targets.** It is not implemented. SSH bindings use
+  the target's key- or certificate-based credential.
+- **Per-account stored passwords for local accounts.** Local accounts take a password typed
+  at connection time; only the target's one managed account has a stored credential.
+- **Remote account discovery.** Accounts are registered by hand and marked "configured, not
+  checked". Warpgate never creates or changes accounts on targets.
+- **Recording the binding id in session records.** It is not stored there. It appears in the
+  connection log lines and in the audit events.
+
+### Automated tests added
+
+- `warpgate-core/src/account_binding.rs` uses a migrated in-memory SQLite database. It
+  covers:
+  - an assigned account being used, and unassigned ones refused;
+  - forged and other users' binding ids;
+  - disabled and expired bindings;
+  - strict versus lenient targets;
+  - directory relinking, including across two directories;
+  - local assignments staying on their own target;
+  - unsupported combinations.
+- `warpgate-core/src/rdp_account.rs` covers:
+  - choice selection by binding id and by name, with forged ones refused;
+  - a managed-only plan needing no prompt;
+  - the sign-in password never being offered to a non-directory account.
+- `warpgate-protocol-rdp/src/server/sign_in.rs` covers which accounts may go without a
+  typed password.
+- `warpgate-admin` covers validation of local account names.
+- `TargetAccountBinding` covers its account keys.
+- The existing migration round-trip test now runs `m00097` up and down.
+
+### On the build server
+
+```sh
+cargo test -p warpgate-core account_binding
+cargo test -p warpgate-core rdp_account
+cargo test -p warpgate-db-entities
+cargo test -p warpgate-db-migrations
+cargo test -p warpgate-protocol-rdp
+cargo test -p warpgate-admin account_bindings
+just clippy
+just openapi   # regenerates the TypeScript clients from the committed schemas
+cd warpgate-web && npm run check && npm run lint
+```
+
+Both `openapi-schema.json` files were edited by hand. Running `just openapi-all` should
+produce the same content.
+
+The integration scenarios cannot run here. These need a real Windows host, an AD directory
+and an SSH server:
+- mstsc and MobaXterm with a single password entry;
+- account switching at the Windows logon or lock screen;
+- browser and native SSH as `deploy` and as a directory account;
+- SFTP and port forwarding with a binding;
+- jump hosts.

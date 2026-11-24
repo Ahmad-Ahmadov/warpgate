@@ -167,6 +167,11 @@
             asyncComponent: () => import('./config/AccessRole.svelte'),
         }),
 
+        // ---- account access ----
+        '/config/account-access': wrap({
+            asyncComponent: () => import('./screens/AccountAccess.svelte'),
+        }),
+
         // ---- admin roles ----
         '/config/admin-roles': wrap({
             asyncComponent: () => import('./config/AdminRoles.svelte'),

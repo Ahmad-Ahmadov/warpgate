@@ -112,8 +112,8 @@ pub async fn run(
     // Who the target is signed in to as: the stored account and its stored (or vaulted)
     // password, or an account the user may use (their own directory account, or one assigned
     // to them) with the password they typed, which is dropped, and wiped, right after.
-    let config = match (&options.auth, credentials) {
-        (RdpTargetAuth::Password(auth), _) => {
+    let config = match (credentials, &options.auth) {
+        (None, RdpTargetAuth::Password(auth)) => {
             let password = auth.password.resolve(&*secrets).await?;
             build_config(
                 &options,
@@ -128,7 +128,7 @@ pub async fn run(
                 keyboard_layout,
             )
         }
-        (RdpTargetAuth::DomainAccount(_) | RdpTargetAuth::LocalAccount(_), Some(credentials)) => {
+        (Some(credentials), _) => {
             build_config(
                 &options,
                 SignInAs {
@@ -145,10 +145,9 @@ pub async fn run(
                 keyboard_layout,
             )
         }
-        (RdpTargetAuth::DomainAccount(_) | RdpTargetAuth::LocalAccount(_), None) => {
+        (None, RdpTargetAuth::DomainAccount(_) | RdpTargetAuth::LocalAccount(_)) => {
             return Err(WarpgateError::InvalidRequest(
-                "This target signs in with an account you enter the password of when connecting, and no password was given"
-                    .into(),
+                "This target has no stored password, and no account password was given".into(),
             )
             .into());
         }
@@ -917,6 +916,7 @@ pub(crate) fn test_connector_config(username: &str, password: &str) -> connector
         compression: RdpTargetCompression::default(),
         interactive_logon: false,
         tls_security: warpgate_common::RdpTlsSecurity::default(),
+        require_account_binding: false,
     };
     let mut config = build_config(
         &options,

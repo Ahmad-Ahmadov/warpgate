@@ -32,6 +32,7 @@ use warpgate_common::{
     SSHTargetAuth, TargetOptionsVariant, TargetSSHOptions, UserFacingReason, UserSessionId,
     WarpgateError, io_connect_reason,
 };
+use warpgate_core::account_binding::{BindingChoice, BoundUser, resolve_ssh_account};
 use warpgate_core::{AdmittedTarget, ConfigProvider, Services};
 
 use self::handler::ClientHandlerEvent;
@@ -204,16 +205,56 @@ pub async fn resolve_ssh_chain_for_admin(
 
 /// Resolve the target-side connection plan while consuming the capability
 /// minted for this target session.
+///
+/// The destination's username is the account assigned to the user on the target, when
+/// accounts are assigned to them there (Access Control, account access): `account` picks
+/// among their own, and nothing a client sends can name another. Jump hosts keep the
+/// accounts they are set up with.
 pub async fn resolve_approved_ssh_chain(
     services: &Services,
     admitted: AdmittedTarget<TargetSSHOptions>,
+    account: BindingChoice,
 ) -> Result<Vec<ResolvedSshChainHost>, WarpgateError> {
-    resolve_ssh_chain(
-        services,
-        admitted.target().id,
-        Some(&admitted.user_info().username),
+    let user_info = admitted.user_info();
+    let target = admitted.target();
+    let mut chain = resolve_ssh_chain(services, target.id, Some(&user_info.username)).await?;
+    let user = BoundUser {
+        id: user_info.id,
+        username: &user_info.username,
+    };
+    let bound = resolve_ssh_account(
+        &services.db,
+        user,
+        target.id,
+        &target.name,
+        admitted.options(),
+        account,
     )
     .await
+    .map_err(|error| {
+        warn!(user = %user_info.username, target = %target.name, %error, "No account to sign in to the SSH target with");
+        WarpgateError::InvalidRequest(error.user_message().into())
+    })?;
+    match (bound, chain.last_mut()) {
+        (Some(bound), Some(destination)) => {
+            info!(
+                user = %user_info.username,
+                target = %target.name,
+                target_account = %bound.username,
+                binding_id = %bound.binding_id,
+                "Signing in to the SSH target as the account assigned to the user"
+            );
+            destination.ssh_options.username = bound.username;
+        }
+        (None, Some(destination)) => info!(
+            user = %user_info.username,
+            target = %target.name,
+            target_account = %destination.ssh_options.username,
+            "Signing in to the SSH target as it is set up"
+        ),
+        (_, None) => {}
+    }
+    Ok(chain)
 }
 
 #[derive(Debug)]

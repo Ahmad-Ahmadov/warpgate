@@ -29,6 +29,7 @@ macro_rules! with_every_entity {
             SshClientKey,
             SsoCredential,
             Target,
+            TargetAccountBinding,
             TargetGroup,
             TargetRoleAssignment,
             TargetSession,

@@ -16,7 +16,13 @@
     import Button from 'ui/Button.svelte'
     import Menu from 'ui/Menu.svelte'
     import Modal from 'ui/Modal.svelte'
-    import { api, ResponseError, type WebClientSessionInfo } from './lib/api'
+    import Select from 'ui/Select.svelte'
+    import {
+        api,
+        ResponseError,
+        type TargetAccount,
+        type WebClientSessionInfo,
+    } from './lib/api'
     import {
         ReconnectingWebSocket,
         SocketState,
@@ -249,42 +255,103 @@
         window.close()
     }
 
-    async function startSession(targetId: string): Promise<void> {
+    async function startSession(
+        targetId: string,
+        accountBindingId?: string,
+    ): Promise<void> {
         const { sessionId: id } = await api.createWebSshSession({
-            createWebSshSessionBody: { targetId },
+            createWebSshSessionBody: { targetId, accountBindingId },
         })
         sessionId = id
         history.replaceState(history.state, '', `#/web-ssh/${id}`)
     }
 
-    onMount(async () => {
-        reloadServerInfo()
+    // Several accounts assigned to the user on the target: they choose one, among
+    // their own only (the server checks the choice again).
+    let accountChoice = $state<{
+        targetId: string
+        accounts: TargetAccount[]
+    } | null>(null)
+    let chosenBinding = $state('')
 
+    /** Whether the user has several accounts here, so is asked to choose. */
+    async function asksForAccount(targetId: string): Promise<boolean> {
+        let accounts: TargetAccount[]
         try {
-            if (!sessionId && params.targetId) {
-                opening = true
-                try {
-                    await startSession(params.targetId)
-                } finally {
-                    opening = false
-                }
-            }
+            accounts = await api.getTargetAccounts({ targetId })
+        } catch {
+            // Starting the session reports any problem.
+            return false
+        }
+        if (accounts.length < 2) {
+            return false
+        }
+        chosenBinding = accounts[0].bindingId ?? ''
+        accountChoice = { targetId, accounts }
+        return true
+    }
+
+    async function reportError(e: unknown): Promise<void> {
+        if (await handleReauthError(e)) {
+            return
+        }
+        notice = await stringifyError(e)
+        if (e instanceof ResponseError && e.response.status === 404) {
+            sessionNotFound = true
+        }
+    }
+
+    /** Join the session that was started, and stream it. */
+    async function attach(): Promise<void> {
+        try {
             if (!sessionId) {
                 sessionNotFound = true
                 return
             }
             sessionInfo = await api.getWebSshSession({ sessionId })
         } catch (e) {
-            if (await handleReauthError(e)) {
-                return
-            }
-            notice = await stringifyError(e)
-            if (e instanceof ResponseError && e.response.status === 404) {
-                sessionNotFound = true
-            }
+            await reportError(e)
             return
         }
         startStream()
+    }
+
+    async function openSession(
+        targetId: string,
+        accountBindingId?: string,
+    ): Promise<void> {
+        opening = true
+        try {
+            await startSession(targetId, accountBindingId)
+        } catch (e) {
+            opening = false
+            await reportError(e)
+            return
+        }
+        opening = false
+        await attach()
+    }
+
+    async function connectChosen(): Promise<void> {
+        if (!accountChoice) {
+            return
+        }
+        const { targetId } = accountChoice
+        accountChoice = null
+        await openSession(targetId, chosenBinding || undefined)
+    }
+
+    onMount(async () => {
+        reloadServerInfo()
+
+        if (!sessionId && params.targetId) {
+            if (await asksForAccount(params.targetId)) {
+                return
+            }
+            await openSession(params.targetId)
+            return
+        }
+        await attach()
     })
 
     const originalTitle = document.title
@@ -469,6 +536,27 @@
     </Modal>
 {/if}
 
+{#if accountChoice}
+    <Modal open title="Choose the account" size="sm" dismissable={false}>
+        <p class="account-choice-lede">
+            Several accounts on this target are assigned to you. Choose the one
+            to sign in as.
+        </p>
+        <Select
+            label="Account"
+            options={accountChoice.accounts.map(a => ({
+                value: a.bindingId ?? '',
+                label: a.account,
+            }))}
+            bind:value={chosenBinding}
+        />
+        {#snippet footer()}
+            <Button variant="ghost" onclick={disconnect}>Cancel</Button>
+            <Button variant="primary" onclick={connectChosen}>Connect</Button>
+        {/snippet}
+    </Modal>
+{/if}
+
 {#if pendingHostKey}
     <Modal
         open={true}
@@ -515,6 +603,12 @@
 {/if}
 
 <style lang="scss">
+    .account-choice-lede {
+        margin: 0 0 var(--wg-space-md);
+        color: var(--wg-text-muted);
+        font: var(--wg-text-body-md);
+    }
+
     :global(body) {
         margin: 0;
         overflow: hidden;

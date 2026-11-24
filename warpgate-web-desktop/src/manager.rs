@@ -9,7 +9,10 @@ use futures::stream::{FuturesOrdered, StreamExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info_span, warn};
 use warpgate_common::{TargetOptions, UserSessionId, WarpgateError};
-use warpgate_core::rdp_account::{SignInKind, SignInPlan, TargetCredentials, verify_sign_in};
+use warpgate_core::account_binding::BoundUser;
+use warpgate_core::rdp_account::{
+    AuthorizedSignIn, SignInAnswer, SignInKind, SignInPlan, verify_sign_in,
+};
 use warpgate_core::recordings::{DesktopRecorder, DesktopRecordingMetadata};
 use warpgate_core::{
     AdmittedTarget, DesktopClientHandles, DesktopConnectionError, DesktopEvent, Services,
@@ -59,7 +62,7 @@ impl WebDesktopClientManager {
         authorization: TargetAuthorization,
         remote_address: Option<SocketAddr>,
         size: Option<(u16, u16)>,
-        sign_in: SignInPlan,
+        sign_in: Option<SignInPlan>,
     ) -> Result<UserSessionId, WarpgateError> {
         let user_id = authorization.user_info().id;
         let username = authorization.user_info().username.clone();
@@ -115,7 +118,7 @@ async fn run_session(
     authorization: TargetAuthorization,
     remote_address: Option<SocketAddr>,
     size: Option<(u16, u16)>,
-    sign_in: SignInPlan,
+    sign_in: Option<SignInPlan>,
     registry: ClientManager<WebDesktopSession>,
     services: Services,
 ) {
@@ -130,17 +133,17 @@ async fn run_session(
             // The account's password is asked for only now: after sign-in, second factor
             // and approval, so nobody types one for a session that is not approved. It is
             // held from the browser's answer until the target is connected, and no longer.
-            let credentials = if sign_in.kind().asks_for_password() {
-                Some(
-                    ask_sign_in(session_ref, services_ref, &admitted, &sign_in)
+            let sign_in = match &sign_in {
+                None => None,
+                Some(plan) => Some(match plan.stored_sign_in() {
+                    Some(stored) => stored,
+                    None => ask_sign_in(session_ref, services_ref, &admitted, plan)
                         .await
                         .map_err(|e| Arc::new(DesktopConnectionError::from(e)))?,
-                )
-            } else {
-                None
+                }),
             };
             let (handles, recorder, encode_jpeg) =
-                connect(session_ref, services_ref, admitted, size, credentials)
+                connect(session_ref, services_ref, admitted, size, sign_in)
                     .await
                     .map_err(|e| Arc::new(DesktopConnectionError::from(e)))?;
             relay_events(session_ref, handles, recorder, encode_jpeg).await
@@ -158,7 +161,7 @@ async fn ask_sign_in(
     services: &Services,
     admitted: &AdmittedTarget,
     plan: &SignInPlan,
-) -> Result<TargetCredentials, WarpgateError> {
+) -> Result<AuthorizedSignIn, WarpgateError> {
     let TargetOptions::Rdp(options) = admitted.options() else {
         return Err(WarpgateError::InvalidTarget);
     };
@@ -167,19 +170,32 @@ async fn ask_sign_in(
             "the session's sign-in was already taken".into(),
         ));
     };
-    let user_id = admitted.user_info().id;
-    let kind = match plan.kind() {
+    let user_info = admitted.user_info();
+    let user = BoundUser {
+        id: user_info.id,
+        username: &user_info.username,
+    };
+    let target = admitted.target();
+    let kind = match plan.prompt_kind() {
         SignInKind::DomainAccount => "domain_account",
         SignInKind::LocalAccount | SignInKind::Managed => "local_account",
     };
+    // The managed account among several takes no password: the target's stored one.
+    let passwordless: Vec<String> = plan
+        .choices()
+        .iter()
+        .filter(|choice| !choice.asks_for_password())
+        .map(|choice| choice.label())
+        .collect();
     let deadline = tokio::time::Instant::now() + SIGN_IN_TIMEOUT;
     let mut error = None;
     for attempt in 1..=MAX_SIGN_IN_ATTEMPTS {
         session
             .ask_sign_in(SignInRequest {
                 kind,
-                target: admitted.target().name.clone(),
+                target: target.name.clone(),
                 accounts: plan.account_names(),
+                passwordless: passwordless.clone(),
                 error: error.take(),
             })
             .await;
@@ -197,14 +213,19 @@ async fn ask_sign_in(
         // `verify_sign_in` logs its answer, without the password.
         match verify_sign_in(
             &services.db,
-            user_id,
+            user,
+            target.id,
+            &target.name,
             options,
-            answer.account.as_deref(),
+            SignInAnswer {
+                binding_id: None,
+                account: answer.account.as_deref(),
+            },
             answer.password.into_zeroizing(),
         )
         .await
         {
-            Ok(credentials) => return Ok(credentials),
+            Ok(sign_in) => return Ok(sign_in),
             Err(refusal) if refusal.may_retry() && attempt < MAX_SIGN_IN_ATTEMPTS => {
                 error = Some(refusal.user_message().to_owned());
             }
@@ -223,7 +244,7 @@ async fn connect(
     services: &Services,
     admitted: AdmittedTarget,
     size: Option<(u16, u16)>,
-    credentials: Option<TargetCredentials>,
+    sign_in: Option<AuthorizedSignIn>,
 ) -> Result<(DesktopClientHandles, Option<Arc<DesktopRecorder>>, bool), WarpgateError> {
     let target_session_id = admitted.id();
     let (handles, encode_jpeg) = match session.target_kind() {
@@ -246,7 +267,9 @@ async fn connect(
                 admitted.narrow()?,
                 size.unwrap_or(warpgate_protocol_rdp::DEFAULT_SIZE),
                 services.secret_backends.clone(),
-                credentials,
+                sign_in.ok_or(WarpgateError::InconsistentState(
+                    "an RDP session without a decided sign-in".into(),
+                ))?,
             )?;
             // The RDP helper only ever emits raw BGRA.
             (handles, true)

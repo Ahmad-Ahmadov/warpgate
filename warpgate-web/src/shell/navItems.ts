@@ -143,6 +143,14 @@ export const NAV_SECTIONS: NavSection[] = [
                 requires: 'accessRolesEdit',
             },
             {
+                id: 'account-access',
+                label: 'Account access',
+                href: '#/config/account-access',
+                match: '/config/account-access',
+                icon: ICONS.user,
+                requires: 'accessRolesAssign',
+            },
+            {
                 id: 'admin-roles',
                 label: 'Admin roles',
                 href: '#/config/admin-roles',

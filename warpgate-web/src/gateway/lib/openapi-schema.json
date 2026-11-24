@@ -1290,6 +1290,70 @@
         "operationId": "get_ticket_request_targets"
       }
     },
+    "/targets/{target_id}/accounts": {
+      "get": {
+        "summary": "The accounts the signed-in user may connect to a target as: their own assignments\nthere, or the target's own setup. Authorized as starting a session is, and only ever\nabout the user's own accounts.",
+        "parameters": [
+          {
+            "name": "target_id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The accounts, in the order they were assigned. Empty for an SSH target the user signs\nin to as it is set up.",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TargetAccount"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The user has no account to use on the target, and why.",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": ""
+          },
+          "403": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          },
+          {
+            "ClusterSecurityScheme": []
+          }
+        ],
+        "operationId": "get_target_accounts"
+      }
+    },
     "/web-ssh/sessions": {
       "post": {
         "requestBody": {
@@ -1827,6 +1891,11 @@
           "target_id": {
             "type": "string",
             "format": "uuid"
+          },
+          "account_binding_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The account to sign in as, among those assigned to the user on the target (see\n`get_target_accounts`): only ever one of their own. Without it, the only one, or the\nfirst of several."
           }
         }
       },
@@ -2580,6 +2649,38 @@
             "type": "string"
           }
         }
+      },
+      "TargetAccount": {
+        "type": "object",
+        "title": "TargetAccount",
+        "description": "An account the signed-in user may connect to a target as.",
+        "required": [
+          "account",
+          "kind"
+        ],
+        "properties": {
+          "binding_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The assignment it comes from (Access Control); absent for the target's own setup."
+          },
+          "account": {
+            "type": "string",
+            "description": "The account, as the target is signed in to with it."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TargetAccountKind"
+          }
+        }
+      },
+      "TargetAccountKind": {
+        "type": "string",
+        "description": "What kind of remote account a binding names.",
+        "enum": [
+          "directory",
+          "local",
+          "managed"
+        ]
       },
       "TargetClickAction": {
         "type": "string",

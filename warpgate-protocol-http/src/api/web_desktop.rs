@@ -9,7 +9,8 @@ use poem_openapi::{Object, OpenApi};
 use tracing::warn;
 use uuid::Uuid;
 use warpgate_common::{TargetOptions, UserSessionId, WarpgateError};
-use warpgate_core::rdp_account::{SignInPlan, plan_sign_in};
+use warpgate_core::account_binding::BoundUser;
+use warpgate_core::rdp_account::plan_sign_in;
 use warpgate_web_desktop::WebDesktopClientManager;
 
 use crate::api::auth_scheme::AuthedSession;
@@ -59,15 +60,22 @@ impl Api {
             // takes one, is asked for over the session's stream once it is approved.
             let sign_in = match authorization.options() {
                 TargetOptions::Rdp(options) => {
-                    let user_id = authorization.user_info().id;
-                    plan_sign_in(&services.db, user_id, options)
-                        .await
-                        .map_err(|error| {
-                            warn!(%user_id, %error, "No account to sign in to the target with");
-                            WarpgateError::InvalidRequest(error.user_message().into())
-                        })?
+                    let user_info = authorization.user_info();
+                    let target = authorization.target();
+                    let user = BoundUser {
+                        id: user_info.id,
+                        username: &user_info.username,
+                    };
+                    Some(
+                        plan_sign_in(&services.db, user, target.id, &target.name, options)
+                            .await
+                            .map_err(|error| {
+                                warn!(user_id = %user.id, %error, "No account to sign in to the target with");
+                                WarpgateError::InvalidRequest(error.user_message().into())
+                            })?,
+                    )
                 }
-                _ => SignInPlan::Managed,
+                _ => None,
             };
             manager
                 .create_session(

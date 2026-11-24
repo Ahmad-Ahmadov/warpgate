@@ -295,6 +295,14 @@
     />
 </div>
 
+<div class="insecure">
+    <Checkbox
+        label="Require an account assignment"
+        hint="Users may sign in only as accounts assigned to them on this target (Access, Account access); a user with none is refused. Without it, users with assignments are still held to them."
+        bind:checked={options.requireAccountBinding}
+    />
+</div>
+
 <style>
     h5 {
         margin: var(--wg-space-xl) 0 var(--wg-space-md);
