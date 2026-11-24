@@ -580,10 +580,10 @@
             <EmptyState
                 icon="target"
                 title={kindFilter === 'all'
-                    ? "You don't have access to any targets yet"
+                    ? "You don't have access to any targets yet."
                     : 'No targets of that kind'}
                 hint={kindFilter === 'all'
-                    ? `Ask an administrator to give ${$serverInfo?.username ?? 'your account'} a role with the targets you need.`
+                    ? 'Contact your administrator to request access.'
                     : undefined}
             />
         {/snippet}

@@ -117,7 +117,7 @@
             icon="user"
             size="compact"
             title="No users yet"
-            hint="Users sign in to reach the targets their roles allow."
+            hint="Manage users and their access to targets through Access Control."
         >
             {#snippet action()}
                 <Button
