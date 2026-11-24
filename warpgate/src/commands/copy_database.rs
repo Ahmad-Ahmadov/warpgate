@@ -49,6 +49,12 @@ macro_rules! with_every_table_in_order {
             CertificateCredential,
             SessionApprovalRequest,
             TargetAccountBinding,
+            // Access Control: accounts first, then what references them
+            TargetAccount,
+            AccessAssignment,
+            AccessGroupGrant,
+            AccessGroupExclusion,
+            AccessMigrationReview,
         ];
     };
 }

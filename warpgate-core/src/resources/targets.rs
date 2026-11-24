@@ -6,11 +6,12 @@ use sea_orm::{
 use uuid::Uuid;
 use warpgate_common::{StoredSecrets, TargetOptions, WarpgateError};
 use warpgate_db_entities::{
-    KnownHost, Target, TargetRoleAssignment, TargetSession, Ticket, TicketRequest,
+    AccessAssignment, AccessGroupExclusion, AccessGroupGrant, AccessMigrationReview, KnownHost,
+    Target, TargetAccount, TargetRoleAssignment, TargetSession, Ticket, TicketRequest,
 };
 
 use super::{AdmittedSessions, ResourceError, check_name, name_taken};
-use crate::db::is_unique_violation;
+use crate::access_control::{protocol_of, uses_accounts};
 
 #[derive(Object)]
 pub struct TargetDataRequest {
@@ -28,9 +29,12 @@ pub struct TargetDataRequest {
     pub ticket_max_uses: Option<i16>,
 }
 
+/// What a target's settings are stored as: encrypted, and with no account in them (those
+/// live in its Accounts, see [`super::target_accounts`]).
 fn serialize_options_for_storage(
     mut options: TargetOptions,
 ) -> Result<serde_json::Value, WarpgateError> {
+    super::target_accounts::strip_account_fields(&mut options);
     options.encrypt_all()?;
     Ok(serde_json::to_value(options)?)
 }
@@ -52,28 +56,39 @@ fn set_data(
     Ok(())
 }
 
-pub async fn create<C: ConnectionTrait>(
+/// Create a target. An account its settings name (as API clients written before target
+/// accounts send one) becomes its primary account; it grants nobody anything.
+pub async fn create<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     data: &TargetDataRequest,
+    actor: Option<Uuid>,
 ) -> Result<Target::Model, ResourceError> {
     check_name(&data.name)?;
+    let txn = db.begin().await?;
     let mut model = Target::ActiveModel {
         id: Set(Uuid::new_v4()),
         kind: Set((&data.options).into()),
         ..Default::default()
     };
     set_data(&mut model, data)?;
-    model.insert(db).await.map_err(name_taken)
+    let target = model.insert(&txn).await.map_err(name_taken)?;
+    super::target_accounts::sync_primary(&txn, &target, &data.options, actor).await?;
+    txn.commit().await?;
+    Ok(target)
 }
 
-pub async fn update<C: ConnectionTrait>(
+/// Update a target. As on [`create`], an account its settings name updates its primary
+/// account; the Warpgate UI sends them blank and manages accounts on their own.
+pub async fn update<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     id: Uuid,
     data: &TargetDataRequest,
+    actor: Option<Uuid>,
 ) -> Result<Target::Model, ResourceError> {
     check_name(&data.name)?;
+    let txn = db.begin().await?;
     let target = Target::Entity::find_by_id(id)
-        .one(db)
+        .one(&txn)
         .await?
         .ok_or(ResourceError::NotFound)?;
     if target.kind != (&data.options).into() {
@@ -82,7 +97,10 @@ pub async fn update<C: ConnectionTrait>(
 
     let mut model: Target::ActiveModel = target.into();
     set_data(&mut model, data)?;
-    model.update(db).await.map_err(name_taken)
+    let target = model.update(&txn).await.map_err(name_taken)?;
+    super::target_accounts::sync_primary(&txn, &target, &data.options, actor).await?;
+    txn.commit().await?;
+    Ok(target)
 }
 
 pub async fn delete<C: ConnectionTrait + TransactionTrait>(
@@ -97,6 +115,28 @@ pub async fn delete<C: ConnectionTrait + TransactionTrait>(
 
     TargetRoleAssignment::Entity::delete_many()
         .filter(TargetRoleAssignment::Column::TargetId.eq(target.id))
+        .exec(&txn)
+        .await?;
+
+    // Access Control: everything that named the target or its accounts goes with it.
+    AccessGroupExclusion::Entity::delete_many()
+        .filter(AccessGroupExclusion::Column::TargetId.eq(target.id))
+        .exec(&txn)
+        .await?;
+    AccessGroupGrant::Entity::delete_many()
+        .filter(AccessGroupGrant::Column::TargetId.eq(target.id))
+        .exec(&txn)
+        .await?;
+    AccessAssignment::Entity::delete_many()
+        .filter(AccessAssignment::Column::TargetId.eq(target.id))
+        .exec(&txn)
+        .await?;
+    AccessMigrationReview::Entity::delete_many()
+        .filter(AccessMigrationReview::Column::TargetId.eq(target.id))
+        .exec(&txn)
+        .await?;
+    TargetAccount::Entity::delete_many()
+        .filter(TargetAccount::Column::TargetId.eq(target.id))
         .exec(&txn)
         .await?;
 
@@ -130,37 +170,54 @@ pub async fn delete<C: ConnectionTrait + TransactionTrait>(
     Ok(AdmittedSessions(admitted))
 }
 
-pub async fn add_role<C: ConnectionTrait>(
+/// The legacy "allow a role on a target", translated into Access Control: the group of
+/// that role is granted the target's primary account (or, on a protocol with no accounts,
+/// the target). A target with accounts and no primary one refuses, rather than pick an
+/// account that could widen access.
+pub async fn add_role<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     target_id: Uuid,
     role_id: Uuid,
-) -> Result<(), ResourceError> {
-    TargetRoleAssignment::ActiveModel {
-        target_id: Set(target_id),
-        role_id: Set(role_id),
-    }
-    .insert(db)
-    .await
-    .map_err(|err| {
-        if is_unique_violation(&err) {
-            ResourceError::RoleAlreadyAssigned
-        } else {
-            err.into()
-        }
-    })?;
-    Ok(())
+    actor: Option<Uuid>,
+) -> Result<warpgate_db_entities::AccessGroupGrant::Model, ResourceError> {
+    let target = Target::Entity::find_by_id(target_id)
+        .one(db)
+        .await?
+        .ok_or(ResourceError::NotFound)?;
+    let account_id = if uses_accounts(protocol_of(target.kind)) {
+        let primary = TargetAccount::Entity::find()
+            .filter(TargetAccount::Column::TargetId.eq(target_id))
+            .filter(TargetAccount::Column::IsPrimary.eq(true))
+            .one(db)
+            .await?
+            .ok_or(ResourceError::NoPrimaryAccount)?;
+        Some(primary.id)
+    } else {
+        None
+    };
+    super::access_groups::add_grant(db, role_id, target_id, account_id, actor).await
 }
 
-pub async fn remove_role<C: ConnectionTrait>(
+/// The legacy "disallow a role on a target": every grant of the group on the target is
+/// removed (with its members' exclusions). Returns what was removed.
+pub async fn remove_role<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     target_id: Uuid,
     role_id: Uuid,
-) -> Result<(), ResourceError> {
-    let result = TargetRoleAssignment::Entity::delete_by_id((target_id, role_id))
+) -> Result<Vec<warpgate_db_entities::AccessGroupGrant::Model>, ResourceError> {
+    let grants = AccessGroupGrant::Entity::find()
+        .filter(AccessGroupGrant::Column::RoleId.eq(role_id))
+        .filter(AccessGroupGrant::Column::TargetId.eq(target_id))
+        .all(db)
+        .await?;
+    let legacy = TargetRoleAssignment::Entity::delete_by_id((target_id, role_id))
         .exec(db)
         .await?;
-    if result.rows_affected == 0 {
+    if grants.is_empty() && legacy.rows_affected == 0 {
         return Err(ResourceError::NotFound);
     }
-    Ok(())
+    for grant in &grants {
+        super::access_groups::remove_grant(db, grant.id).await?;
+    }
+    Ok(grants)
 }

@@ -20,7 +20,7 @@ pub use server::bind_server;
 use tokio::sync::mpsc::{channel, unbounded_channel};
 use tracing::{Instrument, error, info, info_span, warn};
 use warpgate_common::{ListenEndpoint, Protocol, SecretResolver, TargetRdpOptions, WarpgateError};
-use warpgate_core::rdp_account::{AuthorizedSignIn, managed_logon_identity};
+use warpgate_core::rdp_account::{AuthorizedSignIn, stored_logon_identity};
 use warpgate_core::{
     AdmittedTarget, DESKTOP_INPUT_CHANNEL_CAPACITY, DesktopClientHandles, DesktopEvent,
     DesktopInput, DesktopState, LogonState, ProtocolServer, Services,
@@ -87,8 +87,9 @@ impl std::fmt::Debug for RdpProtocolServer {
 /// Start an RDP client for a target and bridge it to normalised desktop streams.
 ///
 /// `sign_in` is what the target is signed in to with, decided for the admitted user by
-/// [`warpgate_core::rdp_account`]: the target's stored credential, or an account the user may
+/// [`warpgate_core::rdp_account`]: an account's stored credential, or an account the user may
 /// use (their own directory account, or one assigned to them) with the password they typed.
+/// Only accounts Access Control authorized for the user on this target get that far.
 pub fn connect(
     admitted: AdmittedTarget<TargetRdpOptions>,
     size: (u16, u16),
@@ -128,9 +129,10 @@ pub fn connect_with_keyboard_layout(
     }
     let typed_password = sign_in.credentials().is_some();
     // The account the session must log on as: the one Warpgate signs in with.
-    let allowed = match sign_in.credentials() {
-        Some(credentials) => Some(credentials.identity().clone()),
-        None => managed_logon_identity(&options),
+    let allowed = match (sign_in.credentials(), sign_in.stored_credential()) {
+        (Some(credentials), _) => Some(credentials.identity().clone()),
+        (None, Some(stored)) => stored_logon_identity(&stored.account, options.interactive_logon),
+        (None, None) => None,
     };
     // Who the target is signed in to as, next to who is signing in, for the audit log.
     info!(
@@ -138,10 +140,10 @@ pub fn connect_with_keyboard_layout(
         target = %target.name,
         sign_in = sign_in.kind().as_str(),
         target_account = %sign_in.account(),
-        binding_id = ?sign_in.binding_id(),
+        account_id = %sign_in.account_id(),
         "Connecting to the RDP target"
     );
-    let credentials = sign_in.into_credentials();
+    let (credentials, stored) = sign_in.into_parts();
     let (event_tx, event_rx) = channel::<DesktopEvent>(EVENT_CHANNEL_CAPACITY);
     let (input_tx, input_rx) = channel::<DesktopInput>(DESKTOP_INPUT_CHANNEL_CAPACITY);
     let (abort_tx, abort_rx) = unbounded_channel::<()>();
@@ -179,6 +181,7 @@ pub fn connect_with_keyboard_layout(
                 logon,
                 secrets,
                 credentials,
+                stored,
             )
             .await
             {

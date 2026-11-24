@@ -334,6 +334,22 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin> PostgresSession<S> {
             .register_approved_target_session(approved)
             .await?;
 
+        // The database account is the one Access Control authorized for the user (the only
+        // one, or the one named after the target: `user#target#account`), decided now.
+        let admitted =
+            match warpgate_core::access_control::admit_account(&self.services.db, admitted).await {
+                Ok((admitted, _)) => admitted,
+                Err(error) => {
+                    warn!(%error, "No account to sign in to the target with");
+                    let message = match &error {
+                        WarpgateError::InvalidRequest(message) => message.clone(),
+                        _ => "Warpgate access denied".to_owned(),
+                    };
+                    self.send_error_response("28000".into(), message).await?;
+                    return Ok(());
+                }
+            };
+
         self.run_authorized_inner(startup, admitted).await
     }
 

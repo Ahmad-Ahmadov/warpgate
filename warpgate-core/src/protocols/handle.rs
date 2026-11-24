@@ -270,6 +270,20 @@ impl<O> AdmittedTarget<O> {
     }
 }
 
+impl<O: TargetOptionsVariant> AdmittedTarget<O> {
+    /// Fill the connection's options in, with the account Access Control authorized
+    /// ([`crate::access_control::admit_account`]). Crate-only, like the capability itself.
+    pub(crate) fn with_target_options(
+        self,
+        change: impl FnOnce(&mut warpgate_common::TargetOptions),
+    ) -> Result<Self, WarpgateError> {
+        Ok(Self {
+            id: self.id,
+            approved: self.approved.with_target_options(change)?,
+        })
+    }
+}
+
 impl AdmittedTarget {
     pub fn narrow<O: TargetOptionsVariant>(self) -> Result<AdmittedTarget<O>, WarpgateError> {
         Ok(AdmittedTarget {

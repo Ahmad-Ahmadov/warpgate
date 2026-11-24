@@ -13,7 +13,7 @@ use warpgate_common::{
     AdminPermission, BackendType, SecretError, SecretRef, SecretResolver as _, StoredSecret,
     StoredSecrets, VaultAuthConfig, WarpgateError,
 };
-use warpgate_db_entities::{SecretBackend, SshClientKey, Target};
+use warpgate_db_entities::{SecretBackend, SshClientKey, Target, TargetAccount};
 
 use super::AdminContext;
 use crate::api::common::is_unique_violation;
@@ -272,7 +272,35 @@ async fn existing_references_to_backend(
 ) -> Result<HashMap<SecretRef, Vec<SecretReferenceUsageInstance>>, WarpgateError> {
     let mut found: HashMap<SecretRef, Vec<SecretReferenceUsageInstance>> = HashMap::new();
 
-    for target in Target::Entity::find().all(db).await? {
+    let targets = Target::Entity::find().all(db).await?;
+    // A target account's credential is the target's, as far as its secrets are concerned.
+    let target_names: HashMap<Uuid, String> = targets
+        .iter()
+        .map(|target| (target.id, target.name.clone()))
+        .collect();
+    for account in TargetAccount::Entity::find().all(db).await? {
+        let Ok(Some(credential)) = account.credential() else {
+            continue;
+        };
+        for secret in credential.secret_references() {
+            if secret.backend == backend_name {
+                found
+                    .entry(secret)
+                    .or_default()
+                    .push(SecretReferenceUsageInstance::Target(
+                        SecretReferenceUsageTarget {
+                            id: account.target_id,
+                            name: target_names
+                                .get(&account.target_id)
+                                .cloned()
+                                .unwrap_or_default(),
+                        },
+                    ));
+            }
+        }
+    }
+
+    for target in targets {
         if let Ok(target) = warpgate_common::Target::try_from(target) {
             for secret in target.options.secret_references() {
                 if secret.backend == backend_name {

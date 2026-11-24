@@ -6,6 +6,10 @@
 macro_rules! with_every_entity {
     ($callback:ident) => {
         $callback![
+            AccessAssignment,
+            AccessGroupExclusion,
+            AccessGroupGrant,
+            AccessMigrationReview,
             AdminRole,
             ApiToken,
             CertificateCredential,
@@ -29,6 +33,7 @@ macro_rules! with_every_entity {
             SshClientKey,
             SsoCredential,
             Target,
+            TargetAccount,
             TargetAccountBinding,
             TargetGroup,
             TargetRoleAssignment,

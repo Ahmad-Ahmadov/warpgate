@@ -53,18 +53,18 @@ export const ADMIN_PERMISSIONS = [
     {
         key: 'accessRolesCreate' as const,
         label: 'Create',
-        category: 'Access roles' as const,
+        category: 'Access control' as const,
         deps: ['accessRolesEdit'] as AdminRolePermissionKey[],
     },
     {
         key: 'accessRolesEdit' as const,
         label: 'Edit',
-        category: 'Access roles' as const,
+        category: 'Access control' as const,
     },
     {
         key: 'accessRolesDelete' as const,
         label: 'Delete',
-        category: 'Access roles' as const,
+        category: 'Access control' as const,
         deps: [
             'accessRolesCreate',
             'accessRolesEdit',
@@ -73,7 +73,7 @@ export const ADMIN_PERMISSIONS = [
     {
         key: 'accessRolesAssign' as const,
         label: 'Assign',
-        category: 'Access roles' as const,
+        category: 'Access control' as const,
     },
     {
         key: 'sessionsView' as const,

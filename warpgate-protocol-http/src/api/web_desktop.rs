@@ -9,7 +9,7 @@ use poem_openapi::{Object, OpenApi};
 use tracing::warn;
 use uuid::Uuid;
 use warpgate_common::{TargetOptions, UserSessionId, WarpgateError};
-use warpgate_core::account_binding::BoundUser;
+use warpgate_core::access_control::ConnectingUser;
 use warpgate_core::rdp_account::plan_sign_in;
 use warpgate_web_desktop::WebDesktopClientManager;
 
@@ -55,20 +55,26 @@ impl Api {
         let remote_addr = remote_addr.0.as_socket_addr().copied();
         create_web_client_session(&ctx, session, target_id, move |authorization| async move {
             // Who the user signs in to an RDP target as, settled for the authorized user
-            // before an approval is asked for: one with no account to use there (not linked
-            // to a directory, or assigned none) is told so now. A password, where the account
-            // takes one, is asked for over the session's stream once it is approved.
+            // before an approval is asked for: one with no account Access Control lets them
+            // use there is told so now. A password, where the account takes one, is asked
+            // for over the session's stream once it is approved.
             let sign_in = match authorization.options() {
-                TargetOptions::Rdp(options) => {
+                TargetOptions::Rdp(_) => {
                     let user_info = authorization.user_info();
                     let target = authorization.target();
-                    let user = BoundUser {
+                    let user = ConnectingUser {
                         id: user_info.id,
                         username: &user_info.username,
                     };
                     Some(
-                        plan_sign_in(&services.db, user, target.id, &target.name, options)
-                            .await
+                        plan_sign_in(
+                            &services.db,
+                            user,
+                            target.id,
+                            &target.name,
+                            authorization.ticket_id().is_some(),
+                        )
+                        .await
                             .map_err(|error| {
                                 warn!(user_id = %user.id, %error, "No account to sign in to the target with");
                                 WarpgateError::InvalidRequest(error.user_message().into())

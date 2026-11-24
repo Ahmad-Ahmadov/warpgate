@@ -182,6 +182,8 @@ pub(crate) enum Commands {
         #[clap(long, action=ArgAction::SetTrue)]
         destructive: bool,
     },
+    /// Show what the access-control migration would do to the database, without running it
+    AccessMigrationPreview,
     /// Show version information
     Version,
     /// Automatic healthcheck for running Warpgate in a container
@@ -270,6 +272,9 @@ async fn _main() -> Result<()> {
         }
         Commands::CopyDatabase { target_url } => {
             crate::commands::copy_database::command(&params, target_url).await
+        }
+        Commands::AccessMigrationPreview => {
+            crate::commands::access_migration_preview::command(&params).await
         }
     }
 }

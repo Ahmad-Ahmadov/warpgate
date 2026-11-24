@@ -31,7 +31,6 @@ use warpgate_common::{
     WarpgateError,
 };
 use warpgate_common_http::ext::construct_external_url;
-use warpgate_core::account_binding::BindingChoice;
 use warpgate_core::approvals::{GateOutcome, GatedConnection};
 use warpgate_core::auth::submit_credential;
 use warpgate_core::login_protection::FailedAttemptInfo;
@@ -730,10 +729,22 @@ impl ServerSession {
 
     /// The dial consumes the capability minted when the target session started.
     async fn connect_remote(&mut self, admitted: AdmittedTarget<TargetSSHOptions>) -> Result<()> {
-        // A native SSH client has no way to choose among several assigned accounts: it signs
-        // in as the first assigned. Browser SSH lets the user choose.
-        let ssh_chain =
-            resolve_approved_ssh_chain(&self.services, admitted, BindingChoice::First).await?;
+        // The account is the one Access Control authorized: the user's only one there, or the
+        // one named after the target (`user:target:account`). Several and none named, or one
+        // that is not theirs, is refused, and the user is told why (and how to choose).
+        let ssh_chain = match resolve_approved_ssh_chain(&self.services, admitted).await {
+            Ok(chain) => chain,
+            Err(error) => {
+                let message = match &error {
+                    WarpgateError::InvalidRequest(message) => message.clone(),
+                    _ => "Could not connect to the target".to_owned(),
+                };
+                self.emit_service_message(&message)?;
+                self.request_disconnect();
+                self.disconnect_server().await;
+                return Err(error.into());
+            }
+        };
 
         let visual_chain = self.make_visual_connection_chain(&ssh_chain[..]).await?;
         self.rc_state = RCState::Connecting;

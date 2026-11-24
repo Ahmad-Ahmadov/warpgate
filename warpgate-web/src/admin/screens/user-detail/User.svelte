@@ -14,7 +14,7 @@
      *             openExpiryModal, saveExpiry (future-date validation),
      *             getExpiryStatus (urgency tiers), toggleAdminRole,
      *             unlinkFromLdap, autoLinkToLdap, applyPreset
-     * Sections:   General, Credentials, Access roles, Admin roles, Network
+     * Sections:   General, Credentials, Access groups, Admin roles, Network
      * Actions:    Audit log link, Update, Remove
      *
      * ── Behaviour worth spelling out ─────────────────────────────────────
@@ -335,7 +335,7 @@
         ...($adminPermissions.usersEdit && user?.credentialPolicy
             ? [{ value: 'credentials', label: 'Credentials' }]
             : []),
-        { value: 'roles', label: 'Access roles', badge: userRoles.length },
+        { value: 'roles', label: 'Access groups', badge: userRoles.length },
         {
             value: 'admin-roles',
             label: 'Admin roles',
@@ -409,10 +409,15 @@
                     <div class="panel">
                         <!-- Upstream #2789: access ends with the assignment. -->
                         <p class="roles-note">
-                            Removing a role ends this user's open sessions to
-                            targets that no other role grants them, at once. A
-                            role that expires does the same shortly after.
-                            Sessions started with a ticket are not affected.
+                            Membership in an access group gives the user what
+                            the group grants (Access Control). Removing them ends
+                            their open sessions to targets they no longer have an
+                            assignment for, at once; a membership that expires
+                            does the same shortly after. Sessions started with a
+                            ticket are not affected.
+                            <a href="#/config/access-control?user={u.id}">
+                                See all of this user's access
+                            </a>
                         </p>
                         <ul class="role-list">
                             {#each allRoles as role (role.id)}

@@ -108,11 +108,12 @@ export const NAVIGATION_ACTIONS: PaletteAction[] = [
         requires: 'usersEdit',
     },
     {
-        id: 'nav.access-roles',
-        label: 'Access roles',
+        id: 'nav.access-control',
+        label: 'Access control',
         group: 'Go to',
-        href: '#/config/access-roles',
-        requires: 'accessRolesEdit',
+        keywords: 'assignments access groups roles accounts permissions',
+        href: '#/config/access-control',
+        requires: 'accessRolesAssign',
     },
     {
         id: 'nav.admin-roles',

@@ -4,7 +4,10 @@ use sea_orm::{
     TransactionTrait,
 };
 use uuid::Uuid;
-use warpgate_db_entities::{Role, TargetRoleAssignment, UserRoleAssignment};
+use warpgate_db_entities::{
+    AccessGroupExclusion, AccessGroupGrant, AccessMigrationReview, Role, TargetRoleAssignment,
+    UserRoleAssignment,
+};
 
 use super::{ResourceError, check_name, name_taken};
 
@@ -53,7 +56,8 @@ pub async fn update<C: ConnectionTrait>(
     model.update(db).await.map_err(name_taken)
 }
 
-/// Also removes every assignment of the role, including revoked ones
+/// Also removes every assignment of the role, including revoked ones, and everything the
+/// role granted as an access group
 pub async fn delete<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     id: Uuid,
@@ -71,6 +75,21 @@ pub async fn delete<C: ConnectionTrait + TransactionTrait>(
 
     TargetRoleAssignment::Entity::delete_many()
         .filter(TargetRoleAssignment::Column::RoleId.eq(id))
+        .exec(&txn)
+        .await?;
+
+    // As an access group: what it granted, who was excluded from it, and its migration
+    // review items go with it.
+    AccessGroupExclusion::Entity::delete_many()
+        .filter(AccessGroupExclusion::Column::RoleId.eq(id))
+        .exec(&txn)
+        .await?;
+    AccessGroupGrant::Entity::delete_many()
+        .filter(AccessGroupGrant::Column::RoleId.eq(id))
+        .exec(&txn)
+        .await?;
+    AccessMigrationReview::Entity::delete_many()
+        .filter(AccessMigrationReview::Column::RoleId.eq(id))
         .exec(&txn)
         .await?;
 

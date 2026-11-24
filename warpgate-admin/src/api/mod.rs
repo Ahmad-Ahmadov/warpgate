@@ -1,6 +1,6 @@
 use poem_openapi::OpenApi;
 
-mod account_bindings;
+mod access_control;
 mod admin_roles;
 mod certificate_credentials;
 pub mod cluster_notifications;
@@ -92,6 +92,14 @@ pub fn get() -> impl OpenApi {
             certificate_credentials::ListApi,
             certificate_credentials::DetailApi,
         ),
-        (secret_backends::Api, account_bindings::Api),
+        (
+            secret_backends::Api,
+            (
+                access_control::TargetAccountsApi,
+                access_control::AssignmentsApi,
+                access_control::AccessGroupsApi,
+                access_control::MigrationReviewApi,
+            ),
+        ),
     )
 }

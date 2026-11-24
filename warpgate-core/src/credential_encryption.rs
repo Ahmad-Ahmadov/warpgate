@@ -6,10 +6,11 @@ use sea_orm::{
 use tracing::{error, info, warn};
 use warpgate_common::encryption::{Keyring, env_keyring};
 use warpgate_common::{
-    SshHostKeyKind, StoredSecrets, TargetOptions, WarpgateError, emit_runtime_warning,
+    SshHostKeyKind, StoredSecrets, TargetAccountCredential, TargetOptions, WarpgateError,
+    emit_runtime_warning,
 };
 use warpgate_db_entities::Parameters::RecordingsStorageConfig;
-use warpgate_db_entities::{Parameters, SecretBackend, SshClientKey, Target};
+use warpgate_db_entities::{Parameters, SecretBackend, SshClientKey, Target, TargetAccount};
 
 use crate::cluster::alive_nodes;
 
@@ -173,6 +174,14 @@ fn parsed_options(target: &Target::Model) -> Option<TargetOptions> {
         .ok()
 }
 
+fn parsed_account_credential(account: &TargetAccount::Model) -> Option<TargetAccountCredential> {
+    account
+        .credential()
+        .map_err(|error| warn!(account = %account.id, %error, "Skipping a target account with an unreadable credential"))
+        .ok()
+        .flatten()
+}
+
 fn parsed_recordings_storage(parameters: &Parameters::Model) -> Option<RecordingsStorageConfig> {
     parameters
         .recordings_storage_config()
@@ -187,6 +196,14 @@ async fn probe_undecryptable(db: &DatabaseConnection) -> Result<Vec<String>, War
     for target in Target::Entity::find().all(db).await? {
         if parsed_options(&target).is_some_and(|mut options| !options.all_decryptable()) {
             undecryptable.push(format!("target `{}`", target.name));
+        }
+    }
+
+    for account in TargetAccount::Entity::find().all(db).await? {
+        if parsed_account_credential(&account)
+            .is_some_and(|mut credential| !credential.all_decryptable())
+        {
+            undecryptable.push(format!("target account `{}`", account.display_name()));
         }
     }
 
@@ -246,6 +263,17 @@ async fn rewrite_all(db: &DatabaseConnection) -> Result<usize, WarpgateError> {
         if matches!(options.reencrypt_all(), Ok(true)) {
             let mut model: Target::ActiveModel = target.into();
             model.options = Set(serde_json::to_value(options)?);
+            rewritten += update_unless_deleted(model.update(db).await)?;
+        }
+    }
+
+    for account in TargetAccount::Entity::find().all(db).await? {
+        let Some(mut credential) = parsed_account_credential(&account) else {
+            continue;
+        };
+        if matches!(credential.reencrypt_all(), Ok(true)) {
+            let mut model: TargetAccount::ActiveModel = account.into();
+            model.credential = Set(Some(serde_json::to_value(credential)?));
             rewritten += update_unless_deleted(model.update(db).await)?;
         }
     }

@@ -130,6 +130,36 @@ pub async fn migrate_down(connection: &DatabaseConnection, steps: u32) -> Result
     Ok(())
 }
 
+/// What the access-control migration (m00098) would do to this database, before it runs:
+/// the report of `warpgate access-migration-preview`. Writes nothing (beyond the migration
+/// tracking table, should a database have none yet).
+pub enum AccessMigrationPreview {
+    /// The report.
+    Report(String),
+    /// Earlier migrations have not run either: preview with the release before this one.
+    EarlierMigrationsPending,
+    /// It has run: its report is in Access Control, Migration review.
+    AlreadyApplied,
+}
+
+pub async fn preview_access_migration(
+    connection: &DatabaseConnection,
+) -> Result<AccessMigrationPreview> {
+    use warpgate_db_migrations::{
+        AccessControlMigrationState, access_control_migration_state,
+        preview_access_control_migration,
+    };
+    Ok(match access_control_migration_state(connection).await? {
+        AccessControlMigrationState::Pending => {
+            AccessMigrationPreview::Report(preview_access_control_migration(connection).await?)
+        }
+        AccessControlMigrationState::EarlierMigrationsPending => {
+            AccessMigrationPreview::EarlierMigrationsPending
+        }
+        AccessControlMigrationState::Applied => AccessMigrationPreview::AlreadyApplied,
+    })
+}
+
 pub async fn cleanup_db(
     db: &DatabaseConnection,
     recordings: &SessionRecordings,

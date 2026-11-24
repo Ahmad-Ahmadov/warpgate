@@ -257,22 +257,23 @@
 
     async function startSession(
         targetId: string,
-        accountBindingId?: string,
+        accountId?: string,
     ): Promise<void> {
         const { sessionId: id } = await api.createWebSshSession({
-            createWebSshSessionBody: { targetId, accountBindingId },
+            createWebSshSessionBody: { targetId, accountId },
         })
         sessionId = id
         history.replaceState(history.state, '', `#/web-ssh/${id}`)
     }
 
-    // Several accounts assigned to the user on the target: they choose one, among
-    // their own only (the server checks the choice again).
+    // Several accounts authorized for the user on the target (Access Control):
+    // they choose one, among their own only (the server checks the choice again,
+    // and refuses to pick one for them).
     let accountChoice = $state<{
         targetId: string
         accounts: TargetAccount[]
     } | null>(null)
-    let chosenBinding = $state('')
+    let chosenAccount = $state('')
 
     /** Whether the user has several accounts here, so is asked to choose. */
     async function asksForAccount(targetId: string): Promise<boolean> {
@@ -286,7 +287,7 @@
         if (accounts.length < 2) {
             return false
         }
-        chosenBinding = accounts[0]?.bindingId ?? ''
+        chosenAccount = accounts[0]?.id ?? ''
         accountChoice = { targetId, accounts }
         return true
     }
@@ -318,11 +319,11 @@
 
     async function openSession(
         targetId: string,
-        accountBindingId?: string,
+        accountId?: string,
     ): Promise<void> {
         opening = true
         try {
-            await startSession(targetId, accountBindingId)
+            await startSession(targetId, accountId)
         } catch (e) {
             opening = false
             await reportError(e)
@@ -338,7 +339,7 @@
         }
         const { targetId } = accountChoice
         accountChoice = null
-        await openSession(targetId, chosenBinding || undefined)
+        await openSession(targetId, chosenAccount || undefined)
     }
 
     onMount(async () => {
@@ -545,10 +546,10 @@
         <Select
             label="Account"
             options={accountChoice.accounts.map(a => ({
-                value: a.bindingId ?? '',
+                value: a.id,
                 label: a.account,
             }))}
-            bind:value={chosenBinding}
+            bind:value={chosenAccount}
         />
         {#snippet footer()}
             <Button variant="ghost" onclick={disconnect}>Cancel</Button>

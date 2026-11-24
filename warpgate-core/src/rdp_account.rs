@@ -1,28 +1,26 @@
-//! Which Windows account an RDP target is signed in to as, and the checks that keep every
-//! user to the accounts they may use.
+//! Which Windows account an RDP connection signs in to the target as, and the checks that
+//! keep every user to the accounts they may use.
 //!
-//! A target signs users in one of three ways ([`SignInKind`]):
+//! The accounts are the target's (its Accounts inventory), and a user may sign in only as
+//! one Access Control authorized for them on the target ([`crate::access_control`]): an
+//! account assigned to them directly or through an access group. How each signs in
+//! ([`SignInKind`]) is the account's:
 //!
-//! * **Managed**: the account and password stored with the target (kept by Warpgate, or a
-//!   Vault reference). The user never sees the password.
-//! * **Domain account**: the user's own directory (Active Directory) account. The account is
-//!   the directory entry their Warpgate user is linked to (`ldap_server_id` and
+//! * **Managed**: a stored credential (kept by Warpgate, or a Vault reference). The user
+//!   never sees the password.
+//! * **Domain account**: the user's own directory (Active Directory) account, from the
+//!   directory entry their Warpgate user is linked to (`ldap_server_id` and
 //!   `ldap_object_uuid`, set when an administrator imported or linked them), never one a
-//!   client names. The user types its password when connecting; it is checked by binding to
-//!   the directory as that entry ([`warpgate_ldap::authenticate_user`], LDAPS or StartTLS
-//!   only) before the target is dialed.
-//! * **Local account**: a Windows account an administrator assigned to the user on that
-//!   target ([`RdpTargetLocalAccountAuth`]). The user chooses one of the accounts assigned to
-//!   them, and types its password; the target checks it.
-//!
-//! An administrator can also assign accounts to a user on a target (Access Control, account
-//! access, [`crate::account_binding`]): a user with assignments may only use those, whatever
-//! the target's own mode, and each comes as one of the choices below.
+//!   client names. Its password is checked by binding to the directory as that entry
+//!   ([`warpgate_ldap::authenticate_user`], LDAPS or StartTLS only) before the target is
+//!   dialed; a native RDP connection reuses the password the user signed in to Warpgate with.
+//! * **Local account**: a named Windows account, with its password typed by the user when
+//!   connecting; the target checks it.
 //!
 //! The native RDP listener and the browser client both resolve the account with
 //! [`plan_sign_in`] and [`verify_sign_in`], against the user and target Warpgate admitted, so
 //! neither can be talked into another account: whatever account a client asks for is only
-//! looked up among the ones this module allows. What they connect with is an
+//! looked up among the ones Access Control allows. What they connect with is an
 //! [`AuthorizedSignIn`], which only this module makes.
 //!
 //! The account signed in with is also what the target must report when the session logs on
@@ -37,48 +35,36 @@
 use std::fmt;
 
 use sea_orm::{DatabaseConnection, EntityTrait};
-use time::OffsetDateTime;
 use tracing::{info, warn};
 use uuid::Uuid;
-use warpgate_common::{
-    RdpDomainUsernameFormat, RdpTargetAuth, RdpTargetLocalAccountAuth, TargetRdpOptions,
-};
-use warpgate_db_entities::TargetAccountBinding::{
-    DirectoryUsernameFormat, Model as Binding, TargetAccountKind,
+use warpgate_common::MaybeSecretRef;
+use warpgate_common::audit::AuditEvent;
+use warpgate_db_entities::TargetAccount::{
+    DirectoryUsernameFormat, TargetAccountAuthMethod, TargetAccountKind,
 };
 use warpgate_db_entities::{LdapServer, User};
 use warpgate_ldap::{LdapAuthOutcome, LdapBindRejection, LdapConfig, LdapUser};
 /// Re-exported for the protocol crates that take the password, so they wipe it the same way.
 pub use zeroize::{Zeroize, Zeroizing};
 
-use crate::account_binding::{
-    AccountAccess, BindingError, BoundTarget, BoundUser, account_access, refuse,
-};
+use crate::access_control::{AccessError, AuthorizedAccount, ConnectingUser, connection_accounts};
 
 /// The longest password taken: what an RDP Client Info PDU carries, and more than Active
 /// Directory or Windows allow.
 pub const MAX_ACCOUNT_PASSWORD_CHARS: usize = 256;
 
-/// How a target signs users in.
+/// How an account signs in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignInKind {
-    /// The account and password stored with the target.
+    /// With its stored credential.
     Managed,
-    /// The user's own directory account, with the password they type.
+    /// The user's own directory account, with the password they type (or signed in with).
     DomainAccount,
-    /// A Windows account assigned to the user, with the password they type.
+    /// A named Windows account, with the password the user types.
     LocalAccount,
 }
 
 impl SignInKind {
-    pub const fn of(options: &TargetRdpOptions) -> Self {
-        match options.auth {
-            RdpTargetAuth::Password(_) => Self::Managed,
-            RdpTargetAuth::DomainAccount(_) => Self::DomainAccount,
-            RdpTargetAuth::LocalAccount(_) => Self::LocalAccount,
-        }
-    }
-
     /// Whether the user types a password for the target when connecting to it.
     pub const fn asks_for_password(self) -> bool {
         !matches!(self, Self::Managed)
@@ -241,28 +227,47 @@ impl LogonIdentity {
     }
 }
 
-/// The account a target with stored credentials logs on as: the one Warpgate signs in with.
-/// `None` for an interactive-logon target, which shows the target's own sign-in screen and
-/// leaves the account to whoever is at it: Warpgate records that account, but cannot hold it
-/// to one.
-pub fn managed_logon_identity(options: &TargetRdpOptions) -> Option<LogonIdentity> {
-    if options.interactive_logon || !matches!(options.auth, RdpTargetAuth::Password(_)) {
-        return None;
+/// What a session signed in with a stored credential must log on as: that account. `None`
+/// for an interactive-logon target, which shows the target's own sign-in screen and leaves
+/// the account to whoever is at it: Warpgate records that account, but cannot hold it to one.
+pub fn stored_logon_identity(
+    account: &WindowsAccount,
+    interactive_logon: bool,
+) -> Option<LogonIdentity> {
+    (!interactive_logon).then(|| LogonIdentity::for_account(account))
+}
+
+/// An account's stored credential, for the RDP client to resolve (decrypt, or fetch from the
+/// secret backend) when it connects. Never printed.
+#[derive(Clone)]
+pub struct StoredCredential {
+    pub account: WindowsAccount,
+    pub password: MaybeSecretRef,
+}
+
+impl fmt::Debug for StoredCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoredCredential")
+            .field("account", &self.account)
+            .field("password", &"<redacted>")
+            .finish()
     }
-    WindowsAccount::parse(&options.username, options.domain.as_deref())
-        .map(|account| LogonIdentity::for_account(&account))
 }
 
 /// One account a user may sign in to an RDP target as.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct SignInChoice {
-    /// The assignment it comes from (Access Control); `None` for the target's own setup.
-    pub binding_id: Option<Uuid>,
+    /// The target account.
+    pub account_id: Uuid,
     pub kind: SignInKind,
-    /// The account. For the managed account, the target's configured one.
+    /// The Windows account it signs in as.
     pub account: WindowsAccount,
     /// How a directory account is named to the target.
     format: DirectoryUsernameFormat,
+    /// A directory account's domain, as the target account sets it.
+    domain_hint: Option<String>,
+    /// A managed account's stored password.
+    stored: Option<MaybeSecretRef>,
 }
 
 impl SignInChoice {
@@ -279,17 +284,17 @@ impl SignInChoice {
 
 /// Who a user may sign in to a target as, before they type a password: one account, or
 /// several to choose from. Only ever made by [`plan_sign_in`], for one user and target.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct SignInPlan {
     user_id: Uuid,
     target_id: Uuid,
     choices: Vec<SignInChoice>,
 }
 
-/// What a client answered: the account it chose, by binding or by name, if it chose.
+/// What a client answered: the account it chose, by id or by name, if it chose.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SignInAnswer<'a> {
-    pub binding_id: Option<Uuid>,
+    pub account_id: Option<Uuid>,
     pub account: Option<&'a str>,
 }
 
@@ -303,8 +308,8 @@ impl SignInPlan {
         self.choices.iter().map(SignInChoice::label).collect()
     }
 
-    /// The sign-in that needs nothing from the user: the only choice is the managed account,
-    /// with the target's stored credential.
+    /// The sign-in that needs nothing from the user: the only choice is a managed account,
+    /// with its stored credential.
     pub fn stored_sign_in(&self) -> Option<AuthorizedSignIn> {
         match self.choices.as_slice() {
             [only] if only.kind == SignInKind::Managed => {
@@ -337,11 +342,11 @@ impl SignInPlan {
 
     /// The choice a client's answer names: only ever one of this plan's.
     fn select(&self, answer: SignInAnswer<'_>) -> Result<&SignInChoice, SignInError> {
-        if let Some(id) = answer.binding_id {
+        if let Some(id) = answer.account_id {
             return self
                 .choices
                 .iter()
-                .find(|choice| choice.binding_id == Some(id))
+                .find(|choice| choice.account_id == id)
                 .ok_or(SignInError::AccountNotAllowed);
         }
         if let Some(name) = answer
@@ -363,17 +368,18 @@ impl SignInPlan {
 }
 
 /// What a connection to an RDP target signs in with, decided for the user and target
-/// Warpgate admitted: the target's stored credential, or an account the user may use with
-/// the password they typed. Only this module makes one, so a protocol cannot connect
-/// without going through the checks here.
+/// Warpgate admitted: an account's stored credential, or an account the user may use with the
+/// password they typed. Only this module makes one, so a protocol cannot connect without
+/// going through the checks here.
 #[derive(Debug)]
 pub struct AuthorizedSignIn {
     user_id: Uuid,
     target_id: Uuid,
-    binding_id: Option<Uuid>,
+    account_id: Uuid,
     kind: SignInKind,
     account: String,
     credentials: Option<TargetCredentials>,
+    stored: Option<StoredCredential>,
 }
 
 impl AuthorizedSignIn {
@@ -381,10 +387,14 @@ impl AuthorizedSignIn {
         Self {
             user_id,
             target_id,
-            binding_id: choice.binding_id,
+            account_id: choice.account_id,
             kind: SignInKind::Managed,
             account: choice.label(),
             credentials: None,
+            stored: choice.stored.clone().map(|password| StoredCredential {
+                account: choice.account.clone(),
+                password,
+            }),
         }
     }
 
@@ -392,10 +402,11 @@ impl AuthorizedSignIn {
         Self {
             user_id: plan.user_id,
             target_id: plan.target_id,
-            binding_id: choice.binding_id,
+            account_id: choice.account_id,
             kind: choice.kind,
             account: credentials.account().display_name(),
             credentials: Some(credentials),
+            stored: None,
         }
     }
 
@@ -409,9 +420,9 @@ impl AuthorizedSignIn {
         self.target_id
     }
 
-    /// The assignment it comes from, if any, for the audit log.
-    pub const fn binding_id(&self) -> Option<Uuid> {
-        self.binding_id
+    /// The target account, for the audit log.
+    pub const fn account_id(&self) -> Uuid {
+        self.account_id
     }
 
     pub const fn kind(&self) -> SignInKind {
@@ -428,9 +439,14 @@ impl AuthorizedSignIn {
         self.credentials.as_ref()
     }
 
-    /// The account and password the user typed, for the connection to use (and wipe).
-    pub fn into_credentials(self) -> Option<TargetCredentials> {
-        self.credentials
+    /// The account's stored credential, for a managed account.
+    pub const fn stored_credential(&self) -> Option<&StoredCredential> {
+        self.stored.as_ref()
+    }
+
+    /// What the connection signs in with (and wipes): the typed credentials, or the stored.
+    pub fn into_parts(self) -> (Option<TargetCredentials>, Option<StoredCredential>) {
+        (self.credentials, self.stored)
     }
 }
 
@@ -549,29 +565,26 @@ impl DomainAccountError {
 pub enum SignInError {
     #[error(transparent)]
     Domain(#[from] DomainAccountError),
-    /// The user's assigned accounts do not allow it (Access Control).
+    /// Access Control does not allow it.
     #[error(transparent)]
-    Binding(#[from] BindingError),
+    Access(#[from] AccessError),
     /// The password the user signed in to Warpgate with cannot be used for this account:
     /// it was not checked by the account's own directory, or the account is not theirs.
     #[error("the sign-in password cannot be reused for this account")]
     PasswordNotReusable,
-    /// The target signs in with assigned accounts, and none is assigned to the user.
-    #[error("no account on the target is assigned to the user")]
-    NoAssignedAccount,
     /// Several accounts are assigned to the user, and the request named none.
     #[error("no account was chosen")]
     AccountNotChosen,
     /// The request named an account the user may not sign in as.
     #[error("the account is not assigned to the user")]
     AccountNotAllowed,
+    /// An assigned account cannot sign in to an RDP target as it is configured.
+    #[error("the account cannot sign in to this target")]
+    AccountUnusable,
     #[error("no password was given")]
     PasswordMissing,
     #[error("the password is too long")]
     PasswordTooLong,
-    /// The target signs in with its stored account, so takes no password from the user.
-    #[error("the target takes no password when connecting")]
-    NotAsked,
 }
 
 impl SignInError {
@@ -580,16 +593,28 @@ impl SignInError {
     pub const fn user_message(&self) -> &'static str {
         match self {
             Self::Domain(error) => error.user_message(),
-            Self::Binding(error) => error.user_message(),
+            Self::Access(error) => match error {
+                AccessError::NoAccess => {
+                    "No account on this target is assigned to you. Ask an administrator to assign one."
+                }
+                AccessError::NotChosen(_) => "Choose the account to sign in as.",
+                AccessError::NotAllowed => "You may not sign in to this target as that account.",
+                AccessError::NotLinked => {
+                    "Your Warpgate account is not linked to a directory account. Ask an administrator."
+                }
+                AccessError::Unsupported(reason) => *reason,
+                AccessError::Directory(_) | AccessError::Database(_) => {
+                    "The account could not be looked up right now. Try again later."
+                }
+            },
             Self::PasswordNotReusable => "Enter the account's password.",
-            Self::NoAssignedAccount => {
-                "No Windows account on this target is assigned to you. Ask an administrator to assign one."
-            }
             Self::AccountNotChosen => "Choose the account to sign in as.",
             Self::AccountNotAllowed => "You may not sign in to this target as that account.",
+            Self::AccountUnusable => {
+                "The account assigned to you cannot sign in to this target. Ask an administrator."
+            }
             Self::PasswordMissing => "Enter the account's password.",
             Self::PasswordTooLong => "The password is too long.",
-            Self::NotAsked => "This target does not take a password when connecting.",
         }
     }
 
@@ -597,166 +622,133 @@ impl SignInError {
     pub const fn may_retry(&self) -> bool {
         match self {
             Self::Domain(error) => error.may_retry(),
-            Self::Binding(BindingError::NotChosen | BindingError::NotFound)
-            | Self::PasswordNotReusable => true,
-            Self::Binding(_) => false,
-            Self::AccountNotChosen
+            Self::Access(error) => error.may_retry(),
+            Self::PasswordNotReusable
+            | Self::AccountNotChosen
             | Self::AccountNotAllowed
             | Self::PasswordMissing
             | Self::PasswordTooLong => true,
-            Self::NoAssignedAccount | Self::NotAsked => false,
+            Self::AccountUnusable => false,
         }
     }
 }
 
-/// The accounts of a local-account target assigned to `user_id`, in the order listed.
-fn assigned_accounts(
-    auth: &RdpTargetLocalAccountAuth,
-    options: &TargetRdpOptions,
-    user_id: Uuid,
-) -> Vec<WindowsAccount> {
-    let mut accounts: Vec<WindowsAccount> = Vec::new();
-    for assignment in auth
-        .accounts
-        .iter()
-        .filter(|assignment| assignment.users.contains(&user_id))
-    {
-        let Some(account) = WindowsAccount::parse(&assignment.username, options.domain.as_deref())
-        else {
-            continue;
-        };
-        if !accounts
-            .iter()
-            .any(|known| known.is_named(&account.display_name()))
-        {
-            accounts.push(account);
-        }
+/// Audit an account a client asked for that is not the user's, or a user with none.
+fn refuse(
+    user: ConnectingUser<'_>,
+    target_id: Uuid,
+    target_name: &str,
+    requested: Option<String>,
+    reason: &str,
+) {
+    AuditEvent::AccessAssignmentRefused {
+        user_id: user.id,
+        username: user.username.to_owned(),
+        target_id,
+        target_name: target_name.to_owned(),
+        requested_account: requested,
+        reason: reason.to_owned(),
     }
-    accounts
+    .emit();
 }
 
-/// The domain a directory account takes from the target: its Domain field, on a target that
-/// signs users in with their domain account. Elsewhere the field means something else (the
-/// managed account's domain, or the computer's name), so the directory's own is used.
-fn directory_domain_hint(options: &TargetRdpOptions) -> Option<&str> {
-    match options.auth {
-        RdpTargetAuth::DomainAccount(_) => options.domain.as_deref(),
-        RdpTargetAuth::Password(_) | RdpTargetAuth::LocalAccount(_) => None,
-    }
-}
-
-/// The computer a local account written without one belongs to: the target's Domain field,
-/// on a target that signs users in with assigned local accounts, where it is the computer
-/// name. Elsewhere it may be a domain, which would turn a local account into a domain one.
-fn local_domain_hint(options: &TargetRdpOptions) -> Option<&str> {
-    match options.auth {
-        RdpTargetAuth::LocalAccount(_) => options.domain.as_deref(),
-        RdpTargetAuth::Password(_) | RdpTargetAuth::DomainAccount(_) => None,
-    }
-}
-
-/// The target's managed account.
-fn managed_choice(options: &TargetRdpOptions, binding_id: Option<Uuid>) -> SignInChoice {
-    SignInChoice {
-        binding_id,
-        kind: SignInKind::Managed,
-        account: WindowsAccount::parse(&options.username, options.domain.as_deref()).unwrap_or(
-            WindowsAccount {
-                username: options.username.clone(),
-                domain: None,
-            },
-        ),
-        format: DirectoryUsernameFormat::Upn,
-    }
-}
-
-/// The choices of a user with no assignments on the target: its own setup.
-async fn unrestricted_choices(
+/// The choice an authorized account makes for an RDP target.
+async fn choice_for(
     db: &DatabaseConnection,
     user_id: Uuid,
-    options: &TargetRdpOptions,
-) -> Result<Vec<SignInChoice>, SignInError> {
-    match &options.auth {
-        RdpTargetAuth::Password(_) => Ok(vec![managed_choice(options, None)]),
-        RdpTargetAuth::DomainAccount(_) => {
-            let format = target_format(options);
-            let (account, _) =
-                find_domain_account(db, user_id, format, directory_domain_hint(options)).await?;
-            Ok(vec![SignInChoice {
-                binding_id: None,
+    authorized: &AuthorizedAccount,
+) -> Result<SignInChoice, SignInError> {
+    let account = &authorized.account;
+    let parse = || {
+        WindowsAccount::parse(&account.name, account.domain.as_deref())
+            .ok_or(SignInError::AccountUnusable)
+    };
+    match (account.kind, account.auth_method) {
+        (TargetAccountKind::Directory, TargetAccountAuthMethod::DirectoryPassword) => {
+            let format = account
+                .username_format
+                .unwrap_or(DirectoryUsernameFormat::Upn);
+            let (windows, _) =
+                find_domain_account(db, user_id, format, account.domain.as_deref()).await?;
+            Ok(SignInChoice {
+                account_id: account.id,
                 kind: SignInKind::DomainAccount,
-                account,
+                account: windows,
                 format,
-            }])
+                domain_hint: account.domain.clone(),
+                stored: None,
+            })
         }
-        RdpTargetAuth::LocalAccount(auth) => {
-            let accounts = assigned_accounts(auth, options, user_id);
-            if accounts.is_empty() {
-                return Err(SignInError::NoAssignedAccount);
-            }
-            Ok(accounts
-                .into_iter()
-                .map(|account| SignInChoice {
-                    binding_id: None,
-                    kind: SignInKind::LocalAccount,
-                    account,
-                    format: DirectoryUsernameFormat::Upn,
-                })
-                .collect())
+        (
+            TargetAccountKind::Local | TargetAccountKind::Domain,
+            TargetAccountAuthMethod::TypedPassword,
+        ) => Ok(SignInChoice {
+            account_id: account.id,
+            kind: SignInKind::LocalAccount,
+            account: parse()?,
+            format: DirectoryUsernameFormat::Upn,
+            domain_hint: None,
+            stored: None,
+        }),
+        (
+            TargetAccountKind::Local | TargetAccountKind::Domain,
+            TargetAccountAuthMethod::StoredCredential,
+        ) => {
+            let password = account
+                .credential()
+                .ok()
+                .flatten()
+                .and_then(|credential| credential.password().cloned())
+                .ok_or(SignInError::AccountUnusable)?;
+            Ok(SignInChoice {
+                account_id: account.id,
+                kind: SignInKind::Managed,
+                account: parse()?,
+                format: DirectoryUsernameFormat::Upn,
+                domain_hint: None,
+                stored: Some(password),
+            })
         }
+        _ => Err(SignInError::AccountUnusable),
     }
 }
 
-/// The choices of a user with assignments on the target: those, and nothing else. One that
-/// cannot be resolved now (the directory unreachable, say) is left out; if that leaves none,
-/// the first reason is the answer.
-async fn bound_choices(
+/// Who `user` signs in to the target as, before any password is typed: to tell the user
+/// which account they will be (or may choose from), and to turn away a user who has none
+/// before an approval is asked for. Only the accounts Access Control authorized for them
+/// there (or, for a ticket without an assignment, the target's primary account); one that
+/// cannot be resolved now (the directory unreachable, say) is left out, and if that leaves
+/// none, the first reason is the answer.
+pub async fn plan_sign_in(
     db: &DatabaseConnection,
-    user_id: Uuid,
-    options: &TargetRdpOptions,
-    bindings: &[Binding],
-) -> Result<Vec<SignInChoice>, SignInError> {
+    user: ConnectingUser<'_>,
+    target_id: Uuid,
+    target_name: &str,
+    via_ticket: bool,
+) -> Result<SignInPlan, SignInError> {
+    let accounts = connection_accounts(db, user, target_id, via_ticket).await?;
+    if accounts.is_empty() {
+        refuse(
+            user,
+            target_id,
+            target_name,
+            None,
+            "no usable access assignment on the target",
+        );
+        return Err(SignInError::Access(AccessError::NoAccess));
+    }
     let mut choices: Vec<SignInChoice> = Vec::new();
     let mut first_error = None;
-    for binding in bindings {
-        let choice = match binding.account_kind {
-            TargetAccountKind::Directory => {
-                let format = binding
-                    .username_format
-                    .unwrap_or_else(|| target_format(options));
-                match find_domain_account(db, user_id, format, directory_domain_hint(options)).await
-                {
-                    Ok((account, _)) => SignInChoice {
-                        binding_id: Some(binding.id),
-                        kind: SignInKind::DomainAccount,
-                        account,
-                        format,
-                    },
-                    Err(error) => {
-                        warn!(binding_id = %binding.id, %error, "Could not resolve an assigned directory account");
-                        first_error.get_or_insert(SignInError::Domain(error));
-                        continue;
-                    }
-                }
+    for authorized in &accounts {
+        let choice = match choice_for(db, user.id, authorized).await {
+            Ok(choice) => choice,
+            Err(error) => {
+                warn!(account_id = %authorized.account.id, %error, "Could not resolve an authorized account");
+                first_error.get_or_insert(error);
+                continue;
             }
-            TargetAccountKind::Local => {
-                let Some(account) = WindowsAccount::parse(
-                    binding.account_name.as_deref().unwrap_or_default(),
-                    local_domain_hint(options),
-                ) else {
-                    warn!(binding_id = %binding.id, "Skipping an assigned account with no usable name");
-                    continue;
-                };
-                SignInChoice {
-                    binding_id: Some(binding.id),
-                    kind: SignInKind::LocalAccount,
-                    account,
-                    format: DirectoryUsernameFormat::Upn,
-                }
-            }
-            TargetAccountKind::Managed => managed_choice(options, Some(binding.id)),
         };
-        // The same account assigned twice (by two names for it) is offered once.
+        // The same Windows account authorized twice (by two names for it) is offered once.
         if !choices
             .iter()
             .any(|known| known.kind == choice.kind && known.account.is_named(&choice.label()))
@@ -765,29 +757,8 @@ async fn bound_choices(
         }
     }
     if choices.is_empty() {
-        return Err(first_error.unwrap_or(SignInError::Binding(BindingError::NoActiveBinding)));
+        return Err(first_error.unwrap_or(SignInError::AccountUnusable));
     }
-    Ok(choices)
-}
-
-/// Who `user` signs in to the target as, before any password is typed: to tell the user
-/// which account they will be (or may choose from), and to turn away a user who has none
-/// before an approval is asked for. The user's assigned accounts, if they have any there;
-/// the target's own setup otherwise.
-pub async fn plan_sign_in(
-    db: &DatabaseConnection,
-    user: BoundUser<'_>,
-    target_id: Uuid,
-    target_name: &str,
-    options: &TargetRdpOptions,
-) -> Result<SignInPlan, SignInError> {
-    let target = BoundTarget::rdp(target_id, target_name, options);
-    let choices = match account_access(db, user, target, OffsetDateTime::now_utc()).await? {
-        AccountAccess::Unrestricted => unrestricted_choices(db, user.id, options).await?,
-        AccountAccess::Restricted(bindings) => {
-            bound_choices(db, user.id, options, &bindings).await?
-        }
-    };
     Ok(SignInPlan {
         user_id: user.id,
         target_id,
@@ -807,36 +778,39 @@ fn check_password(password: &str) -> Result<(), SignInError> {
 
 /// Check what `user` answered to sign in to the target, and return what to sign in with.
 ///
-/// The plan is made again here, server-side: the account the client chose (by binding or by
+/// The plan is made again here, server-side: the account the client chose (by id or by
 /// name) is only ever looked up among the user's own choices, and anything else is refused
 /// and audited. A domain password is checked with the directory; a local account's is left
-/// to the target; the managed account takes none.
+/// to the target; a managed account takes none.
 pub async fn verify_sign_in(
     db: &DatabaseConnection,
-    user: BoundUser<'_>,
+    user: ConnectingUser<'_>,
     target_id: Uuid,
     target_name: &str,
-    options: &TargetRdpOptions,
+    via_ticket: bool,
     answer: SignInAnswer<'_>,
     password: Zeroizing<String>,
 ) -> Result<AuthorizedSignIn, SignInError> {
-    let plan = plan_sign_in(db, user, target_id, target_name, options).await?;
+    let plan = plan_sign_in(db, user, target_id, target_name, via_ticket).await?;
     let choice = match plan.select(answer) {
         Ok(choice) => choice.clone(),
         Err(error) => {
             if matches!(error, SignInError::AccountNotAllowed) {
                 refuse(
                     user,
-                    BoundTarget::rdp(target_id, target_name, options),
-                    answer.binding_id,
-                    answer.account,
-                    &BindingError::NotFound,
+                    target_id,
+                    target_name,
+                    answer
+                        .account_id
+                        .map(|id| id.to_string())
+                        .or_else(|| answer.account.map(str::to_owned)),
+                    "the account is not assigned to the user on this target",
                 );
             }
             return Err(error);
         }
     };
-    authorize_choice(db, &plan, options, &choice, password).await
+    authorize_choice(db, &plan, &choice, password).await
 }
 
 /// Sign in as the user's own directory account with the password they signed in to Warpgate
@@ -849,7 +823,6 @@ pub async fn verify_sign_in(
 pub async fn reuse_sign_in_password(
     db: &DatabaseConnection,
     plan: &SignInPlan,
-    options: &TargetRdpOptions,
     account: Option<&str>,
     password: Zeroizing<String>,
 ) -> Result<AuthorizedSignIn, SignInError> {
@@ -876,13 +849,12 @@ pub async fn reuse_sign_in_password(
     {
         return Err(SignInError::PasswordNotReusable);
     }
-    authorize_choice(db, plan, options, &choice, password).await
+    authorize_choice(db, plan, &choice, password).await
 }
 
 async fn authorize_choice(
     db: &DatabaseConnection,
     plan: &SignInPlan,
-    options: &TargetRdpOptions,
     choice: &SignInChoice,
     password: Zeroizing<String>,
 ) -> Result<AuthorizedSignIn, SignInError> {
@@ -896,14 +868,14 @@ async fn authorize_choice(
                 db,
                 user_id,
                 choice.format,
-                directory_domain_hint(options),
+                choice.domain_hint.as_deref(),
                 &password,
             )
             .await?;
             info!(
                 %user_id,
                 account = %account.display_name(),
-                binding_id = ?choice.binding_id,
+                account_id = %choice.account_id,
                 "Domain password verified; signing in to the target as the user's own account"
             );
             let credentials = TargetCredentials {
@@ -920,7 +892,7 @@ async fn authorize_choice(
             info!(
                 %user_id,
                 account = %choice.label(),
-                binding_id = ?choice.binding_id,
+                account_id = %choice.account_id,
                 "Signing in to the target as an account assigned to the user"
             );
             let credentials = TargetCredentials {
@@ -946,7 +918,7 @@ pub async fn directory_account_name(
     Ok(account.display_name())
 }
 
-/// The names of `user_id`'s own directory account in every format a binding can use, looked
+/// The names of `user_id`'s own directory account in every format an account can use, looked
 /// up once: for an administrator to see which account an assignment would sign in as.
 pub async fn directory_account_names(
     db: &DatabaseConnection,
@@ -997,17 +969,6 @@ async fn directory_of(
     let config = LdapConfig::try_from(&server)
         .map_err(|error| DomainAccountError::DirectoryUnavailable(error.to_string()))?;
     Ok((config, object_uuid))
-}
-
-/// How a domain-account target names the account, in the binding's terms.
-fn target_format(options: &TargetRdpOptions) -> DirectoryUsernameFormat {
-    match &options.auth {
-        RdpTargetAuth::DomainAccount(auth) => match auth.username_format {
-            RdpDomainUsernameFormat::Upn => DirectoryUsernameFormat::Upn,
-            RdpDomainUsernameFormat::DownLevel => DirectoryUsernameFormat::DownLevel,
-        },
-        RdpTargetAuth::Password(_) | RdpTargetAuth::LocalAccount(_) => DirectoryUsernameFormat::Upn,
-    }
 }
 
 /// The account `user_id` would sign in to the target as, looked up in the directory with
@@ -1187,8 +1148,6 @@ fn dns_domain_of(dn: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use warpgate_common::{RdpLocalAccountAssignment, RdpTargetDomainAccountAuth};
-
     use super::*;
 
     const BACKSLASH: char = '\\';
@@ -1220,34 +1179,6 @@ mod tests {
         }
     }
 
-    fn options(auth: RdpTargetAuth, domain: Option<&str>) -> TargetRdpOptions {
-        TargetRdpOptions {
-            host: "server".into(),
-            port: 3389,
-            username: "operator".into(),
-            domain: domain.map(Into::into),
-            kdc_url: None,
-            auth,
-            verify_tls: false,
-            compression: warpgate_common::RdpTargetCompression::default(),
-            interactive_logon: false,
-            tls_security: warpgate_common::RdpTlsSecurity::default(),
-            require_account_binding: false,
-        }
-    }
-
-    fn local(accounts: &[(&str, &[Uuid])]) -> RdpTargetAuth {
-        RdpTargetAuth::LocalAccount(RdpTargetLocalAccountAuth {
-            accounts: accounts
-                .iter()
-                .map(|(username, users)| RdpLocalAccountAssignment {
-                    username: (*username).into(),
-                    users: users.to_vec(),
-                })
-                .collect(),
-        })
-    }
-
     #[test]
     fn a_distinguished_name_gives_its_dns_domain() {
         assert_eq!(
@@ -1272,7 +1203,7 @@ mod tests {
             account_of(&full, DirectoryUsernameFormat::DownLevel, Some("CORP")),
             Some(account("alice", Some("CORP")))
         );
-        // Without a domain on the target, the directory's own.
+        // Without a domain on the account, the directory's own.
         assert_eq!(
             account_of(&full, DirectoryUsernameFormat::DownLevel, Some("  ")),
             Some(account("alice", Some("corp.example.com")))
@@ -1358,6 +1289,12 @@ mod tests {
         let printed = format!("{credentials:?}");
         assert!(!printed.contains("hunter2"), "{printed}");
         assert_eq!(credentials.password(), "hunter2");
+
+        let stored = StoredCredential {
+            account: account("operator", None),
+            password: "hunter2".parse().unwrap(),
+        };
+        assert!(!format!("{stored:?}").contains("hunter2"));
     }
 
     #[test]
@@ -1370,7 +1307,7 @@ mod tests {
         assert!(!disabled.may_retry());
         assert!(!DomainAccountError::NotLinked.may_retry());
         assert!(!SignInError::Domain(DomainAccountError::NotLinked).may_retry());
-        assert!(!SignInError::NoAssignedAccount.may_retry());
+        assert!(!SignInError::Access(AccessError::NoAccess).may_retry());
         assert!(SignInError::AccountNotAllowed.may_retry());
     }
 
@@ -1402,62 +1339,29 @@ mod tests {
         assert!(!identity.admits("SRV01", "administrator"));
     }
 
+    /// 34: a stored-credential account logs on as itself; on an interactive-logon target
+    /// Warpgate records the account but cannot hold it to one.
     #[test]
-    fn a_managed_target_logs_on_as_its_stored_account() {
-        let password = RdpTargetAuth::default();
-        let mut identity =
-            managed_logon_identity(&options(password.clone(), Some("corp.example.com"))).unwrap();
+    fn a_stored_account_logs_on_as_itself() {
+        let operator = WindowsAccount::parse("operator", Some("corp.example.com")).unwrap();
+        let mut identity = stored_logon_identity(&operator, false).unwrap();
         assert_eq!(
             identity.account(),
             down_level("corp.example.com", "operator")
         );
         assert!(identity.admits("CORP", "operator"));
         assert!(!identity.admits("CORP", "administrator"));
-
-        let mut interactive = options(password, None);
-        interactive.interactive_logon = true;
-        assert_eq!(managed_logon_identity(&interactive), None);
-        assert_eq!(
-            managed_logon_identity(&options(local(&[]), None)),
-            None,
-            "only a stored account is the target's own"
-        );
+        assert_eq!(stored_logon_identity(&operator, true), None);
     }
 
-    #[test]
-    fn only_the_accounts_assigned_to_a_user_are_theirs() {
-        let (alice, bob) = (Uuid::from_u128(1), Uuid::from_u128(2));
-        let administrator = down_level("SRV01", "administrator");
-        let RdpTargetAuth::LocalAccount(auth) = local(&[
-            ("operator", &[alice, bob][..]),
-            (administrator.as_str(), &[bob][..]),
-            ("OPERATOR", &[alice][..]),
-            ("", &[alice][..]),
-        ]) else {
-            unreachable!()
-        };
-        let options = options(RdpTargetAuth::LocalAccount(auth.clone()), Some("SRV01"));
-        assert_eq!(
-            assigned_accounts(&auth, &options, alice),
-            vec![account("operator", Some("SRV01"))],
-            "listed twice, and a blank name, count once and not at all"
-        );
-        assert_eq!(
-            assigned_accounts(&auth, &options, bob),
-            vec![
-                account("operator", Some("SRV01")),
-                account("administrator", Some("SRV01"))
-            ]
-        );
-        assert!(assigned_accounts(&auth, &options, Uuid::from_u128(3)).is_empty());
-    }
-
-    fn choice(binding: Option<u128>, kind: SignInKind, account: WindowsAccount) -> SignInChoice {
+    fn choice(id: u128, kind: SignInKind, account: WindowsAccount) -> SignInChoice {
         SignInChoice {
-            binding_id: binding.map(Uuid::from_u128),
+            account_id: Uuid::from_u128(id),
             kind,
             account,
             format: DirectoryUsernameFormat::Upn,
+            domain_hint: None,
+            stored: (kind == SignInKind::Managed).then(|| "stored".parse().unwrap()),
         }
     }
 
@@ -1472,12 +1376,12 @@ mod tests {
     fn two_accounts() -> SignInPlan {
         plan(vec![
             choice(
-                Some(10),
+                10,
                 SignInKind::DomainAccount,
                 account("ahmad", Some("CORP")),
             ),
             choice(
-                Some(11),
+                11,
                 SignInKind::LocalAccount,
                 account("support", Some("WIN-SRV-01")),
             ),
@@ -1496,36 +1400,30 @@ mod tests {
         );
         assert_eq!(plan.prompt_kind(), SignInKind::LocalAccount);
         assert_eq!(
-            plan.directory_choice().and_then(|choice| choice.binding_id),
+            plan.directory_choice().map(|choice| choice.account_id),
             Some(Uuid::from_u128(10))
         );
         assert!(plan.stored_sign_in().is_none());
-        assert!(!SignInKind::of(&options(RdpTargetAuth::default(), None)).asks_for_password());
-        assert!(
-            SignInKind::of(&options(
-                RdpTargetAuth::DomainAccount(RdpTargetDomainAccountAuth::default()),
-                None
-            ))
-            .asks_for_password()
-        );
+        assert!(!SignInKind::Managed.asks_for_password());
+        assert!(SignInKind::DomainAccount.asks_for_password());
     }
 
-    /// 2, 4, 5, 24: a client chooses only among the user's own accounts, by assignment or
-    /// by name; anything else is refused.
+    /// 7, 10, 28: a client chooses only among its own accounts, by id or by name; a forged
+    /// id or another name is refused, and several accounts need a choice.
     #[test]
     fn a_client_chooses_only_among_its_own_accounts() {
         let plan = two_accounts();
-        let by_binding = SignInAnswer {
-            binding_id: Some(Uuid::from_u128(11)),
+        let by_id = SignInAnswer {
+            account_id: Some(Uuid::from_u128(11)),
             account: None,
         };
         assert_eq!(
-            plan.select(by_binding).unwrap().label(),
+            plan.select(by_id).unwrap().label(),
             down_level("WIN-SRV-01", "support")
         );
         let typed = format!(" {} ", down_level("corp", "AHMAD"));
         let by_name = SignInAnswer {
-            binding_id: None,
+            account_id: None,
             account: Some(&typed),
         };
         assert_eq!(
@@ -1534,11 +1432,11 @@ mod tests {
         );
         for forged in [
             SignInAnswer {
-                binding_id: Some(Uuid::from_u128(99)),
+                account_id: Some(Uuid::from_u128(99)),
                 account: None,
             },
             SignInAnswer {
-                binding_id: None,
+                account_id: None,
                 account: Some("administrator"),
             },
         ] {
@@ -1553,39 +1451,41 @@ mod tests {
         ));
     }
 
-    /// 29: a target whose only account is its managed one connects without asking.
+    /// 34: an account with a stored credential connects without asking, with that account's
+    /// own credential.
     #[test]
-    fn the_managed_account_alone_needs_no_prompt() {
+    fn a_stored_account_alone_needs_no_prompt() {
         let plan = plan(vec![choice(
-            None,
+            12,
             SignInKind::Managed,
             account("operator", None),
         )]);
         let sign_in = plan.stored_sign_in().unwrap();
         assert_eq!(sign_in.kind(), SignInKind::Managed);
         assert!(sign_in.credentials().is_none());
+        assert_eq!(sign_in.account_id(), Uuid::from_u128(12));
+        let stored = sign_in.stored_credential().unwrap();
+        assert_eq!(stored.account, account("operator", None));
         assert_eq!(
             (sign_in.user_id(), sign_in.target_id()),
             (Uuid::from_u128(1), Uuid::from_u128(2))
         );
     }
 
-    /// The password the user signed in with is offered to their own directory account only:
-    /// never to a local account, whatever the client names.
+    /// 35: the password the user signed in with is offered to their own directory account
+    /// only: never to a local account, whatever the client names.
     #[tokio::test]
     async fn the_sign_in_password_is_never_offered_to_another_account() {
         let plan = plan(vec![choice(
-            Some(11),
+            11,
             SignInKind::LocalAccount,
             account("support", Some("WIN-SRV-01")),
         )]);
-        let options = options(RdpTargetAuth::LocalAccount(Default::default()), None);
         let db = DatabaseConnection::Disconnected;
         let label = down_level("WIN-SRV-01", "support");
         for named in [None, Some("support"), Some(label.as_str())] {
             assert!(matches!(
-                reuse_sign_in_password(&db, &plan, &options, named, Zeroizing::new("p".into()))
-                    .await,
+                reuse_sign_in_password(&db, &plan, named, Zeroizing::new("p".into())).await,
                 Err(SignInError::PasswordNotReusable)
             ));
         }

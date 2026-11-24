@@ -101,8 +101,11 @@ mod m00094_unique_role_names;
 mod m00095_kubernetes_sessions;
 mod m00096_ldap_authenticate_users;
 mod m00097_target_account_bindings;
+mod m00098_unified_access_control;
 
 pub(crate) mod helpers;
+
+pub use m00098_unified_access_control::preview as preview_access_control_migration;
 
 pub struct Migrator;
 
@@ -207,8 +210,43 @@ impl MigratorTrait for Migrator {
             Box::new(m00095_kubernetes_sessions::Migration),
             Box::new(m00096_ldap_authenticate_users::Migration),
             Box::new(m00097_target_account_bindings::Migration),
+            Box::new(m00098_unified_access_control::Migration),
         ]
     }
+}
+
+/// Where a database stands with the access-control migration (m00098).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessControlMigrationState {
+    /// Every earlier migration has run, and m00098 has not: it can be previewed.
+    Pending,
+    /// Earlier migrations have not run either: the preview needs the release before this one.
+    EarlierMigrationsPending,
+    /// m00098 has run; its report is in Access Control, Migration review.
+    Applied,
+}
+
+const ACCESS_CONTROL_MIGRATION: &str = "m00098_unified_access_control";
+
+pub async fn access_control_migration_state<C: ConnectionTrait>(
+    db: &C,
+) -> Result<AccessControlMigrationState, DbErr> {
+    let pending: Vec<String> = Migrator::get_pending_migrations(db)
+        .await?
+        .iter()
+        .map(|migration| migration.name().to_owned())
+        .collect();
+    let Some(position) = pending
+        .iter()
+        .position(|name| name == ACCESS_CONTROL_MIGRATION)
+    else {
+        return Ok(AccessControlMigrationState::Applied);
+    };
+    Ok(if position == 0 {
+        AccessControlMigrationState::Pending
+    } else {
+        AccessControlMigrationState::EarlierMigrationsPending
+    })
 }
 
 const MIGRATION_LOCK_KEY: i64 = 0x1337_1337_1337_1337;
@@ -342,5 +380,203 @@ mod tests {
 
         db.close().await.unwrap();
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// 20, 25, 26: the access-control migration on a database as m00097 left it. Access is
+    /// carried over, a rollback puts the credentials back in the target's settings, and
+    /// running it again gives the same result. The deployed m00097 keeps its place.
+    #[tokio::test]
+    async fn the_access_control_migration_carries_access_over_and_reruns_cleanly() {
+        use sea_orm::{ActiveModelTrait, EntityTrait, PaginatorTrait, Set};
+        use sea_orm_migration::{MigrationName, MigratorTrait};
+        use time::OffsetDateTime;
+        use uuid::Uuid;
+        use warpgate_db_entities::{
+            AccessAssignment, AccessGroupExclusion, AccessGroupGrant, AccessMigrationReview, Role,
+            Target, TargetAccount, TargetAccountBinding, TargetRoleAssignment, User,
+            UserRoleAssignment,
+        };
+
+        use super::{AccessControlMigrationState, Migrator, access_control_migration_state};
+
+        set_config_migration_values(ConfigMigrationValues::default());
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let names: Vec<String> = Migrator::migrations()
+            .iter()
+            .map(|migration| migration.name().to_owned())
+            .collect();
+        let m00097 = names
+            .iter()
+            .position(|name| name == "m00097_target_account_bindings")
+            .unwrap();
+        assert_eq!(
+            names.get(m00097 + 1).map(String::as_str),
+            Some("m00098_unified_access_control"),
+            "the deployed m00097 is not rewritten; the change is a new migration after it"
+        );
+        migrate_database_up(&db, u32::try_from(m00097 + 1).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            access_control_migration_state(&db).await.unwrap(),
+            AccessControlMigrationState::Pending
+        );
+
+        let now = OffsetDateTime::now_utc();
+        let mut users = vec![];
+        for name in ["ahmad", "yusif"] {
+            let id = Uuid::new_v4();
+            User::ActiveModel {
+                id: Set(id),
+                username: Set(name.into()),
+                description: Set(String::new()),
+                credential_policy: Set(serde_json::json!({})),
+                rate_limit_bytes_per_second: Set(None),
+                ldap_server_id: Set(None),
+                ldap_object_uuid: Set(None),
+                allowed_ip_ranges: Set(serde_json::Value::Null),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            users.push(id);
+        }
+        let (ahmad, yusif) = (users[0], users[1]);
+        let ops = Uuid::new_v4();
+        Role::ActiveModel {
+            id: Set(ops),
+            name: Set("ops".into()),
+            description: Set(String::new()),
+            is_default: Set(false),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        for user_id in [ahmad, yusif] {
+            UserRoleAssignment::ActiveModel {
+                user_id: Set(user_id),
+                role_id: Set(ops),
+                granted_at: Set(Some(now)),
+                expires_at: Set(None),
+                revoked_at: Set(None),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        let server = Uuid::new_v4();
+        Target::ActiveModel {
+            id: Set(server),
+            name: Set("LINUX-SRV-01".into()),
+            description: Set(String::new()),
+            kind: Set(warpgate_db_entities::Target::TargetKind::Ssh),
+            options: Set(serde_json::json!({"ssh": {"host": "h", "username": "deploy"}})),
+            rate_limit_bytes_per_second: Set(None),
+            group_id: Set(None),
+            ticket_max_duration_seconds: Set(None),
+            ticket_requests_disabled: Set(false),
+            ticket_require_approval: Set(false),
+            ticket_max_uses: Set(None),
+            require_approval: Set(false),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        TargetRoleAssignment::ActiveModel {
+            target_id: Set(server),
+            role_id: Set(ops),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        TargetAccountBinding::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            user_id: Set(yusif),
+            target_id: Set(server),
+            account_kind: Set(TargetAccountBinding::LegacyAccountKind::Local),
+            account_name: Set(Some("admin".into())),
+            ldap_server_id: Set(None),
+            ldap_object_uuid: Set(None),
+            username_format: Set(None),
+            auth_method: Set(TargetAccountBinding::LegacyAuthMethod::TargetCredential),
+            enabled: Set(true),
+            expires_at: Set(None),
+            created_by: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            account_key: Set("local:admin".into()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        async fn counts(db: &sea_orm::DatabaseConnection) -> [u64; 5] {
+            [
+                TargetAccount::Entity::find().count(db).await.unwrap(),
+                AccessAssignment::Entity::find().count(db).await.unwrap(),
+                AccessGroupGrant::Entity::find().count(db).await.unwrap(),
+                AccessGroupExclusion::Entity::find()
+                    .count(db)
+                    .await
+                    .unwrap(),
+                AccessMigrationReview::Entity::find()
+                    .count(db)
+                    .await
+                    .unwrap(),
+            ]
+        }
+
+        migrate_database_up(&db, 1).await.unwrap();
+        assert_eq!(
+            access_control_migration_state(&db).await.unwrap(),
+            AccessControlMigrationState::Applied
+        );
+        let first = counts(&db).await;
+        // deploy (primary) and admin; yusif's binding; the role's grant; yusif excluded from it
+        assert_eq!(&first[..4], &[2, 1, 1, 1]);
+        let options = Target::Entity::find_by_id(server)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .options;
+        assert_eq!(
+            options["ssh"]["username"], "",
+            "the credential moved to the account"
+        );
+        // The earlier tables are left as they were, for a rollback.
+        assert_eq!(
+            TargetRoleAssignment::Entity::find()
+                .count(&db)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            TargetAccountBinding::Entity::find()
+                .count(&db)
+                .await
+                .unwrap(),
+            1
+        );
+
+        migrate_database_down(&db, 1).await.unwrap();
+        let options = Target::Entity::find_by_id(server)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .options;
+        assert_eq!(
+            options["ssh"]["username"], "deploy",
+            "a rollback restores the settings"
+        );
+
+        migrate_database_up(&db, 1).await.unwrap();
+        assert_eq!(
+            counts(&db).await,
+            first,
+            "running it again gives the same result"
+        );
     }
 }

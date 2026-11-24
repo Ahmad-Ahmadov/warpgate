@@ -9,7 +9,7 @@ use futures::stream::{FuturesOrdered, StreamExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info_span, warn};
 use warpgate_common::{TargetOptions, UserSessionId, WarpgateError};
-use warpgate_core::account_binding::BoundUser;
+use warpgate_core::access_control::ConnectingUser;
 use warpgate_core::rdp_account::{
     AuthorizedSignIn, SignInAnswer, SignInKind, SignInPlan, verify_sign_in,
 };
@@ -162,7 +162,7 @@ async fn ask_sign_in(
     admitted: &AdmittedTarget,
     plan: &SignInPlan,
 ) -> Result<AuthorizedSignIn, WarpgateError> {
-    let TargetOptions::Rdp(options) = admitted.options() else {
+    let TargetOptions::Rdp(_) = admitted.options() else {
         return Err(WarpgateError::InvalidTarget);
     };
     let Some(mut answers) = session.take_sign_in_answers() else {
@@ -171,16 +171,17 @@ async fn ask_sign_in(
         ));
     };
     let user_info = admitted.user_info();
-    let user = BoundUser {
+    let user = ConnectingUser {
         id: user_info.id,
         username: &user_info.username,
     };
+    let via_ticket = admitted.ticket_id().is_some();
     let target = admitted.target();
     let kind = match plan.prompt_kind() {
         SignInKind::DomainAccount => "domain_account",
         SignInKind::LocalAccount | SignInKind::Managed => "local_account",
     };
-    // The managed account among several takes no password: the target's stored one.
+    // An account with a stored credential among several takes no password.
     let passwordless: Vec<String> = plan
         .choices()
         .iter()
@@ -216,9 +217,9 @@ async fn ask_sign_in(
             user,
             target.id,
             &target.name,
-            options,
+            via_ticket,
             SignInAnswer {
-                binding_id: None,
+                account_id: None,
                 account: answer.account.as_deref(),
             },
             answer.password.into_zeroizing(),

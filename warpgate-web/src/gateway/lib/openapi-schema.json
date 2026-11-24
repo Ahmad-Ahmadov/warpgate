@@ -1292,7 +1292,7 @@
     },
     "/targets/{target_id}/accounts": {
       "get": {
-        "summary": "The accounts the signed-in user may connect to a target as: their own assignments\nthere, or the target's own setup. Authorized as starting a session is, and only ever\nabout the user's own accounts.",
+        "summary": "The accounts the signed-in user may connect to a target as: the ones Access Control\nauthorized for them there. Authorized as starting a session is, and only ever about\nthe user's own accounts.",
         "parameters": [
           {
             "name": "target_id",
@@ -1308,7 +1308,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The accounts, in the order they were assigned. Empty for an SSH target the user signs\nin to as it is set up.",
+            "description": "The user's own accounts on the target, in the order they were assigned. Empty on a\nprotocol with no remote accounts.",
             "content": {
               "application/json; charset=utf-8": {
                 "schema": {
@@ -1892,10 +1892,10 @@
             "type": "string",
             "format": "uuid"
           },
-          "account_binding_id": {
+          "account_id": {
             "type": "string",
             "format": "uuid",
-            "description": "The account to sign in as, among those assigned to the user on the target (see\n`get_target_accounts`): only ever one of their own. Without it, the only one, or the\nfirst of several."
+            "description": "The target account to sign in as, among those Access Control authorized for the user\nthere (see `get_target_accounts`): only ever one of their own. Needed when they have\nseveral."
           }
         }
       },
@@ -2655,14 +2655,15 @@
         "title": "TargetAccount",
         "description": "An account the signed-in user may connect to a target as.",
         "required": [
+          "id",
           "account",
           "kind"
         ],
         "properties": {
-          "binding_id": {
+          "id": {
             "type": "string",
             "format": "uuid",
-            "description": "The assignment it comes from (Access Control); absent for the target's own setup."
+            "description": "The target account: send it back as `account_id` to connect as it."
           },
           "account": {
             "type": "string",
@@ -2675,11 +2676,11 @@
       },
       "TargetAccountKind": {
         "type": "string",
-        "description": "What kind of remote account a binding names.",
+        "description": "What kind of identity an account is.",
         "enum": [
-          "directory",
           "local",
-          "managed"
+          "domain",
+          "directory"
         ]
       },
       "TargetClickAction": {

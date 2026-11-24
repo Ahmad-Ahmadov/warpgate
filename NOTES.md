@@ -2993,6 +2993,10 @@ Then:
 
 ## RDP: Windows account access control
 
+> **Superseded** by [Unified Access Control](#unified-access-control-user-target-account): the
+> "Sign in with" modes became target accounts, and who may use them became assignments.
+> The logon enforcement and single-password parts below still hold.
+
 Each RDP target says which Windows account a user may sign in as. Warpgate enforces that for
 browser and native (mstsc, MobaXterm, FreeRDP) connections alike: both go through the same
 shared code (`warpgate-core/src/rdp_account.rs` and the RDP client in
@@ -3135,6 +3139,10 @@ Then test by hand, in the browser and in mstsc/MobaXterm:
   shows both the Warpgate user and the Windows account.
 
 ## Account access: user, target and remote account
+
+> **Superseded** by [Unified Access Control](#unified-access-control-user-target-account):
+> bindings became assignments of target accounts (migration m00098), assignments are
+> mandatory, and the native-RDP single-password behaviour below is unchanged.
 
 Administrators can now assign which remote account a Warpgate user may sign in to an RDP or
 SSH target as. The UI is **Access → Account access**. The data model is
@@ -3328,3 +3336,251 @@ and an SSH server:
 - browser and native SSH as `deploy` and as a directory account;
 - SFTP and port forwarding with a binding;
 - jump hosts.
+
+## Unified Access Control: user, target, account
+
+One model now decides who may connect to what, and as which remote account:
+
+```
+user → target → account → (MFA, approval, session policies)
+```
+
+An **assignment** is the whole permission: to reach the target, and to sign in there as
+the account. Users connect only through an assignment that is in force. Holding a role
+grants nothing by itself, and nor does a target having a credential. There is no optional
+switch and no legacy fallback.
+
+### The three parts
+
+- **Targets** hold connection settings only: host, port, TLS, Kerberos KDC, jump host,
+  interactive logon. They no longer name an account.
+  - The RDP "Sign in with" dropdown is gone, and so are the RDP per-user account lists and
+    the "Require an account assignment" checkbox.
+  - The username and credential fields of RDP, SSH, MySQL and PostgreSQL targets are gone
+    from the UI.
+- **Target accounts** (`target_accounts`, a target's Accounts section). A target holds any
+  number of them.
+  - Kinds:
+    - `local`: an account of the server, such as `WIN-SRV-01\support`, `deploy` or a
+      database user;
+    - `domain`: a named domain account, such as `CORP\sqladmin`;
+    - `directory`: each user's own linked LDAP/AD identity. It names no one. It is
+      resolved from the user's verified LDAP link at connection time, and Warpgate keeps
+      no password for it.
+  - Authentication:
+    - `stored_credential`: an encrypted password, a Vault/OpenBao reference, Warpgate's
+      SSH keys, a Vault-signed SSH certificate, or an AWS role;
+    - `typed_password`: RDP only, typed by the user when connecting;
+    - `directory_password`: RDP linked directory account only.
+  - `check_account` refuses impossible combinations, both when an account is saved and
+    when it is used. Examples: a directory account with one shared password, or a typed
+    password over SSH.
+  - A credential is stored once, encrypted with the same `StoredSecrets` machinery as
+    before, and included in key rotation (`credential_encryption.rs`). It is never
+    returned: a password comes back blank, and a blank password on update keeps the stored
+    one. Secret references are counted in the secret backend's "used by" list.
+  - Each target has at most one **primary account**. It grants nobody anything. It is used:
+    - by jump-host hops;
+    - by ticket connections from users with no assignment there;
+    - by the legacy API fields.
+- **Access Control** (admin UI, Access control): the only place access is granted or
+  revoked.
+  - **Assignments**: every effective assignment, direct or group-derived, with its source,
+    status, problem and expiry. There is search, filtering, create and edit, enable and
+    disable, revoke, and bulk actions with a dry-run preview.
+  - **Access groups**: optional. A group is a role, with the same membership, APIs, SSO
+    role mappings and default-role setting.
+    - What a group grants is only its rows in `access_group_grants` (target + account).
+      Every effective assignment it makes is listed, with the group as its source.
+    - Excluding one member from a grant (`access_group_exclusions`) revokes it for them
+      alone. Their direct assignments, and the other members, are untouched.
+    - Adding or removing a grant shows who gains or loses access before it applies, and is
+      audited.
+  - **Migration review**: see below.
+  - Admin roles are separate and unchanged.
+
+### One resolver
+
+`warpgate-core/src/access_control.rs` is the only place the rules are applied.
+
+- `effective_assignments` works out the direct assignments, plus group grants for active
+  memberships, minus exclusions. For each one it records why it cannot be used, if it
+  cannot:
+  - it is disabled or expired, or the user is excluded;
+  - the account is disabled, deleted, belongs to another target, or cannot sign in as
+    configured;
+  - the user is not linked to a directory, or their link changed since a direct directory
+    assignment was made.
+- `has_access` and `authorized_target_ids` back `ConfigProvider::authorize_target*`. Every
+  protocol's authorization goes through these, along with the portal's target list and the
+  periodic `close_sessions_without_access` sweep.
+- `resolve_connection` picks the account:
+  - the only usable one;
+  - or the one the client asked for, by id (browser) or by name (`user:target:account`
+    for native SSH and database clients).
+  - It is only ever looked up among the user's own usable accounts.
+  - Several accounts with none named is refused, with a message saying how to choose.
+    Native SSH no longer silently takes the first.
+  - Refusals are audited as `AccessAssignmentRefused1`.
+- `TargetAuthorization` carries only the client's request, which is just a request.
+  Protocols consume the result:
+  - SSH: `resolve_approved_ssh_chain` decides at connect time, after approval. SFTP, SCP
+    and port forwarding use the same connection.
+  - MySQL and PostgreSQL: `admit_account` decides after admission and fills the
+    connection's options.
+  - RDP: `rdp_account::plan_sign_in` / `verify_sign_in` offer only authorized accounts,
+    and the connection carries the chosen account's own stored credential
+    (`AuthorizedSignIn::into_parts`).
+  - HTTP, Kubernetes and VNC: accountless assignments.
+- Tickets stay an explicit, administrator-issued, audited exception. A ticket admits its
+  user without an assignment. On a target with accounts, the connection uses the user's
+  own assignment if they have one, and the target's primary account otherwise.
+
+### Native RDP: one password, unchanged
+
+The single-password behaviour of "Native RDP: one password per connection" is unchanged.
+It now applies to accounts of kind `directory` with `directory_password`:
+- the sign-in password is kept in memory for 5 minutes;
+- it is checked with the directory again before use;
+- it is only ever offered to the user's own directory account;
+- logon enforcement (Save Session Info) is unchanged.
+
+### Migration m00098 (`warpgate-db-migrations/src/m00098_unified_access_control.rs`)
+
+m00097 was pushed, and may be deployed, so it is unchanged. m00098 is a new forward
+migration that runs at startup, in one transaction on SQLite. It never widens access:
+
+- **Inventory.** Each RDP, SSH, MySQL and PostgreSQL target's configured account becomes a
+  primary account, with its credential *moved*. The targets' settings are blanked, so
+  nothing is duplicated.
+  - RDP "Active Directory Authentication" becomes a linked directory account.
+  - RDP "assigned Windows accounts" become local typed-password accounts.
+  - Accounts that only appeared in bindings are added too.
+- **Roles.** A role that reached a target becomes the same group granting the primary
+  account (or the target, for HTTP, Kubernetes and VNC).
+  - Members who had m00097 bindings on that target were held to those bindings. They are
+    excluded from the group's grant there, and keep only their own.
+- **Bindings and RDP-assigned accounts** become direct assignments, but only for users
+  whose roles reached the target. They expire no later than the binding or the role did.
+- **Pending review.** Anything else waits in Access control → Migration review, granting
+  nothing until decided:
+  - a role on a target whose accounts were per-user (`ambiguous`);
+  - a target with no account (`no_account`);
+  - a binding whose user had no role there (`ineffective`);
+  - a local binding named like the stored account (`ambiguous`).
+- **The report.** Every decision is written to `access_migration_reviews`, including the
+  automatic ones. The categories are: migrated, already matching, duplicate, no account,
+  overlapping, ineffective, ambiguous.
+- **Snapshots.** Session snapshots in removed RDP modes are normalized, so the session
+  list keeps showing their target.
+- **Untouched.** `target_roles`, `user_roles` and `target_account_bindings` are left as
+  they were. Grant changes keep a `target_roles` row in step, for legacy API reads and for
+  rollback.
+- **Rollback.** `down` puts each target's credentials back in its settings (from its
+  primary account, or its typed-password accounts for RDP) and drops the new tables.
+  - Changes made in Access Control after the upgrade are not carried back.
+  - Back up the database before upgrading.
+  - A later migration can drop `target_account_bindings` once rollback past m00098 is no
+    longer needed.
+
+**Before upgrading**, preview it against the current database. It writes nothing, apart
+from the migration tracking table if the database has none:
+
+```sh
+warpgate --config /etc/warpgate.yaml access-migration-preview
+```
+
+It prints the counts, every pending item and the full report. After the upgrade, decide
+the pending items in the UI. Confirming an item needs an account where the target has
+accounts. SSO-managed groups are flagged: their membership keeps coming from the SSO role
+mappings, and their grants decide what membership gives.
+
+### Compatibility
+
+- **Legacy target fields.** `username`, `auth` and RDP `domain` in `/targets` requests are
+  translated into the target's primary account, which is created or updated. Reads show
+  the primary account again, with no secret. The Warpgate UI sends these fields blank.
+- **Legacy role-target API.** `POST /targets/{id}/roles/{role_id}` grants the role's group
+  the primary account, or the target itself where there are no accounts.
+  - With no primary account it answers 409 with an explicit message. It never picks an
+    account.
+  - `DELETE` removes the group's grants on the target. `GET` reads the `target_roles`
+    mirror.
+  - The Python integration tests and Terraform keep working through this.
+- **Removed.** `/account-bindings*`, the RDP `domain_account` and `local_account` auth
+  kinds, and `require_account_binding`. A request with a removed auth kind fails to parse,
+  which is an explicit 400.
+- **Gateway.** `GET /targets/{id}/accounts` returns `{id, account, kind}`, the user's own
+  accounts. `POST /web-ssh/sessions` takes `account_id`, which replaces
+  `account_binding_id`.
+
+### Admin API (needs `AccessRolesAssign`, except target accounts, which need `TargetsEdit`)
+
+| | |
+|---|---|
+| `GET/POST /targets/{id}/accounts`, `PUT/DELETE …/{account_id}` | target accounts (list also for `AccessRolesAssign`) |
+| `GET/POST /access-assignments`, `PUT/DELETE /access-assignments/{id}` | direct assignments; list shows all effective ones (`user_id`, `target_id`, `group_id`, `source`) |
+| `GET /access-assignments/options?user_id&target_id` | assignable accounts (directory name read live) and current access |
+| `POST /access-assignments/bulk` | enable, disable, revoke direct ones; `dry_run` |
+| `GET /access-groups`, `GET/POST /access-groups/{id}/grants`, `DELETE …/{grant_id}?dry_run` | groups and their grants, with impact |
+| `POST /access-group-grants/{grant_id}/exclusions`, `DELETE /access-group-exclusions/{id}` | exclude or restore one member |
+| `GET /access-migration/reviews?status`, `POST …/{id}/confirm`, `POST …/{id}/reject` | migration review |
+
+Both `openapi-schema.json` files were edited by hand. `just openapi-all` should produce the
+same content.
+
+### Audit and sessions
+
+- **Audit events:**
+  - `AccessAssignmentChanged1`: created, updated, enabled, disabled, revoked, excluded or
+    restored, with previous and new state, source and actor.
+  - `AccessAssignmentRefused1`.
+  - `TargetAccountChanged1`: records the kind of credential, never its value.
+  - `AccessGroupGrantChanged1`: records the affected users.
+  - `AccessMigrationReviewResolved1`.
+- **Ending sessions.** A change that can take access away ends the affected users'
+  sessions on the target at once: revoking, disabling, editing, excluding, removing a
+  grant, deleting or changing an account, or deleting a group. The periodic sweep catches
+  expiry.
+- **Connection logs** name both the Warpgate user and the remote account, with the
+  account's id and the assignment source.
+
+### On the build server
+
+```sh
+cargo test -p warpgate-common account_credentials
+cargo test -p warpgate-common options_with_the_retired
+cargo test -p warpgate-db-entities
+cargo test -p warpgate-db-migrations --features sqlite
+cargo test -p warpgate-core --features sqlite access_control
+cargo test -p warpgate-core --features sqlite resources
+cargo test -p warpgate-core --features sqlite rdp_account
+cargo test -p warpgate-admin access_control
+cargo test -p warpgate-protocol-rdp
+cargo test -p warpgate-protocol-ssh
+just clippy
+just openapi        # regenerates the TypeScript clients from the committed schemas
+cd warpgate-web && npm run check && npm run lint
+```
+
+Integration tests, which grant access through `add_target_role` and so also exercise the
+compatibility path:
+
+```sh
+cd tests && poetry run pytest test_access_control.py test_target_credential_encryption.py
+cd tests && poetry run pytest    # the whole suite
+```
+
+### Not done, and why
+
+- **Choosing an account in the native SSH menu.** The interactive target menu lists
+  targets, not accounts. With several accounts, the user is told to connect as
+  `user:target:account`.
+- **Kubernetes, HTTP and VNC** have no per-user remote account. Their assignments are
+  accountless; the cluster, URL or VNC credential stays on the target.
+- **Remote accounts are not discovered, created or checked on servers.**
+- **Stored session records** do not get an account column. The account is in the
+  connection log lines and audit events.
+- **Changing a group's membership** (roles API, SSO, LDAP) is audited as before
+  (`AccessRoleGranted1` / `AccessRoleRevoked1`). It does not list each assignment gained or
+  lost.

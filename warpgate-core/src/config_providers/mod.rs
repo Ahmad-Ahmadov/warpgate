@@ -24,6 +24,7 @@ use warpgate_common::{
 use warpgate_db_entities as e;
 use warpgate_sso::SsoProviderConfig;
 
+use crate::access_control::AccountRequest;
 use crate::login_protection::LoginProtectionService;
 
 #[enum_dispatch]
@@ -163,11 +164,16 @@ impl std::ops::Deref for AuthorizedIdentity {
 }
 
 /// Proof that a user is authorized for a specific target (but not necessarily allowed to connect yet pending approval, see [ApprovedTarget]).
+///
+/// Authorized means Access Control lets the user reach the target ([`crate::access_control`]).
+/// Which account the connection signs in as is decided when it is made, from
+/// [`Self::account_request`] (what the client asked for, if anything), among the user's own.
 pub struct TargetAuthorization<O = TargetOptions> {
     user_info: AuthStateUserInfo,
     target: SpecificTarget<O>,
     protocol: Protocol,
     ticket_id: Option<Uuid>,
+    account_request: Option<AccountRequest>,
 }
 
 impl TargetAuthorization {
@@ -182,6 +188,7 @@ impl TargetAuthorization {
             target: SpecificTarget::any(target),
             protocol,
             ticket_id: None,
+            account_request: None,
         }
     }
 
@@ -196,6 +203,7 @@ impl TargetAuthorization {
             target: SpecificTarget::any(target),
             protocol,
             ticket_id,
+            account_request: None,
         })
     }
 
@@ -208,7 +216,45 @@ impl TargetAuthorization {
             target: self.target.narrow()?,
             protocol: self.protocol,
             ticket_id: self.ticket_id,
+            account_request: self.account_request,
         })
+    }
+}
+
+impl<O> TargetAuthorization<O> {
+    /// The account the client asks to connect as. Only a request: it is looked up among the
+    /// user's own usable accounts on the target when the connection is made, and refused
+    /// otherwise, so any caller may set it.
+    #[must_use]
+    pub fn with_account_request(mut self, request: Option<AccountRequest>) -> Self {
+        self.account_request = request;
+        self
+    }
+
+    /// See [`Self::with_account_request`].
+    pub const fn account_request(&self) -> Option<&AccountRequest> {
+        self.account_request.as_ref()
+    }
+}
+
+impl<O: TargetOptionsVariant> TargetAuthorization<O> {
+    /// Fill the connection's options in (with the account Access Control authorized).
+    /// Crate-only: no protocol can change what it was authorized for.
+    pub(crate) fn with_target_options(
+        mut self,
+        change: impl FnOnce(&mut TargetOptions),
+    ) -> Result<Self, WarpgateError> {
+        self.target = self.target.with_options(change)?;
+        Ok(self)
+    }
+}
+
+impl<O: TargetOptionsVariant> ApprovedTarget<O> {
+    pub(crate) fn with_target_options(
+        self,
+        change: impl FnOnce(&mut TargetOptions),
+    ) -> Result<Self, WarpgateError> {
+        Ok(Self(self.0.with_target_options(change)?))
     }
 }
 
@@ -298,19 +344,35 @@ pub async fn authorize_for_target<C: ConfigProvider + ?Sized>(
             target: SpecificTarget::any(target),
             protocol: identity.protocol,
             ticket_id: None,
+            account_request: None,
         }))
 }
 
 /// Resolves the target by name and checks authorization. A target that
 /// doesn't exist and one the user may not reach are the same `None` here, so
 /// a caller can't be used as a target-existence oracle.
+///
+/// The name may also carry the account to sign in as: `TARGET:ACCOUNT` or `TARGET#ACCOUNT`
+/// (native SSH and database clients, whose username is `user:TARGET:ACCOUNT`). A target
+/// whose own name matches the whole string wins.
 pub async fn authorize_for_target_by_name<C: ConfigProvider + ?Sized>(
     config_provider: &C,
     identity: &AuthorizedIdentity,
     target_name: &str,
 ) -> Result<Option<TargetAuthorization>, WarpgateError> {
-    match config_provider.get_target_by_name(target_name).await? {
-        Some(target) => authorize_for_target(config_provider, identity, target).await,
+    if let Some(target) = config_provider.get_target_by_name(target_name).await? {
+        return authorize_for_target(config_provider, identity, target).await;
+    }
+    let Some((name, account)) = crate::access_control::split_account_selector(target_name) else {
+        return Ok(None);
+    };
+    match config_provider.get_target_by_name(name).await? {
+        Some(target) => Ok(authorize_for_target(config_provider, identity, target)
+            .await?
+            .map(|authorization| {
+                authorization
+                    .with_account_request(Some(AccountRequest::Name(account.trim().to_owned())))
+            })),
         None => Ok(None),
     }
 }
@@ -435,8 +497,11 @@ pub async fn validate_ticket(
             return Ok(None);
         }
 
-        // A ticket binds user↔target directly, so it mints the proof without a
-        // role check — that's what makes it a ticket.
+        // A ticket binds user↔target directly, so it mints the proof without an
+        // Access Control assignment — that's what makes it a ticket: an
+        // administrator's explicit, audited, use- and time-limited grant. The account
+        // it connects as is still decided by `access_control` (the user's own
+        // assignment there, else the target's primary account).
         Ok(Some(ValidatedTicket {
             id: ticket.id,
             authorization: TargetAuthorization {
@@ -444,6 +509,7 @@ pub async fn validate_ticket(
                 target: SpecificTarget::any(target),
                 protocol,
                 ticket_id: Some(ticket.id),
+                account_request: None,
             },
         }))
     } else {

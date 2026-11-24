@@ -15,6 +15,11 @@
      *     form saves, so each needs to follow the other without looping.
      *   - jump hosts exclude this target, so it cannot be its own jump host.
      *
+     * Which accounts the target has, and how each signs in (Warpgate's keys,
+     * a password or Vault reference, a Vault-signed certificate, a cloud role),
+     * are the target's Accounts; who may use which is Access Control. When this
+     * target is another's jump host, the hop signs in as its primary account.
+     *
      * `allowInsecureAlgos` is a **Checkbox**, not a Toggle. It binds into
      * `options` and is written when the form saves — a deferred write, so
      * "this will be true when you save" is the honest announcement. The
@@ -22,17 +27,12 @@
      */
     import {
         api,
-        type SSHClientKey,
         type Target,
         type TargetOptionsTargetSSHOptions,
     } from 'admin/lib/api'
     import { adminPermissions } from 'admin/lib/store'
     import { TargetKind } from 'gateway/lib/api'
-    import { serverInfo } from 'gateway/lib/store'
     import { untrack } from 'svelte'
-    import SecretRefInput, {
-        loadSecretBackends,
-    } from 'common/SecretRefInput.svelte'
     import Callout from 'ui/Callout.svelte'
     import Checkbox from 'ui/Checkbox.svelte'
     import Input from 'ui/Input.svelte'
@@ -48,11 +48,6 @@
 
     let hostKeyCheckInvalidated = $state(false)
     let sshTargets = $state<Target[]>([])
-    let clientKeys = $state<SSHClientKey[]>([])
-
-    api.getSshOwnKeys().then(keys => {
-        clientKeys = keys
-    })
 
     $effect(() => {
         // Runs when options are reassigned after saving
@@ -83,91 +78,10 @@
         })
     })
 
-    // svelte-ignore state_referenced_locally
-    let clientKeySelectValue = $state(
-        options.auth.kind === 'PublicKey' ? (options.auth.keyId ?? '') : '',
-    )
-
-    $effect(() => {
-        const val = clientKeySelectValue
-        untrack(() => {
-            if (options.auth.kind === 'PublicKey') {
-                options.auth.keyId = val || undefined
-            }
-        })
-    })
-
-    $effect(() => {
-        const keyId =
-            options.auth.kind === 'PublicKey' ? options.auth.keyId : undefined
-        untrack(() => {
-            clientKeySelectValue = keyId ?? ''
-        })
-    })
-
     const jumpHostOptions = $derived([
         { value: '', label: 'Direct connection' },
         ...sshTargets.map(t => ({ value: t.id, label: t.name })),
     ])
-
-    const clientKeyOptions = $derived([
-        { value: '', label: 'Use default keys' },
-        ...clientKeys.map(k => ({
-            value: k.id,
-            label: `${k.label} (${k.kind})${k.isDefault ? ' — default' : ''}`,
-        })),
-    ])
-
-    let secretBackendOptions = $state<{ value: string; label: string }[]>([])
-    loadSecretBackends().then(list => {
-        secretBackendOptions = list.map(b => ({ value: b.name, label: b.name }))
-    })
-
-    const authOptions = $derived([
-        { value: 'PublicKey', label: "Warpgate's own private keys" },
-        { value: 'Password', label: 'Password' },
-        ...($serverInfo?.runningOnEc2
-            ? [{ value: 'IamRole', label: 'IAM role' }]
-            : []),
-        // Upstream #2734: Warpgate gets a short-lived certificate for each
-        // connection from a secret backend's SSH engine. Offered once a
-        // backend exists, and always for a target already using it.
-        ...(secretBackendOptions.length || options.auth.kind === 'Certificate'
-            ? [
-                  {
-                      value: 'Certificate',
-                      label: "Certificate signed by a secret backend's SSH CA",
-                  },
-              ]
-            : []),
-    ])
-
-    // A target can name a backend that no longer exists; it stays selectable,
-    // marked, rather than the select silently showing nothing.
-    const certificateBackendOptions = $derived.by(() => {
-        const current =
-            options.auth.kind === 'Certificate' ? options.auth.backend : ''
-        return current && !secretBackendOptions.some(b => b.value === current)
-            ? [
-                  ...secretBackendOptions,
-                  { value: current, label: `${current} (not found)` },
-              ]
-            : secretBackendOptions
-    })
-
-    // Switching the kind keeps the rest of the auth object, so a certificate
-    // auth needs its own fields filled in, as upstream's editor does.
-    $effect(() => {
-        if (options.auth.kind === 'Certificate') {
-            untrack(() => {
-                if (options.auth.kind === 'Certificate') {
-                    options.auth.backend ??= ''
-                    options.auth.mount ??= 'ssh'
-                    options.auth.role ??= ''
-                }
-            })
-        }
-    })
 </script>
 
 <h5>Connection</h5>
@@ -214,79 +128,6 @@
     </div>
 {/if}
 
-<h5>Authentication</h5>
-
-<Input
-    label="Username"
-    mono
-    placeholder="Use the currently logged in user's name"
-    bind:value={options.username}
-/>
-
-<div class="row auth-row">
-    <Select
-        label="Authenticate using"
-        options={authOptions}
-        bind:value={options.auth.kind}
-    />
-
-    {#if options.auth.kind === 'PublicKey'}
-        <Select
-            label="Key"
-            options={clientKeyOptions}
-            bind:value={clientKeySelectValue}
-        />
-        <a
-            class="manage-keys"
-            href="/@warpgate/admin#/config/ssh"
-            target="_blank"
-            rel="noopener"
-        >
-            Manage keys
-            <span aria-hidden="true">↗</span>
-        </a>
-    {/if}
-
-    {#if options.auth.kind === 'Password'}
-        <SecretRefInput
-            bind:value={options.auth.password}
-            inlineLabel="Password"
-            disabled={!$adminPermissions.targetsEdit}
-        />
-    {/if}
-</div>
-
-{#if options.auth.kind === 'Certificate'}
-    <div class="row">
-        <Select
-            label="Secret backend"
-            required
-            placeholder="Choose a backend"
-            options={certificateBackendOptions}
-            bind:value={options.auth.backend}
-        />
-        <Input
-            label="SSH engine mount"
-            mono
-            required
-            placeholder="ssh"
-            bind:value={options.auth.mount}
-        />
-        <Input
-            label="Signing role"
-            mono
-            required
-            bind:value={options.auth.role}
-        />
-    </div>
-    <p class="cert-hint">
-        For each connection Warpgate generates a key pair and has the backend
-        sign its public key with this role. The target must trust the backend's
-        SSH CA, and the backend's allowed paths must include
-        <code>{options.auth.mount || 'ssh'}/sign/{options.auth.role || 'role'}</code>.
-    </p>
-{/if}
-
 <div class="insecure">
     <Checkbox
         label="Allow insecure SSH algorithms"
@@ -295,13 +136,6 @@
     />
 </div>
 
-<div class="insecure">
-    <Checkbox
-        label="Require an account assignment"
-        hint="Users may sign in only as accounts assigned to them on this target (Access, Account access); a user with none is refused. Without it, users with assignments are still held to them."
-        bind:checked={options.requireAccountBinding}
-    />
-</div>
 
 <style>
     h5 {
@@ -329,37 +163,6 @@
 
     .row > :global(.port) {
         flex: 0 1 8rem;
-    }
-
-    .auth-row > :global(.manage-keys) {
-        flex: none;
-    }
-
-    .cert-hint {
-        margin: 0;
-        color: var(--wg-text-muted);
-        font: var(--wg-text-body-md);
-    }
-
-    .manage-keys {
-        display: inline-flex;
-        align-items: center;
-        gap: var(--wg-space-xs);
-        height: var(--wg-control-height);
-        color: var(--wg-primary);
-        font: var(--wg-text-label-md);
-        text-decoration: none;
-        white-space: nowrap;
-    }
-
-    .manage-keys:hover {
-        text-decoration: underline;
-    }
-
-    .manage-keys:focus-visible {
-        outline: var(--wg-focus-ring);
-        outline-offset: var(--wg-focus-ring-offset);
-        border-radius: var(--wg-radius-sm);
     }
 
     .key-check {

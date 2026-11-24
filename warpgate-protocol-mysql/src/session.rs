@@ -11,7 +11,7 @@ use tracing::{error, info, info_span, trace, warn};
 use url::Url;
 use warpgate_common::auth::{AuthSelector, redacted_selector};
 use warpgate_common::helpers::rng::get_crypto_rng;
-use warpgate_common::{Protocol, Secret, TargetMySqlOptions, UserSessionId};
+use warpgate_common::{Protocol, Secret, TargetMySqlOptions, UserSessionId, WarpgateError};
 use warpgate_common_http::ext::construct_external_url;
 use warpgate_core::{
     AdmittedTarget, ApprovedTarget, AuthOkPermit, DbAuthTransport, Services, WarpgateServerHandle,
@@ -276,6 +276,22 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin> MySqlSession<S> {
             .await
             .register_approved_target_session(approved)
             .await?;
+
+        // The database account is the one Access Control authorized for the user (the only
+        // one, or the one named after the target: `user#target#account`), decided now.
+        let admitted =
+            match warpgate_core::access_control::admit_account(&self.services.db, admitted).await {
+                Ok((admitted, _)) => admitted,
+                Err(error) => {
+                    warn!(%error, "No account to sign in to the target with");
+                    let message = match &error {
+                        WarpgateError::InvalidRequest(message) => message.clone(),
+                        _ => "Warpgate access denied".to_owned(),
+                    };
+                    self.send_error(1045, &message).await?;
+                    return Ok(());
+                }
+            };
 
         self.run_authorized_inner(handshake, admitted).await
     }

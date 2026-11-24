@@ -21,6 +21,7 @@ const LEAF_LABELS: Record<string, string> = {
  */
 const ALSO_MATCH_LEAVES: Record<string, string> = {
     '/status/recordings': 'Recording',
+    '/config/access-roles': 'Access group',
 }
 
 export function crumbsFor(path: string, leaf?: Crumb): Crumb[] {

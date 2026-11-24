@@ -116,53 +116,79 @@ pub enum AuditEvent {
         target_account: Option<String>,
         target_session_id: Option<u32>,
     },
-    /// An administrator assigned a remote account to a user on a target.
-    AccountBindingCreated {
-        binding_id: Uuid,
+    /// A user's access to a target as a remote account changed (Access Control): a direct
+    /// assignment was created, changed, enabled, disabled or revoked, or a group-derived one
+    /// was excluded for the user or restored. Never carries a credential.
+    AccessAssignmentChanged {
+        /// `created`, `updated`, `enabled`, `disabled`, `revoked`, `excluded` or `restored`.
+        action: String,
+        /// The direct assignment, when it is one.
+        assignment_id: Option<Uuid>,
         user_id: Uuid,
         username: String,
         target_id: Uuid,
         target_name: String,
-        /// `directory`, `local` or `managed`.
-        account_kind: String,
-        /// The account, as written (a local or managed account), or the directory entry.
+        /// The remote account, as written (`CORP\ahmad`, `deploy`); empty where the protocol
+        /// has none.
         account: String,
-        auth_method: String,
-        actor_user_id: Uuid,
-    },
-    /// An administrator changed an assignment (enabled it, disabled it, changed its expiry
-    /// or how it signs in).
-    AccountBindingUpdated {
-        binding_id: Uuid,
-        user_id: Uuid,
-        username: String,
-        target_id: Uuid,
-        target_name: String,
-        account: String,
-        enabled: bool,
-        auth_method: String,
-        actor_user_id: Uuid,
-    },
-    /// An administrator revoked an assignment.
-    AccountBindingRevoked {
-        binding_id: Uuid,
-        user_id: Uuid,
-        username: String,
-        target_id: Uuid,
-        target_name: String,
-        account: String,
-        actor_user_id: Uuid,
+        account_id: Option<Uuid>,
+        /// Where it comes from: `direct`, `group <name>`, `migration review`, …
+        source: String,
+        previous_state: String,
+        new_state: String,
+        /// The administrator; `None` when Warpgate itself made the change.
+        actor_user_id: Option<Uuid>,
     },
     /// A connection asked for an account the user may not use on the target, or the user
     /// has no usable assignment there.
-    AccountBindingRefused {
+    AccessAssignmentRefused {
         user_id: Uuid,
         username: String,
         target_id: Uuid,
         target_name: String,
-        binding_id: Option<Uuid>,
         requested_account: Option<String>,
         reason: String,
+    },
+    /// An administrator added, changed, disabled or deleted an account in a target's
+    /// inventory. Never carries the credential itself.
+    TargetAccountChanged {
+        /// `created`, `updated` or `deleted`.
+        action: String,
+        target_id: Uuid,
+        target_name: String,
+        account_id: Uuid,
+        account: String,
+        kind: String,
+        auth_method: String,
+        /// `password`, `publickey`, … or `none`: the kind of credential, never its value.
+        credential: String,
+        enabled: bool,
+        actor_user_id: Uuid,
+    },
+    /// An administrator changed what an access group grants: a target and account added or
+    /// removed. `affected_users` lists the members whose effective access changed.
+    AccessGroupGrantChanged {
+        /// `added` or `removed`.
+        action: String,
+        group_id: Uuid,
+        group_name: String,
+        target_id: Uuid,
+        target_name: String,
+        account: String,
+        account_id: Option<Uuid>,
+        affected_users: String,
+        actor_user_id: Uuid,
+    },
+    /// An administrator decided a permission the access-control migration could not map.
+    AccessMigrationReviewResolved {
+        review_id: Uuid,
+        /// `confirmed` or `rejected`.
+        decision: String,
+        target_id: Option<Uuid>,
+        user_id: Option<Uuid>,
+        group_id: Option<Uuid>,
+        account_id: Option<Uuid>,
+        actor_user_id: Uuid,
     },
     /// The target logged a session on as an account the user may not use there (an account
     /// typed into the target's own sign-in screen, say), so Warpgate ended the session.
@@ -518,104 +544,140 @@ impl AuditEvent {
                     "Logged on to target"
                 );
             }
-            Self::AccountBindingCreated {
-                binding_id,
-                user_id,
-                username,
-                target_id,
-                target_name,
-                account_kind,
-                account,
-                auth_method,
-                actor_user_id,
-            } => {
-                info!(
-                    target: "audit",
-                    _type = "AccountBindingCreated1",
-                    binding_id = %binding_id,
-                    user_id = %user_id,
-                    username = %username,
-                    target_id = %target_id,
-                    target_name = %target_name,
-                    account_kind = %account_kind,
-                    account = %account,
-                    auth_method = %auth_method,
-                    actor_user_id = %actor_user_id,
-                    related_users = %format_related_ids(&[*user_id, *actor_user_id]),
-                    "Remote account assigned"
-                );
-            }
-            Self::AccountBindingUpdated {
-                binding_id,
+            Self::AccessAssignmentChanged {
+                action,
+                assignment_id,
                 user_id,
                 username,
                 target_id,
                 target_name,
                 account,
-                enabled,
-                auth_method,
+                account_id,
+                source,
+                previous_state,
+                new_state,
                 actor_user_id,
             } => {
+                let related: Vec<Uuid> = std::iter::once(*user_id).chain(*actor_user_id).collect();
                 info!(
                     target: "audit",
-                    _type = "AccountBindingUpdated1",
-                    binding_id = %binding_id,
+                    _type = "AccessAssignmentChanged1",
+                    action = %action,
+                    assignment_id = assignment_id.map(|id| id.to_string()),
                     user_id = %user_id,
                     username = %username,
                     target_id = %target_id,
                     target_name = %target_name,
                     account = %account,
-                    enabled = *enabled,
-                    auth_method = %auth_method,
-                    actor_user_id = %actor_user_id,
-                    related_users = %format_related_ids(&[*user_id, *actor_user_id]),
-                    "Remote account assignment changed"
+                    account_id = account_id.map(|id| id.to_string()),
+                    source = %source,
+                    previous_state = %previous_state,
+                    new_state = %new_state,
+                    actor_user_id = actor_user_id.map(|id| id.to_string()),
+                    related_users = %format_related_ids(&related),
+                    "Access assignment changed"
                 );
             }
-            Self::AccountBindingRevoked {
-                binding_id,
+            Self::AccessAssignmentRefused {
                 user_id,
                 username,
                 target_id,
                 target_name,
-                account,
-                actor_user_id,
-            } => {
-                info!(
-                    target: "audit",
-                    _type = "AccountBindingRevoked1",
-                    binding_id = %binding_id,
-                    user_id = %user_id,
-                    username = %username,
-                    target_id = %target_id,
-                    target_name = %target_name,
-                    account = %account,
-                    actor_user_id = %actor_user_id,
-                    related_users = %format_related_ids(&[*user_id, *actor_user_id]),
-                    "Remote account assignment revoked"
-                );
-            }
-            Self::AccountBindingRefused {
-                user_id,
-                username,
-                target_id,
-                target_name,
-                binding_id,
                 requested_account,
                 reason,
             } => {
                 tracing::warn!(
                     target: "audit",
-                    _type = "AccountBindingRefused1",
+                    _type = "AccessAssignmentRefused1",
                     user_id = %user_id,
                     username = %username,
                     target_id = %target_id,
                     target_name = %target_name,
-                    binding_id = binding_id.map(|id| id.to_string()),
                     requested_account = requested_account.as_deref(),
                     reason = %reason,
                     related_users = %format_related_ids(&[*user_id]),
-                    "Refused a remote account the user may not use"
+                    "Refused a connection without a usable access assignment"
+                );
+            }
+            Self::TargetAccountChanged {
+                action,
+                target_id,
+                target_name,
+                account_id,
+                account,
+                kind,
+                auth_method,
+                credential,
+                enabled,
+                actor_user_id,
+            } => {
+                info!(
+                    target: "audit",
+                    _type = "TargetAccountChanged1",
+                    action = %action,
+                    target_id = %target_id,
+                    target_name = %target_name,
+                    account_id = %account_id,
+                    account = %account,
+                    kind = %kind,
+                    auth_method = %auth_method,
+                    credential = %credential,
+                    enabled = *enabled,
+                    actor_user_id = %actor_user_id,
+                    related_users = %format_related_ids(&[*actor_user_id]),
+                    "Target account changed"
+                );
+            }
+            Self::AccessGroupGrantChanged {
+                action,
+                group_id,
+                group_name,
+                target_id,
+                target_name,
+                account,
+                account_id,
+                affected_users,
+                actor_user_id,
+            } => {
+                info!(
+                    target: "audit",
+                    _type = "AccessGroupGrantChanged1",
+                    action = %action,
+                    group_id = %group_id,
+                    group_name = %group_name,
+                    target_id = %target_id,
+                    target_name = %target_name,
+                    account = %account,
+                    account_id = account_id.map(|id| id.to_string()),
+                    affected_users = %affected_users,
+                    actor_user_id = %actor_user_id,
+                    related_users = %format_related_ids(&[*actor_user_id]),
+                    related_access_roles = %format_related_ids(&[*group_id]),
+                    "Access group grant changed"
+                );
+            }
+            Self::AccessMigrationReviewResolved {
+                review_id,
+                decision,
+                target_id,
+                user_id,
+                group_id,
+                account_id,
+                actor_user_id,
+            } => {
+                let related: Vec<Uuid> = std::iter::once(*actor_user_id).chain(*user_id).collect();
+                info!(
+                    target: "audit",
+                    _type = "AccessMigrationReviewResolved1",
+                    review_id = %review_id,
+                    decision = %decision,
+                    target_id = target_id.map(|id| id.to_string()),
+                    user_id = user_id.map(|id| id.to_string()),
+                    group_id = group_id.map(|id| id.to_string()),
+                    account_id = account_id.map(|id| id.to_string()),
+                    actor_user_id = %actor_user_id,
+                    related_users = %format_related_ids(&related),
+                    "Access migration review resolved"
                 );
             }
             Self::TargetLogonRefused {

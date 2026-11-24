@@ -8,16 +8,16 @@
      * parent page.
      *
      * TlsConfiguration is reused from 4c, which is why this file is short.
+     *
+     * The database accounts Warpgate signs in as (a password or Vault
+     * reference, or a cloud role) are the target's Accounts; who may use which
+     * is Access Control.
      */
     import type {
         TargetOptionsTargetMySqlOptions,
         TargetOptionsTargetPostgresOptions,
     } from 'admin/lib/api'
-    import { serverInfo } from 'gateway/lib/store'
-    import { adminPermissions } from 'admin/lib/store'
-    import SecretRefInput from 'common/SecretRefInput.svelte'
     import Input from 'ui/Input.svelte'
-    import Select from 'ui/Select.svelte'
     import { TlsMode } from 'admin/lib/api'
     import TlsConfiguration from '../TlsConfiguration.svelte'
 
@@ -28,13 +28,6 @@
     }
 
     let { options = $bindable() }: Props = $props()
-
-    const authOptions = $derived([
-        { value: 'Password', label: 'Password' },
-        ...($serverInfo?.runningOnEc2
-            ? [{ value: 'IamRole', label: 'IAM role' }]
-            : []),
-    ])
 </script>
 
 <h5>Connection</h5>
@@ -55,27 +48,6 @@
         }}
     />
 </div>
-
-<h5>Authentication</h5>
-
-<div class="row">
-    <Input label="Username" mono bind:value={options.username} />
-    {#if options.auth}
-        <Select
-            label="Authenticate using"
-            options={authOptions}
-            bind:value={options.auth.kind}
-        />
-    {/if}
-</div>
-
-{#if options.auth?.kind === 'Password'}
-    <SecretRefInput
-        bind:value={options.auth.password}
-        inlineLabel="Password"
-        disabled={!$adminPermissions.targetsEdit}
-    />
-{/if}
 
 <h5>Transport</h5>
 

@@ -156,20 +156,31 @@
             asyncComponent: () => import('./screens/user-detail/User.svelte'),
         }),
 
-        // ---- access roles ----
-        '/config/access-roles': wrap({
-            asyncComponent: () => import('./screens/Roles.svelte'),
+        // ---- access control ----
+        '/config/access-control': wrap({
+            asyncComponent: () =>
+                import('./screens/access-control/AccessControl.svelte'),
         }),
+        '/config/access-control/:tab': wrap({
+            asyncComponent: () =>
+                import('./screens/access-control/AccessControl.svelte'),
+        }),
+        // The two screens Access Control replaced: their links still land on it.
+        '/config/account-access': wrap({
+            asyncComponent: () =>
+                import('./screens/access-control/AccessControl.svelte'),
+        }),
+        '/config/access-roles': wrap({
+            asyncComponent: () =>
+                import('./screens/access-control/AccessControl.svelte'),
+            props: { defaultTab: 'groups' },
+        }),
+        // An access group's settings and members (a role).
         '/config/access-roles/create': wrap({
             asyncComponent: () => import('./config/CreateRole.svelte'),
         }),
         '/config/access-roles/:id': wrap({
             asyncComponent: () => import('./config/AccessRole.svelte'),
-        }),
-
-        // ---- account access ----
-        '/config/account-access': wrap({
-            asyncComponent: () => import('./screens/AccountAccess.svelte'),
         }),
 
         // ---- admin roles ----

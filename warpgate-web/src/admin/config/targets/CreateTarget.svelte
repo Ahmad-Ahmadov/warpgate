@@ -39,7 +39,9 @@
                     kind: TargetKind.Ssh,
                     host: '192.168.0.1',
                     port: DEFAULT_PORTS.Ssh,
-                    username: 'root',
+                    // Accounts are added on the target's page (Accounts), and
+                    // assigned to users in Access Control.
+                    username: '',
                     allowInsecureAlgos: false,
                     auth: {
                         kind: 'PublicKey' as const,
@@ -62,7 +64,7 @@
                         mode: TlsMode.Required,
                         verify: true,
                     },
-                    username: 'root',
+                    username: '',
                     auth: {
                         kind: 'Password' as const,
                         password: '',
@@ -76,7 +78,7 @@
                         mode: TlsMode.Required,
                         verify: true,
                     },
-                    username: 'postgres',
+                    username: '',
                     protocolVersion: '3.2' as const,
                     auth: {
                         kind: 'Password' as const,
@@ -108,7 +110,7 @@
                     kind: TargetKind.Rdp,
                     host: '192.168.0.1',
                     port: DEFAULT_PORTS.Rdp,
-                    username: 'Administrator',
+                    username: '',
                     auth: {
                         kind: 'Password' as const,
                         password: '',

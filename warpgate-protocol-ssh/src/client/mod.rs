@@ -29,11 +29,15 @@ use tracing::*;
 use uuid::Uuid;
 use warpgate_aws::AwsError;
 use warpgate_common::{
-    SSHTargetAuth, TargetOptionsVariant, TargetSSHOptions, UserFacingReason, UserSessionId,
-    WarpgateError, io_connect_reason,
+    SSHTargetAuth, TargetOptions, TargetOptionsVariant, TargetSSHOptions, UserFacingReason,
+    UserSessionId, WarpgateError, io_connect_reason,
 };
-use warpgate_core::account_binding::{BindingChoice, BoundUser, resolve_ssh_account};
+use warpgate_core::access_control::{
+    AccessError, ConnectingUser, ConnectionAccess, apply_account, primary_account, remote_username,
+    resolve_connection,
+};
 use warpgate_core::{AdmittedTarget, ConfigProvider, Services};
+use warpgate_db_entities::TargetAccount;
 
 use self::handler::ClientHandlerEvent;
 use super::{ChannelOperation, DirectTCPIPParams};
@@ -150,13 +154,33 @@ fn resolve_chain_ids(
     Ok(ids)
 }
 
-/// Resolve the full ordered SSH jump chain for a target
-/// `logged_in_username` is used to substitute empty dynamic usernames
-/// in targets' configs
+/// Sign a hop of the chain in as `account`: its name (or the Warpgate username, for an
+/// account that names none) and its credential.
+fn sign_in_as(
+    options: TargetSSHOptions,
+    username: &str,
+    account: &TargetAccount::Model,
+) -> Result<TargetSSHOptions, WarpgateError> {
+    let mut options = TargetOptions::Ssh(options);
+    apply_account(&mut options, username, account).map_err(WarpgateError::from)?;
+    match options {
+        TargetOptions::Ssh(options) => Ok(options),
+        _ => Err(WarpgateError::InvalidTarget),
+    }
+}
+
+/// Resolve the full ordered SSH jump chain for a target.
+///
+/// The destination signs in as `destination` (the account Access Control authorized, and
+/// the name it signs in with); without one (the administrators' diagnostic), as its primary
+/// account. Each jump host signs in as its own primary account: a hop is infrastructure the
+/// target's configuration routes through, not a target the user connects to.
+/// `logged_in_username` stands in for an account that names none.
 async fn resolve_ssh_chain(
     services: &Services,
     target_id: Uuid,
     logged_in_username: Option<&String>,
+    destination: Option<(String, TargetAccount::Model)>,
 ) -> Result<Vec<ResolvedSshChainHost>, WarpgateError> {
     let targets = services.config_provider.list_targets().await?;
 
@@ -167,94 +191,108 @@ async fn resolve_ssh_chain(
             .and_then(|t| TargetSSHOptions::extract(&t.options).map(|opts| opts.jump_host))
     })?;
 
+    let mut destination = destination;
     let mut jumps = vec![];
-    for id in chain_ids {
+    for (index, id) in chain_ids.into_iter().enumerate() {
         let Some(t) = targets.iter().find(|t| t.id == id) else {
             return Err(unresolvable_jump_host(id));
         };
         let Some(opts) = TargetSSHOptions::extract(&t.options) else {
             return Err(unresolvable_jump_host(id));
         };
-        let mut opts = opts.clone();
-
-        // Forward username from the authenticated user to the target, if target has no username
-        if let Some(logged_in_username) = logged_in_username
-            && opts.username.is_empty()
-        {
-            opts.username = logged_in_username.clone();
-        }
+        let (username, account) = match (index, destination.take()) {
+            (0, Some((username, account))) => (username, account),
+            _ => {
+                let Some(account) = primary_account(&services.db, id).await? else {
+                    return Err(WarpgateError::InvalidRequest(format!(
+                        "The SSH target {} has no primary account to sign in with as a jump host. Set one in its Accounts.",
+                        t.name
+                    )));
+                };
+                let username = if account.name.trim().is_empty() {
+                    logged_in_username.cloned().unwrap_or_default()
+                } else {
+                    account.name.trim().to_owned()
+                };
+                (username, account)
+            }
+        };
 
         jumps.push(ResolvedSshChainHost {
             name: t.name.clone(),
-            ssh_options: opts,
+            ssh_options: sign_in_as(opts.clone(), &username, &account)?,
         });
     }
     jumps.reverse();
     Ok(jumps)
 }
 
-/// Resolve a chain for the administrator-only host-key diagnostic. User
-/// connection paths must use [`resolve_approved_ssh_chain`] instead.
+/// Resolve a chain for the administrator-only host-key diagnostic, signing in as each
+/// target's primary account. User connection paths must use [`resolve_approved_ssh_chain`].
 pub async fn resolve_ssh_chain_for_admin(
     services: &Services,
     target_id: Uuid,
     admin_username: Option<&String>,
 ) -> Result<Vec<ResolvedSshChainHost>, WarpgateError> {
-    resolve_ssh_chain(services, target_id, admin_username).await
+    resolve_ssh_chain(services, target_id, admin_username, None).await
 }
 
 /// Resolve the target-side connection plan while consuming the capability
 /// minted for this target session.
 ///
-/// The destination's username is the account assigned to the user on the target, when
-/// accounts are assigned to them there (Access Control, account access): `account` picks
-/// among their own, and nothing a client sends can name another. Jump hosts keep the
-/// accounts they are set up with.
+/// The destination signs in as the account Access Control authorized for the user there
+/// ([`warpgate_core::access_control::resolve_connection`], decided now, after any approval):
+/// the only one they have, or the one the client asked for (native SSH `user:target:account`,
+/// or the browser's choice), and only ever one of their own. Several, and none asked for, is
+/// a refusal that says how to choose. SCP, SFTP and port forwarding run over this same
+/// connection, so they are held to the same account.
 pub async fn resolve_approved_ssh_chain(
     services: &Services,
     admitted: AdmittedTarget<TargetSSHOptions>,
-    account: BindingChoice,
 ) -> Result<Vec<ResolvedSshChainHost>, WarpgateError> {
     let user_info = admitted.user_info();
     let target = admitted.target();
-    let mut chain = resolve_ssh_chain(services, target.id, Some(&user_info.username)).await?;
-    let user = BoundUser {
+    let user = ConnectingUser {
         id: user_info.id,
         username: &user_info.username,
     };
-    let bound = resolve_ssh_account(
+    let refused = |error: AccessError| match error {
+        AccessError::Database(error) => WarpgateError::from(error),
+        error => {
+            warn!(user = %user_info.username, target = %target.name, %error, "No account to sign in to the SSH target with");
+            WarpgateError::InvalidRequest(error.user_message(&target.name))
+        }
+    };
+    let access = resolve_connection(
         &services.db,
         user,
-        target.id,
-        &target.name,
-        admitted.options(),
-        account,
+        target,
+        admitted.account_request(),
+        admitted.ticket_id().is_some(),
     )
     .await
-    .map_err(|error| {
-        warn!(user = %user_info.username, target = %target.name, %error, "No account to sign in to the SSH target with");
-        WarpgateError::InvalidRequest(error.user_message().into())
-    })?;
-    match (bound, chain.last_mut()) {
-        (Some(bound), Some(destination)) => {
-            info!(
-                user = %user_info.username,
-                target = %target.name,
-                target_account = %bound.username,
-                binding_id = %bound.binding_id,
-                "Signing in to the SSH target as the account assigned to the user"
-            );
-            destination.ssh_options.username = bound.username;
-        }
-        (None, Some(destination)) => info!(
-            user = %user_info.username,
-            target = %target.name,
-            target_account = %destination.ssh_options.username,
-            "Signing in to the SSH target as it is set up"
-        ),
-        (_, None) => {}
-    }
-    Ok(chain)
+    .map_err(refused)?;
+    let ConnectionAccess::Account(authorized) = access else {
+        return Err(WarpgateError::InvalidTarget);
+    };
+    let username = remote_username(&services.db, user, &authorized.account)
+        .await
+        .map_err(refused)?;
+    info!(
+        user = %user_info.username,
+        target = %target.name,
+        target_account = %username,
+        account_id = %authorized.account.id,
+        source = %authorized.describe_sources(),
+        "Signing in to the SSH target as the account Access Control authorized"
+    );
+    resolve_ssh_chain(
+        services,
+        target.id,
+        Some(&user_info.username),
+        Some((username, authorized.account)),
+    )
+    .await
 }
 
 #[derive(Debug)]

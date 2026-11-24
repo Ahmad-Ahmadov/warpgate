@@ -6,7 +6,7 @@ use tokio::sync::mpsc::Receiver;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info_span, warn};
 use warpgate_common::{TargetSSHOptions, UserFacingReason, UserSessionId, WarpgateError};
-use warpgate_core::account_binding::{BindingChoice, BoundUser, resolve_ssh_account};
+use warpgate_core::access_control::{ConnectingUser, resolve_connection};
 use warpgate_core::{Services, TargetAuthorization};
 use warpgate_db_entities::Parameters;
 use warpgate_db_entities::Parameters::SshHostKeyVerificationMode;
@@ -44,27 +44,26 @@ impl WebSshClientManager {
         services: &Services,
         authorization: TargetAuthorization,
         remote_address: Option<SocketAddr>,
-        account: BindingChoice,
     ) -> Result<UserSessionId, WarpgateError> {
         let authorization = authorization.narrow::<TargetSSHOptions>()?;
         // The account is settled before an approval is asked for: a user with none to use
-        // (or who named one that is not theirs) is told so now.
+        // (or who named one that is not theirs, or has several and named none) is told so
+        // now. It is decided again, fresh, when the connection is made.
         {
             let user_info = authorization.user_info();
             let target = authorization.target();
-            resolve_ssh_account(
+            resolve_connection(
                 &services.db,
-                BoundUser {
+                ConnectingUser {
                     id: user_info.id,
                     username: &user_info.username,
                 },
-                target.id,
-                &target.name,
-                authorization.options(),
-                account,
+                target,
+                authorization.account_request(),
+                authorization.ticket_id().is_some(),
             )
             .await
-            .map_err(|error| WarpgateError::InvalidRequest(error.user_message().into()))?;
+            .map_err(|error| WarpgateError::InvalidRequest(error.user_message(&target.name)))?;
         }
         let user_id = authorization.user_info().id;
         let username = authorization.user_info().username.clone();
@@ -114,7 +113,6 @@ impl WebSshClientManager {
                 session,
                 authorization,
                 remote_address,
-                account,
                 event_rx,
                 self.0.clone(),
                 services.clone(),
@@ -132,7 +130,6 @@ async fn run_session(
     session: Arc<WebSshSession>,
     authorization: TargetAuthorization<TargetSSHOptions>,
     remote_address: Option<SocketAddr>,
-    account: BindingChoice,
     mut event_rx: Receiver<RCEvent>,
     registry: ClientManager<WebSshSession>,
     services: Services,
@@ -145,7 +142,7 @@ async fn run_session(
         remote_address,
         |admitted| async {
             session.bind_target_session(admitted.id());
-            let last_error = match resolve_approved_ssh_chain(&services, admitted, account).await {
+            let last_error = match resolve_approved_ssh_chain(&services, admitted).await {
                 Ok(chain) => {
                     session.connect(chain.into_iter().map(|x| x.ssh_options).collect());
                     relay_events(&session, &mut event_rx, &services).await

@@ -59,12 +59,34 @@ impl<O: TargetOptionsVariant> SpecificTarget<O> {
     pub const fn protocol(&self) -> Protocol {
         O::PROTOCOL
     }
+
+    /// The same target with `change` applied to its options (both the full target's and the
+    /// narrowed copy). For filling in the account a connection was authorized to sign in as;
+    /// the capabilities that hold a `SpecificTarget` only offer it to the code that authorizes.
+    pub fn with_options(
+        mut self,
+        change: impl FnOnce(&mut TargetOptions),
+    ) -> Result<Self, WarpgateError> {
+        change(&mut self.target.options);
+        self.options = O::extract(&self.target.options)
+            .ok_or(WarpgateError::InvalidTarget)?
+            .clone();
+        Ok(self)
+    }
 }
 
 impl SpecificTarget<TargetOptions> {
     pub fn any(target: Target) -> Self {
         let options = target.options.clone();
         Self { target, options }
+    }
+
+    /// [`SpecificTarget::with_options`] for a target not narrowed to a protocol.
+    #[must_use]
+    pub fn with_any_options(mut self, change: impl FnOnce(&mut TargetOptions)) -> Self {
+        change(&mut self.target.options);
+        self.options = self.target.options.clone();
+        self
     }
 
     pub fn narrow<O: TargetOptionsVariant>(self) -> Result<SpecificTarget<O>, WarpgateError> {

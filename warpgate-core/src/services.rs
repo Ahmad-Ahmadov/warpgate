@@ -140,10 +140,11 @@ impl Services {
         self.close_admitted_sessions(AdmittedSessions(ids)).await
     }
 
-    /// Close sessions whose role-based access has ended: their user no longer
-    /// holds an active role assignment (not expired, not revoked) that grants
-    /// the target. Ticket-admitted sessions are left to the ticket sweep.
-    pub async fn close_sessions_without_role_access(&self) -> Result<(), WarpgateError> {
+    /// Close sessions whose access has ended: their user no longer holds a usable
+    /// Access Control assignment on the target (revoked, disabled, expired, its
+    /// account disabled or deleted, the group membership behind it ended, or the
+    /// user excluded from it). Ticket-admitted sessions are left to the ticket sweep.
+    pub async fn close_sessions_without_access(&self) -> Result<(), WarpgateError> {
         let open: Vec<(UserSessionId, Uuid, Option<Uuid>)> = TargetSession::Entity::find()
             .join(
                 JoinType::InnerJoin,
@@ -286,8 +287,8 @@ impl Services {
                     if let Err(error) = services.close_sessions_of_expired_tickets().await {
                         warn!("Failed to close sessions of expired tickets: {error}");
                     }
-                    if let Err(error) = services.close_sessions_without_role_access().await {
-                        warn!("Failed to close sessions without role access: {error}");
+                    if let Err(error) = services.close_sessions_without_access().await {
+                        warn!("Failed to close sessions without access: {error}");
                     }
                 }
             });

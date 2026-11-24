@@ -42,10 +42,8 @@ use ironrdp_tokio::{FramedWrite as _, TokioFramed};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tracing::{debug, warn};
-use warpgate_common::{
-    RdpTargetAuth, RdpTargetCompression, SecretResolver, TargetRdpOptions, WarpgateError,
-};
-use warpgate_core::rdp_account::TargetCredentials;
+use warpgate_common::{RdpTargetCompression, SecretResolver, TargetRdpOptions, WarpgateError};
+use warpgate_core::rdp_account::{StoredCredential, TargetCredentials};
 use warpgate_core::{
     DESKTOP_CONNECT_TIMEOUT, DESKTOP_HANDSHAKE_TIMEOUT, DesktopConnectionError, DesktopEvent,
     DesktopInput, DesktopRect, DesktopState, check_desktop_size, within_deadline,
@@ -98,6 +96,7 @@ pub async fn run(
     mut logon: LogonWatcher,
     secrets: Arc<dyn SecretResolver>,
     credentials: Option<TargetCredentials>,
+    stored: Option<StoredCredential>,
 ) -> Result<(), DesktopConnectionError> {
     event_tx
         .send(DesktopEvent::State(DesktopState::Connecting))
@@ -109,17 +108,18 @@ pub async fn run(
     let (width, height) = bound_desktop_size(width, height);
     let (width, height) =
         MonitorLayoutEntry::adjust_display_size(u32::from(width), u32::from(height));
-    // Who the target is signed in to as: the stored account and its stored (or vaulted)
-    // password, or an account the user may use (their own directory account, or one assigned
-    // to them) with the password they typed, which is dropped, and wiped, right after.
-    let config = match (credentials, &options.auth) {
-        (None, RdpTargetAuth::Password(auth)) => {
-            let password = auth.password.resolve(&*secrets).await?;
+    // Who the target is signed in to as: an account and its stored (or vaulted) password, or
+    // an account the user may use (their own directory account, or one assigned to them)
+    // with the password they typed, which is dropped, and wiped, right after. Either way the
+    // account Access Control authorized: the target's own settings name none.
+    let config = match (credentials, stored) {
+        (None, Some(stored)) => {
+            let password = stored.password.resolve(&*secrets).await?;
             build_config(
                 &options,
                 SignInAs {
-                    username: &options.username,
-                    domain: options.domain.as_deref(),
+                    username: &stored.account.username,
+                    domain: stored.account.domain.as_deref(),
                     password: password.expose_secret(),
                     interactive: options.interactive_logon,
                 },
@@ -145,9 +145,9 @@ pub async fn run(
                 keyboard_layout,
             )
         }
-        (None, RdpTargetAuth::DomainAccount(_) | RdpTargetAuth::LocalAccount(_)) => {
+        (None, None) => {
             return Err(WarpgateError::InvalidRequest(
-                "This target has no stored password, and no account password was given".into(),
+                "No account was authorized to sign in to this target with".into(),
             )
             .into());
         }
@@ -911,12 +911,11 @@ pub(crate) fn test_connector_config(username: &str, password: &str) -> connector
         username: username.to_owned(),
         domain: None,
         kdc_url: None,
-        auth: RdpTargetAuth::default(),
+        auth: warpgate_common::RdpTargetAuth::default(),
         verify_tls: false,
         compression: RdpTargetCompression::default(),
         interactive_logon: false,
         tls_security: warpgate_common::RdpTlsSecurity::default(),
-        require_account_binding: false,
     };
     let mut config = build_config(
         &options,

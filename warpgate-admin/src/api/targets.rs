@@ -10,6 +10,7 @@ use warpgate_common::{
 };
 use warpgate_common_http::errors::invalid_field;
 use warpgate_core::resources::ResourceError;
+use warpgate_core::resources::target_accounts::show_primaries;
 use warpgate_core::resources::targets::{self as store, TargetDataRequest};
 use warpgate_db_entities::Target::fuzzy_filter_targets;
 use warpgate_db_entities::{KnownHost, Role, Target, TargetGroup};
@@ -71,10 +72,13 @@ impl ListApi {
         let targets =
             fuzzy_filter_targets(&all_targets, &groups, search.as_deref().unwrap_or_default());
 
-        let targets = targets
+        let mut targets = targets
             .into_iter()
             .map(|t| maybe_redacted_target(&admin, t.clone()))
             .collect::<Result<Vec<_>, _>>()?;
+        // The primary account in the legacy fields, with no secret, for API clients written
+        // before target accounts.
+        show_primaries(db, &mut targets).await?;
 
         Ok(GetTargetsResponse::Ok(Json(targets)))
     }
@@ -87,10 +91,14 @@ impl ListApi {
     ) -> Result<CreateTargetResponse, WarpgateError> {
         admin.require(AdminPermission::TargetsCreate)?;
 
-        match store::create(&admin.services().db, &body).await {
-            Ok(target) => Ok(CreateTargetResponse::Created(Json(maybe_redacted_target(
-                &admin, target,
-            )?))),
+        let db = &admin.services().db;
+        match store::create(db, &body, Some(admin.auth.user_id())).await {
+            Ok(target) => {
+                let mut target = [maybe_redacted_target(&admin, target)?];
+                show_primaries(db, &mut target).await?;
+                let [target] = target;
+                Ok(CreateTargetResponse::Created(Json(target)))
+            }
             Err(ResourceError::EmptyName) => Ok(CreateTargetResponse::BadRequest(invalid_field(
                 "name",
                 "target name is empty",
@@ -98,6 +106,10 @@ impl ListApi {
             Err(ResourceError::NameTaken) => Ok(CreateTargetResponse::Conflict(Json(
                 "Name already exists".into(),
             ))),
+            // The account its settings named cannot be an account of it (see Accounts).
+            Err(ResourceError::Invalid(message)) => {
+                Ok(CreateTargetResponse::BadRequest(Json(message.into())))
+            }
             Err(err) => Err(err.into()),
         }
     }
@@ -162,9 +174,10 @@ impl DetailApi {
             return Ok(GetTargetResponse::NotFound);
         };
 
-        Ok(GetTargetResponse::Ok(Json(maybe_redacted_target(
-            &admin, target,
-        )?)))
+        let mut target = [maybe_redacted_target(&admin, target)?];
+        show_primaries(db, &mut target).await?;
+        let [target] = target;
+        Ok(GetTargetResponse::Ok(Json(target)))
     }
 
     #[oai(path = "/targets/:id", method = "put", operation_id = "update_target")]
@@ -177,7 +190,9 @@ impl DetailApi {
         admin.require(AdminPermission::TargetsEdit)?;
 
         let services = admin.services();
-        let target = match store::update(&services.db, id.0, &body).await {
+        let target = match store::update(&services.db, id.0, &body, Some(admin.auth.user_id()))
+            .await
+        {
             Ok(target) => target,
             Err(ResourceError::EmptyName) => {
                 warn!("Rejecting request: target name is empty");
@@ -193,6 +208,10 @@ impl DetailApi {
                 )));
             }
             Err(ResourceError::NotFound) => return Ok(UpdateTargetResponse::NotFound),
+            Err(ResourceError::Invalid(message)) => {
+                warn!("Rejecting request: {message}");
+                return Ok(UpdateTargetResponse::BadRequest);
+            }
             Err(err) => return Err(err.into()),
         };
 
@@ -202,9 +221,10 @@ impl DetailApi {
         )
         .await?;
 
-        Ok(UpdateTargetResponse::Ok(Json(
-            target.try_into().map_err(WarpgateError::from)?,
-        )))
+        let mut target: [TargetConfig; 1] = [target.try_into().map_err(WarpgateError::from)?];
+        show_primaries(&services.db, &mut target).await?;
+        let [target] = target;
+        Ok(UpdateTargetResponse::Ok(Json(target)))
     }
 
     #[oai(
@@ -283,8 +303,12 @@ enum GetTargetRolesResponse {
 enum AddTargetRoleResponse {
     #[oai(status = 201)]
     Created,
+    /// The role already grants the target; or the target has accounts and no primary one to
+    /// grant, in which case grant one of its accounts in Access Control, Access groups.
     #[oai(status = 409)]
-    AlreadyExists,
+    AlreadyExists(Json<String>),
+    #[oai(status = 404)]
+    NotFound,
 }
 
 #[derive(ApiResponse)]
@@ -339,9 +363,50 @@ impl RolesApi {
     ) -> Result<AddTargetRoleResponse, WarpgateError> {
         admin.require(AdminPermission::AccessRolesAssign)?;
 
-        match store::add_role(&admin.services().db, id.0, role_id.0).await {
-            Ok(()) => Ok(AddTargetRoleResponse::Created),
-            Err(ResourceError::RoleAlreadyAssigned) => Ok(AddTargetRoleResponse::AlreadyExists),
+        // Translated into Access Control: the role's access group is granted the target's
+        // primary account (or the target, on a protocol without accounts), and the change
+        // is audited as any other grant.
+        let db = &admin.services().db;
+        match store::add_role(db, id.0, role_id.0, Some(admin.auth.user_id())).await {
+            Ok(grant) => {
+                let group_name = Role::Entity::find_by_id(grant.role_id)
+                    .one(db)
+                    .await?
+                    .map(|role| role.name)
+                    .unwrap_or_default();
+                let target_name = Target::Entity::find_by_id(grant.target_id)
+                    .one(db)
+                    .await?
+                    .map(|target| target.name)
+                    .unwrap_or_default();
+                warpgate_common::audit::AuditEvent::AccessGroupGrantChanged {
+                    action: "added".into(),
+                    group_id: grant.role_id,
+                    group_name,
+                    target_id: grant.target_id,
+                    target_name,
+                    account: if grant.target_account_id.is_some() {
+                        "the target's primary account".into()
+                    } else {
+                        String::new()
+                    },
+                    account_id: grant.target_account_id,
+                    affected_users: "the group's members (legacy role API)".into(),
+                    actor_user_id: admin.auth.user_id(),
+                }
+                .emit();
+                Ok(AddTargetRoleResponse::Created)
+            }
+            Err(ResourceError::RoleAlreadyAssigned) => Ok(AddTargetRoleResponse::AlreadyExists(
+                Json("The role already grants this target".into()),
+            )),
+            Err(ResourceError::NoPrimaryAccount) => Ok(AddTargetRoleResponse::AlreadyExists(Json(
+                ResourceError::NoPrimaryAccount.to_string(),
+            ))),
+            Err(ResourceError::NotFound) => Ok(AddTargetRoleResponse::NotFound),
+            Err(ResourceError::Invalid(message)) => {
+                Ok(AddTargetRoleResponse::AlreadyExists(Json(message.into())))
+            }
             Err(err) => Err(err.into()),
         }
     }
@@ -359,8 +424,27 @@ impl RolesApi {
     ) -> Result<DeleteTargetRoleResponse, WarpgateError> {
         admin.require(AdminPermission::AccessRolesAssign)?;
 
-        match store::remove_role(&admin.services().db, id.0, role_id.0).await {
-            Ok(()) => Ok(DeleteTargetRoleResponse::Deleted),
+        let services = admin.services();
+        match store::remove_role(&services.db, id.0, role_id.0).await {
+            Ok(grants) => {
+                for grant in &grants {
+                    warpgate_common::audit::AuditEvent::AccessGroupGrantChanged {
+                        action: "removed".into(),
+                        group_id: grant.role_id,
+                        group_name: String::new(),
+                        target_id: grant.target_id,
+                        target_name: String::new(),
+                        account: String::new(),
+                        account_id: grant.target_account_id,
+                        affected_users: "the group's members (legacy role API)".into(),
+                        actor_user_id: admin.auth.user_id(),
+                    }
+                    .emit();
+                }
+                // Sessions the group admitted end now rather than at the next sweep.
+                services.close_sessions_without_access().await?;
+                Ok(DeleteTargetRoleResponse::Deleted)
+            }
             Err(ResourceError::NotFound) => Ok(DeleteTargetRoleResponse::NotFound),
             Err(err) => Err(err.into()),
         }

@@ -1,0 +1,1002 @@
+<script lang="ts">
+    /**
+     * Access Control → Assignments: every effective assignment, direct and
+     * group-derived, with where it comes from and whether it can be used now.
+     *
+     * A direct assignment is edited, disabled or revoked here. A group-derived
+     * one is changed through its group, or taken away from one member alone by
+     * excluding them from the group's grant, which leaves their own direct
+     * assignments untouched. Bulk actions apply to direct assignments only, and
+     * always show what they would change first.
+     */
+    import {
+        type AccessAssignment,
+        AccessAssignmentBulkAction,
+        type AccessAssignmentOptions,
+        AccessAssignmentSource,
+        AccessAssignmentStatus,
+        api,
+        type Target,
+        TargetAccountAuthMethod,
+        type User,
+    } from 'admin/lib/api'
+    import { stringifyError } from 'common/errors'
+    import Badge from 'ui/Badge.svelte'
+    import Button from 'ui/Button.svelte'
+    import Callout from 'ui/Callout.svelte'
+    import Checkbox from 'ui/Checkbox.svelte'
+    import ConfirmDialog from 'ui/ConfirmDialog.svelte'
+    import EmptyState from 'ui/EmptyState.svelte'
+    import Input from 'ui/Input.svelte'
+    import Modal from 'ui/Modal.svelte'
+    import Select from 'ui/Select.svelte'
+    import SkeletonRow from 'ui/SkeletonRow.svelte'
+    import Toggle from 'ui/Toggle.svelte'
+    import { toast } from 'ui/toasts.svelte'
+    import { adminPermissions } from '../../lib/store'
+
+    interface Props {
+        initialUser?: string
+        initialTarget?: string
+    }
+
+    let { initialUser = '', initialTarget = '' }: Props = $props()
+
+    const METHOD_LABELS: Record<TargetAccountAuthMethod, string> = {
+        [TargetAccountAuthMethod.StoredCredential]: 'Stored credential',
+        [TargetAccountAuthMethod.TypedPassword]: 'Password typed when connecting',
+        [TargetAccountAuthMethod.DirectoryPassword]: "User's own directory password",
+    }
+
+    const STATUS_LABELS: Record<AccessAssignmentStatus, string> = {
+        [AccessAssignmentStatus.Active]: 'Active',
+        [AccessAssignmentStatus.Disabled]: 'Disabled',
+        [AccessAssignmentStatus.Expired]: 'Expired',
+        [AccessAssignmentStatus.Excluded]: 'Excluded',
+        [AccessAssignmentStatus.Invalid]: 'Not usable',
+    }
+
+    let assignments = $state<AccessAssignment[]>([])
+    let users = $state<User[]>([])
+    let targets = $state<Target[]>([])
+    let loading = $state(true)
+    let error = $state<string | null>(null)
+
+    // svelte-ignore state_referenced_locally
+    let filterUser = $state(initialUser)
+    // svelte-ignore state_referenced_locally
+    let filterTarget = $state(initialTarget)
+    let filterSource = $state('')
+    let filterStatus = $state('')
+    let search = $state('')
+
+    const sortedUsers = $derived(
+        [...users].sort((a, b) => a.username.localeCompare(b.username)),
+    )
+    const sortedTargets = $derived(
+        [...targets].sort((a, b) => a.name.localeCompare(b.name)),
+    )
+
+    const shown = $derived.by(() => {
+        const needle = search.trim().toLowerCase()
+        return assignments.filter(
+            a =>
+                (!filterUser || a.userId === filterUser) &&
+                (!filterTarget || a.targetId === filterTarget) &&
+                (!filterSource || a.source === filterSource) &&
+                (!filterStatus || a.status === filterStatus) &&
+                (!needle ||
+                    [a.username, a.targetName, a.account ?? '', a.groupName ?? '']
+                        .join(' ')
+                        .toLowerCase()
+                        .includes(needle)),
+        )
+    })
+
+    function rowKey(a: AccessAssignment): string {
+        return a.id ?? `${a.grantId}:${a.userId}`
+    }
+
+    async function load() {
+        loading = true
+        error = null
+        try {
+            ;[assignments, users, targets] = await Promise.all([
+                api.listAccessAssignments({}),
+                api.getUsers(),
+                api.getTargets(),
+            ])
+            selected = new Set(
+                [...selected].filter(id =>
+                    assignments.some(a => a.id === id),
+                ),
+            )
+        } catch (e) {
+            error = await stringifyError(e)
+        } finally {
+            loading = false
+        }
+    }
+
+    function targetKind(id: string): string {
+        return targets.find(t => t.id === id)?.options.kind ?? ''
+    }
+
+    // ---- selection and bulk actions (direct assignments only) ----
+    let selected = $state(new Set<string>())
+    const selectable = $derived(
+        shown.filter(a => a.source === AccessAssignmentSource.Direct && a.id),
+    )
+    const allSelected = $derived(
+        selectable.length > 0 &&
+            selectable.every(a => a.id && selected.has(a.id)),
+    )
+
+    function toggle(id: string | undefined, on: boolean) {
+        if (!id) {
+            return
+        }
+        const next = new Set(selected)
+        if (on) {
+            next.add(id)
+        } else {
+            next.delete(id)
+        }
+        selected = next
+    }
+
+    function toggleAll(on: boolean) {
+        selected = on
+            ? new Set(selectable.map(a => a.id).filter((id): id is string => !!id))
+            : new Set()
+    }
+
+    let bulkAction = $state<AccessAssignmentBulkAction | null>(null)
+    let bulkSummary = $state('')
+    let bulkUsers = $state<string[]>([])
+
+    async function previewBulk(action: AccessAssignmentBulkAction) {
+        try {
+            const preview = await api.bulkUpdateAccessAssignments({
+                bulkAccessAssignmentRequest: {
+                    ids: [...selected],
+                    action,
+                    dryRun: true,
+                },
+            })
+            bulkAction = action
+            bulkSummary = preview.summary
+            bulkUsers = [
+                ...new Set(
+                    preview.affected.map(a => `${a.username} → ${a.targetName}`),
+                ),
+            ]
+        } catch (e) {
+            error = await stringifyError(e)
+        }
+    }
+
+    async function applyBulk() {
+        if (!bulkAction) {
+            return
+        }
+        try {
+            const result = await api.bulkUpdateAccessAssignments({
+                bulkAccessAssignmentRequest: {
+                    ids: [...selected],
+                    action: bulkAction,
+                    dryRun: false,
+                },
+            })
+            toast.success(result.summary)
+            selected = new Set()
+            bulkAction = null
+            await load()
+        } catch (e) {
+            error = await stringifyError(e)
+            bulkAction = null
+        }
+    }
+
+    // ---- the add / edit dialog ----
+    let editorOpen = $state(false)
+    let editing = $state<AccessAssignment | null>(null)
+    let userSearch = $state('')
+    let userId = $state('')
+    let targetId = $state('')
+    let accountId = $state('')
+    let enabled = $state(true)
+    let expiresAt = $state('')
+    let note = $state('')
+    let options = $state<AccessAssignmentOptions | null>(null)
+    let optionsError = $state<string | null>(null)
+    let saving = $state(false)
+    let saveError = $state<string | null>(null)
+
+    const userOptions = $derived([
+        { value: '', label: 'Select a user…' },
+        ...sortedUsers
+            .filter(u =>
+                u.username
+                    .toLowerCase()
+                    .includes(userSearch.trim().toLowerCase()),
+            )
+            .map(u => ({
+                value: u.id,
+                label: u.ldapServerId
+                    ? `${u.username} (linked to LDAP / AD)`
+                    : u.username,
+            })),
+    ])
+    const targetOptions = $derived([
+        { value: '', label: 'Select a target…' },
+        ...sortedTargets.map(t => ({
+            value: t.id,
+            label: `${t.name} (${t.options.kind})`,
+        })),
+    ])
+    const accountOptions = $derived([
+        { value: '', label: 'Select an account…' },
+        ...(options?.accounts ?? []).map(a => ({
+            value: a.id,
+            label: a.problem
+                ? `${a.signsInAs ?? a.account} (${a.problem})`
+                : (a.signsInAs ?? a.account),
+            disabled: !!a.problem && a.id !== editing?.accountId,
+        })),
+    ])
+    const chosenAccount = $derived(
+        options?.accounts.find(a => a.id === accountId),
+    )
+    const chosenUser = $derived(users.find(u => u.id === userId))
+    const chosenTarget = $derived(targets.find(t => t.id === targetId))
+    const canSave = $derived(
+        !!userId &&
+            !!targetId &&
+            !!options &&
+            (!options.usesAccounts || !!accountId) &&
+            !saving,
+    )
+
+    // What can be assigned depends on the user and the target: ask the server.
+    $effect(() => {
+        const user = userId
+        const target = targetId
+        options = null
+        optionsError = null
+        if (!user || !target) {
+            return
+        }
+        let cancelled = false
+        api.getAccessAssignmentOptions({ userId: user, targetId: target })
+            .then(loaded => {
+                if (!cancelled) {
+                    options = loaded
+                    const usable = loaded.accounts.filter(a => !a.problem)
+                    const only = usable[0]
+                    if (!editing && !accountId && usable.length === 1 && only) {
+                        accountId = only.id
+                    }
+                }
+            })
+            .catch(async e => {
+                if (!cancelled) {
+                    optionsError = await stringifyError(e)
+                }
+            })
+        return () => {
+            cancelled = true
+        }
+    })
+
+    function toLocalInput(date?: Date): string {
+        if (!date) {
+            return ''
+        }
+        const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000)
+        return local.toISOString().slice(0, 16)
+    }
+
+    function openAdd() {
+        editing = null
+        userSearch = ''
+        userId = filterUser
+        targetId = filterTarget
+        accountId = ''
+        enabled = true
+        expiresAt = ''
+        note = ''
+        saveError = null
+        editorOpen = true
+    }
+
+    function openEdit(a: AccessAssignment) {
+        editing = a
+        userSearch = ''
+        userId = a.userId
+        targetId = a.targetId
+        accountId = a.accountId ?? ''
+        enabled = a.enabled
+        expiresAt = toLocalInput(a.expiresAt)
+        note = a.note
+        saveError = null
+        editorOpen = true
+    }
+
+    async function save() {
+        saving = true
+        saveError = null
+        const expires = expiresAt ? new Date(expiresAt) : undefined
+        try {
+            if (editing?.id) {
+                await api.updateAccessAssignment({
+                    id: editing.id,
+                    updateAccessAssignmentRequest: {
+                        accountId: accountId || undefined,
+                        enabled,
+                        expiresAt: expires,
+                        note,
+                    },
+                })
+                toast.success('Assignment updated')
+            } else {
+                await api.createAccessAssignment({
+                    createAccessAssignmentRequest: {
+                        userId,
+                        targetId,
+                        accountId: accountId || undefined,
+                        enabled,
+                        expiresAt: expires,
+                        note,
+                    },
+                })
+                toast.success('Access assigned')
+            }
+            editorOpen = false
+            await load()
+        } catch (e) {
+            saveError = await stringifyError(e)
+        } finally {
+            saving = false
+        }
+    }
+
+    async function setEnabled(a: AccessAssignment, value: boolean) {
+        if (!a.id) {
+            return
+        }
+        try {
+            await api.updateAccessAssignment({
+                id: a.id,
+                updateAccessAssignmentRequest: {
+                    accountId: a.accountId,
+                    enabled: value,
+                    expiresAt: a.expiresAt,
+                    note: a.note,
+                },
+            })
+            toast.success(value ? 'Assignment enabled' : 'Assignment disabled')
+            await load()
+        } catch (e) {
+            error = await stringifyError(e)
+        }
+    }
+
+    // ---- revoking, excluding, restoring ----
+    let revoking = $state<AccessAssignment | null>(null)
+    let excluding = $state<AccessAssignment | null>(null)
+
+    async function revoke() {
+        const target = revoking
+        revoking = null
+        if (!target?.id) {
+            return
+        }
+        try {
+            await api.deleteAccessAssignment({ id: target.id })
+            toast.success('Assignment revoked')
+            await load()
+        } catch (e) {
+            error = await stringifyError(e)
+        }
+    }
+
+    async function exclude() {
+        const target = excluding
+        excluding = null
+        if (!target?.grantId) {
+            return
+        }
+        try {
+            await api.excludeFromAccessGroupGrant({
+                grantId: target.grantId,
+                excludeFromGrantRequest: { userId: target.userId, note: '' },
+            })
+            toast.success(`${target.username} excluded from the group's grant`)
+            await load()
+        } catch (e) {
+            error = await stringifyError(e)
+        }
+    }
+
+    async function restore(a: AccessAssignment) {
+        if (!a.exclusionId) {
+            return
+        }
+        try {
+            await api.deleteAccessGroupExclusion({ id: a.exclusionId })
+            toast.success(`${a.username} restored to the group's grant`)
+            await load()
+        } catch (e) {
+            error = await stringifyError(e)
+        }
+    }
+
+    function statusTone(status: AccessAssignmentStatus) {
+        switch (status) {
+            case AccessAssignmentStatus.Active:
+                return 'success' as const
+            case AccessAssignmentStatus.Disabled:
+            case AccessAssignmentStatus.Excluded:
+                return 'neutral' as const
+            default:
+                return 'warning' as const
+        }
+    }
+
+    load()
+</script>
+
+<div class="toolbar">
+    <Input
+        label="Search"
+        labelHidden
+        type="search"
+        placeholder="Search users, targets, accounts, groups"
+        class="search"
+        bind:value={search}
+    />
+    <Select
+        label="User"
+        labelHidden
+        size="compact"
+        class="filter"
+        options={[
+            { value: '', label: 'All users' },
+            ...sortedUsers.map(u => ({ value: u.id, label: u.username })),
+        ]}
+        bind:value={filterUser}
+    />
+    <Select
+        label="Target"
+        labelHidden
+        size="compact"
+        class="filter"
+        options={[
+            { value: '', label: 'All targets' },
+            ...sortedTargets.map(t => ({ value: t.id, label: t.name })),
+        ]}
+        bind:value={filterTarget}
+    />
+    <Select
+        label="Source"
+        labelHidden
+        size="compact"
+        class="filter"
+        options={[
+            { value: '', label: 'Direct and group' },
+            { value: AccessAssignmentSource.Direct, label: 'Direct' },
+            { value: AccessAssignmentSource.Group, label: 'Access groups' },
+        ]}
+        bind:value={filterSource}
+    />
+    <Select
+        label="Status"
+        labelHidden
+        size="compact"
+        class="filter"
+        options={[
+            { value: '', label: 'Any status' },
+            ...Object.values(AccessAssignmentStatus).map(s => ({
+                value: s,
+                label: STATUS_LABELS[s],
+            })),
+        ]}
+        bind:value={filterStatus}
+    />
+    <div class="toolbar-end">
+        <Button
+            variant="primary"
+            size="compact"
+            disabled={!$adminPermissions.accessRolesAssign}
+            onclick={openAdd}
+        >
+            Assign access
+        </Button>
+    </div>
+</div>
+
+{#if selected.size}
+    <section class="bulk" aria-label="Bulk actions">
+        <span>{selected.size} direct assignment{selected.size === 1 ? '' : 's'} selected</span>
+        <Button size="compact" onclick={() => previewBulk(AccessAssignmentBulkAction.Enable)}>
+            Enable
+        </Button>
+        <Button size="compact" onclick={() => previewBulk(AccessAssignmentBulkAction.Disable)}>
+            Disable
+        </Button>
+        <Button
+            size="compact"
+            variant="destructive"
+            onclick={() => previewBulk(AccessAssignmentBulkAction.Revoke)}
+        >
+            Revoke
+        </Button>
+        <Button size="compact" variant="ghost" onclick={() => (selected = new Set())}>
+            Clear
+        </Button>
+    </section>
+{/if}
+
+{#if error}
+    <Callout tone="danger" title="Something went wrong">{error}</Callout>
+{/if}
+
+{#if loading}
+    <SkeletonRow rows={5} columns={[1, 2, 2, 1, 2, 2, 2, 1, 1]} />
+{:else if !shown.length}
+    <EmptyState
+        title={assignments.length ? 'Nothing matches' : 'No access assigned'}
+        hint="Users connect to a target only through an assignment: direct, or through an access group."
+    >
+        {#snippet action()}
+            <Button
+                variant="primary"
+                size="compact"
+                disabled={!$adminPermissions.accessRolesAssign}
+                onclick={openAdd}
+            >
+                Assign access
+            </Button>
+        {/snippet}
+    </EmptyState>
+{:else}
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th scope="col" class="check">
+                        <Checkbox
+                            label="Select all direct assignments shown"
+                            labelHidden
+                            checked={allSelected}
+                            disabled={!selectable.length || !$adminPermissions.accessRolesAssign}
+                            onchange={e => toggleAll((e.target as HTMLInputElement).checked)}
+                        />
+                    </th>
+                    <th scope="col">User</th>
+                    <th scope="col">Target</th>
+                    <th scope="col">Protocol</th>
+                    <th scope="col">Remote account</th>
+                    <th scope="col">Authentication</th>
+                    <th scope="col">Source</th>
+                    <th scope="col">Status</th>
+                    <th scope="col">Expires</th>
+                    <th scope="col"><span class="visually-hidden">Actions</span></th>
+                </tr>
+            </thead>
+            <tbody>
+                {#each shown as a (rowKey(a))}
+                    <tr>
+                        <td class="check">
+                            {#if a.source === AccessAssignmentSource.Direct && a.id}
+                                <Checkbox
+                                    label="Select {a.username} on {a.targetName}"
+                                    labelHidden
+                                    checked={selected.has(a.id)}
+                                    disabled={!$adminPermissions.accessRolesAssign}
+                                    onchange={e =>
+                                        toggle(a.id, (e.target as HTMLInputElement).checked)}
+                                />
+                            {/if}
+                        </td>
+                        <td>
+                            <a href="#/config/users/{a.userId}">
+                                {a.username || '(deleted user)'}
+                            </a>
+                        </td>
+                        <td>
+                            <a href="#/config/targets/{a.targetId}">
+                                {a.targetName || '(deleted target)'}
+                            </a>
+                        </td>
+                        <td class="wg-mono">{a.protocol.toUpperCase()}</td>
+                        <td class="wg-mono">{a.account ?? '—'}</td>
+                        <td>
+                            {#if a.authMethod}
+                                <span title={a.credentialSource}>
+                                    {METHOD_LABELS[a.authMethod]}
+                                </span>
+                            {:else}
+                                <span class="muted">Target entitlement</span>
+                            {/if}
+                        </td>
+                        <td>
+                            {#if a.source === AccessAssignmentSource.Group}
+                                <Badge
+                                    tone="primary"
+                                    href="#/config/access-control/groups?group={a.groupId}"
+                                >
+                                    Group: {a.groupName}
+                                </Badge>
+                            {:else}
+                                <Badge>
+                                    Direct{a.origin && a.origin !== 'direct' ? ` (${a.origin})` : ''}
+                                </Badge>
+                            {/if}
+                        </td>
+                        <td>
+                            <div class="status">
+                                <Badge tone={statusTone(a.status)}>
+                                    {STATUS_LABELS[a.status]}
+                                </Badge>
+                                {#if a.problem && a.status === AccessAssignmentStatus.Invalid}
+                                    <span class="problem">{a.problem}</span>
+                                {/if}
+                            </div>
+                        </td>
+                        <td class="muted">
+                            {a.expiresAt ? a.expiresAt.toLocaleString() : 'Never'}
+                        </td>
+                        <td>
+                            <div class="row-actions">
+                                {#if a.source === AccessAssignmentSource.Direct}
+                                    <Button
+                                        variant="ghost"
+                                        size="compact"
+                                        disabled={!$adminPermissions.accessRolesAssign}
+                                        onclick={() => openEdit(a)}
+                                    >
+                                        Edit
+                                    </Button>
+                                    <Button
+                                        variant="ghost"
+                                        size="compact"
+                                        disabled={!$adminPermissions.accessRolesAssign}
+                                        onclick={() => setEnabled(a, !a.enabled)}
+                                    >
+                                        {a.enabled ? 'Disable' : 'Enable'}
+                                    </Button>
+                                    <Button
+                                        variant="destructive"
+                                        size="compact"
+                                        disabled={!$adminPermissions.accessRolesAssign}
+                                        onclick={() => (revoking = a)}
+                                    >
+                                        Revoke
+                                    </Button>
+                                {:else if a.exclusionId}
+                                    <Button
+                                        variant="ghost"
+                                        size="compact"
+                                        disabled={!$adminPermissions.accessRolesAssign}
+                                        onclick={() => restore(a)}
+                                    >
+                                        Restore
+                                    </Button>
+                                {:else}
+                                    <Button
+                                        variant="destructive"
+                                        size="compact"
+                                        disabled={!$adminPermissions.accessRolesAssign}
+                                        onclick={() => (excluding = a)}
+                                    >
+                                        Exclude
+                                    </Button>
+                                {/if}
+                            </div>
+                        </td>
+                    </tr>
+                {/each}
+            </tbody>
+        </table>
+    </div>
+{/if}
+
+<Modal
+    bind:open={editorOpen}
+    title={editing ? 'Edit assignment' : 'Assign access'}
+    size="md"
+>
+    <div class="editor">
+        {#if !editing}
+            <Input
+                label="Find a user"
+                type="search"
+                placeholder="Username"
+                bind:value={userSearch}
+            />
+        {/if}
+        <Select
+            label="1. User"
+            options={userOptions}
+            bind:value={userId}
+            disabled={!!editing}
+            hint={chosenUser
+                ? chosenUser.ldapServerId
+                    ? 'Linked to an LDAP / AD directory: their own directory account can be assigned.'
+                    : 'Not linked to a directory: linked directory accounts cannot be assigned to them.'
+                : undefined}
+        />
+        <Select
+            label="2. Target"
+            options={targetOptions}
+            bind:value={targetId}
+            disabled={!!editing}
+        />
+
+        {#if optionsError}
+            <Callout tone="danger" title="Could not load the target's accounts">
+                {optionsError}
+            </Callout>
+        {/if}
+
+        {#if options}
+            {#if options.usesAccounts}
+                {#if options.accounts.length}
+                    <Select
+                        label="3. Account"
+                        options={accountOptions}
+                        bind:value={accountId}
+                        hint="From the target's Accounts. A linked directory account signs each user in as their own directory identity."
+                    />
+                {:else}
+                    <Callout tone="warning" title="This target has no accounts yet">
+                        Add one on the target's page, in Accounts:
+                        <a href="#/config/targets/{targetId}">open {chosenTarget?.name}</a>.
+                    </Callout>
+                {/if}
+            {:else}
+                <Callout title="No remote account on this protocol">
+                    The assignment is the user's entitlement to the target itself.
+                </Callout>
+            {/if}
+
+            <Input
+                label="Expires"
+                type="datetime-local"
+                hint="Optional. The assignment stops working at this time, and live sessions end."
+                bind:value={expiresAt}
+            />
+            <Toggle
+                label="Enabled"
+                checked={enabled}
+                onchange={value => (enabled = value)}
+            />
+            <Input label="Note" placeholder="Why, ticket number…" bind:value={note} />
+
+            {#if userId && targetId && (!options.usesAccounts || chosenAccount)}
+                <div class="review">
+                    <span class="review-label">4. Review</span>
+                    <p>
+                        <strong>{chosenUser?.username}</strong> may connect to
+                        <strong>{chosenTarget?.name}</strong>
+                        {#if chosenAccount}
+                            as <span class="wg-mono">{chosenAccount.signsInAs ?? chosenAccount.account}</span>,
+                            signing in with
+                            {METHOD_LABELS[chosenAccount.authMethod].toLowerCase()}
+                            ({chosenAccount.credentialSource.toLowerCase()})
+                        {/if}{enabled ? '' : ', once enabled'}{expiresAt
+                            ? `, until ${new Date(expiresAt).toLocaleString()}`
+                            : ''}.
+                        Second factors, approvals and session policies still apply.
+                    </p>
+                    {#if options.current.length && !editing}
+                        <p class="muted">
+                            Their access there now:
+                            {options.current
+                                .map(c => `${c.account ?? 'the target'} (${STATUS_LABELS[c.status].toLowerCase()}, ${c.source === AccessAssignmentSource.Group ? `group ${c.groupName}` : 'direct'})`)
+                                .join('; ')}.
+                        </p>
+                    {/if}
+                </div>
+            {/if}
+        {/if}
+
+        {#if saveError}
+            <Callout tone="danger" title="Could not save">{saveError}</Callout>
+        {/if}
+    </div>
+
+    {#snippet footer()}
+        <Button variant="ghost" onclick={() => (editorOpen = false)}>Cancel</Button>
+        <Button variant="primary" disabled={!canSave} onclick={save}>
+            {saving ? 'Saving…' : editing ? 'Save' : 'Assign'}
+        </Button>
+    {/snippet}
+</Modal>
+
+<ConfirmDialog
+    open={!!revoking}
+    title="Revoke this assignment?"
+    confirmLabel="Revoke"
+    onconfirm={revoke}
+    oncancel={() => (revoking = null)}
+>
+    {#if revoking}
+        {revoking.username} will no longer connect to {revoking.targetName}
+        {revoking.account ? `as ${revoking.account}` : ''} through this direct
+        assignment. Access through a group, if any, is not affected. Their live
+        sessions on the target end now.
+    {/if}
+</ConfirmDialog>
+
+<ConfirmDialog
+    open={!!excluding}
+    title="Exclude from the group's grant?"
+    confirmLabel="Exclude"
+    onconfirm={exclude}
+    oncancel={() => (excluding = null)}
+>
+    {#if excluding}
+        {excluding.username} stays in {excluding.groupName}, but no longer gets
+        {excluding.targetName}
+        {excluding.account ? `as ${excluding.account}` : ''} through it. Their
+        own direct assignments, and the group's other members, are not affected.
+        Their live sessions on the target end now.
+    {/if}
+</ConfirmDialog>
+
+<ConfirmDialog
+    open={!!bulkAction}
+    title="Apply to the selected assignments?"
+    confirmLabel="Apply"
+    onconfirm={applyBulk}
+    oncancel={() => (bulkAction = null)}
+>
+    <p>{bulkSummary}</p>
+    {#if bulkUsers.length}
+        <ul class="impact">
+            {#each bulkUsers as line (line)}
+                <li>{line}</li>
+            {/each}
+        </ul>
+    {/if}
+</ConfirmDialog>
+
+<style>
+    .toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: var(--wg-space-md);
+        margin: var(--wg-space-lg) 0 var(--wg-space-md);
+    }
+
+    .toolbar :global(.filter) {
+        min-width: 10rem;
+        max-width: 16rem;
+    }
+
+    .toolbar :global(.search) {
+        min-width: 14rem;
+        flex: 1 1 14rem;
+    }
+
+    .toolbar-end {
+        margin-left: auto;
+    }
+
+    .bulk {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: var(--wg-space-sm);
+        margin-bottom: var(--wg-space-md);
+        padding: var(--wg-space-sm) var(--wg-space-md);
+        border: var(--wg-border-width) solid var(--wg-border);
+        border-radius: var(--wg-radius-panel);
+        background: var(--wg-surface-container);
+        font: var(--wg-text-body-md);
+    }
+
+    .table-wrap {
+        overflow-x: auto;
+        border: var(--wg-border-width) solid var(--wg-border);
+        border-radius: var(--wg-radius-panel);
+    }
+
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        font: var(--wg-text-body-md);
+    }
+
+    th,
+    td {
+        padding: var(--wg-space-sm) var(--wg-space-md);
+        text-align: left;
+        vertical-align: middle;
+        border-bottom: var(--wg-border-width) solid var(--wg-border);
+    }
+
+    th {
+        color: var(--wg-text-muted);
+        font: var(--wg-text-label-md);
+        white-space: nowrap;
+    }
+
+    tbody tr:last-child td {
+        border-bottom: 0;
+    }
+
+    td a {
+        color: var(--wg-text);
+    }
+
+    .check {
+        width: 2.5rem;
+    }
+
+    .muted {
+        color: var(--wg-text-muted);
+    }
+
+    .status,
+    .row-actions {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: var(--wg-space-xs);
+    }
+
+    .row-actions {
+        justify-content: flex-end;
+        flex-wrap: nowrap;
+    }
+
+    .problem {
+        color: var(--wg-text-muted);
+        font: var(--wg-text-label-md);
+    }
+
+    .editor {
+        display: flex;
+        flex-direction: column;
+        gap: var(--wg-space-md);
+    }
+
+    .review {
+        display: flex;
+        flex-direction: column;
+        gap: var(--wg-space-xs);
+        padding: var(--wg-space-md);
+        border: var(--wg-border-width) solid var(--wg-border);
+        border-radius: var(--wg-radius-md);
+    }
+
+    .review p {
+        margin: 0;
+    }
+
+    .review-label {
+        color: var(--wg-text-muted);
+        font: var(--wg-text-label-md);
+    }
+
+    .impact {
+        margin: var(--wg-space-sm) 0 0;
+        padding-left: var(--wg-space-lg);
+        max-height: 12rem;
+        overflow-y: auto;
+    }
+
+    .visually-hidden {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip-path: inset(50%);
+        white-space: nowrap;
+    }
+</style>

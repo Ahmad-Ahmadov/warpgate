@@ -39,7 +39,7 @@ use tokio::time::{Instant, sleep, timeout, timeout_at};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 use warpgate_common::helpers::net::accept_loop;
 use warpgate_common::{ListenEndpoint, TargetRdpOptions, WarpgateError};
-use warpgate_core::account_binding::BoundUser;
+use warpgate_core::access_control::ConnectingUser;
 use warpgate_core::rdp_account::{
     AuthorizedSignIn, SignInAnswer, SignInError, SignInKind, SignInPlan, Zeroizing, plan_sign_in,
     reuse_sign_in_password, verify_sign_in,
@@ -866,13 +866,13 @@ async fn dial_if_pending(
             let target = authorization.target();
             plan_sign_in(
                 &viewer.services.db,
-                BoundUser {
+                ConnectingUser {
                     id: user_info.id,
                     username: &user_info.username,
                 },
                 target.id,
                 &target.name,
-                authorization.options(),
+                authorization.ticket_id().is_some(),
             )
             .await
         };
@@ -880,9 +880,14 @@ async fn dial_if_pending(
             Ok(plan) => plan,
             Err(error) => {
                 warn!(%error, "No account to sign in to the target with");
-                let kind = SignInKind::of(authorization.options());
-                end_on_account_screen(viewer, &authorization.target().name, kind, &error, *screen)
-                    .await?;
+                end_on_account_screen(
+                    viewer,
+                    &authorization.target().name,
+                    SignInKind::LocalAccount,
+                    &error,
+                    *screen,
+                )
+                .await?;
                 return Ok(false);
             }
         };
@@ -1007,15 +1012,7 @@ async fn authorize_account(
         && only.kind == SignInKind::DomainAccount
         && let Some(password) = reusable.take()
     {
-        match reuse_sign_in_password(
-            &viewer.services.db,
-            plan,
-            admitted.options(),
-            None,
-            password,
-        )
-        .await
-        {
+        match reuse_sign_in_password(&viewer.services.db, plan, None, password).await {
             Ok(sign_in) => {
                 info!(
                     account = %sign_in.account(),
@@ -1055,11 +1052,11 @@ async fn ask_account_password(
 ) -> Result<Option<(AuthorizedSignIn, Option<String>)>> {
     let db = &viewer.services.db;
     let user_info = admitted.user_info();
-    let user = BoundUser {
+    let user = ConnectingUser {
         id: user_info.id,
         username: &user_info.username,
     };
-    let options = admitted.options();
+    let via_ticket = admitted.ticket_id().is_some();
     let target = admitted.target();
     let accounts: Vec<AccountEntry> = plan
         .choices()
@@ -1109,16 +1106,16 @@ async fn ask_account_password(
         // `verify_sign_in` and `reuse_sign_in_password` log their answer, without the
         // password.
         let result = if reuse && let Some(kept) = reusable.take() {
-            reuse_sign_in_password(db, plan, options, Some(account.as_str()), kept).await
+            reuse_sign_in_password(db, plan, Some(account.as_str()), kept).await
         } else {
             verify_sign_in(
                 db,
                 user,
                 target.id,
                 &target.name,
-                options,
+                via_ticket,
                 SignInAnswer {
-                    binding_id: None,
+                    account_id: None,
                     account: Some(account.as_str()),
                 },
                 password,

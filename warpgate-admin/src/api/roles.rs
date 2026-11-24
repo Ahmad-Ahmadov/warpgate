@@ -177,7 +177,12 @@ impl DetailApi {
         admin.require(AdminPermission::AccessRolesDelete)?;
 
         match store::delete(&admin.services().db, id.0).await {
-            Ok(()) => Ok(DeleteRoleResponse::Deleted),
+            Ok(()) => {
+                // As an access group it may have been all that let members in: their
+                // sessions end now rather than at the next sweep.
+                admin.services().close_sessions_without_access().await?;
+                Ok(DeleteRoleResponse::Deleted)
+            }
             Err(ResourceError::NotFound) => Ok(DeleteRoleResponse::NotFound),
             Err(err) => Err(err.into()),
         }

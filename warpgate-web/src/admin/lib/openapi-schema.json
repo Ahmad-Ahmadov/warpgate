@@ -1855,6 +1855,16 @@
             "description": ""
           },
           "409": {
+            "description": "The role already grants the target; or the target has accounts and no primary one to\ngrant, in which case grant one of its accounts in Access Control, Access groups.",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
             "description": ""
           }
         },
@@ -5060,9 +5070,251 @@
         "operationId": "get_secret_reference_usage"
       }
     },
-    "/account-bindings": {
+    "/targets/{id}/accounts": {
       "get": {
-        "summary": "The remote accounts assigned to users on targets, filtered by user or target.",
+        "summary": "A target's accounts. Credentials are never returned.",
+        "parameters": [
+          {
+            "name": "id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TargetAccount"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "list_target_accounts"
+      },
+      "post": {
+        "summary": "Add an account to a target. It grants nobody anything until assigned.",
+        "parameters": [
+          {
+            "name": "id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/TargetAccountDataRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/TargetAccount"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "create_target_account"
+      }
+    },
+    "/targets/{id}/accounts/{account_id}": {
+      "put": {
+        "summary": "Change an account: its name, credential (a blank password keeps the stored one),\nwhether it is enabled, ... Users connected as it are disconnected.",
+        "parameters": [
+          {
+            "name": "id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          },
+          {
+            "name": "account_id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/TargetAccountDataRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/TargetAccount"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "update_target_account"
+      },
+      "delete": {
+        "summary": "Delete an account, revoking every assignment and group grant of it.",
+        "parameters": [
+          {
+            "name": "id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          },
+          {
+            "name": "account_id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "delete_target_account"
+      }
+    },
+    "/access-assignments": {
+      "get": {
+        "summary": "Every effective assignment, direct and group-derived (excluded ones included), with\nwhere it comes from and whether it can be used now. Filter by user, target or group;\n`source` is `direct` or `group`.",
         "parameters": [
           {
             "name": "user_id",
@@ -5085,6 +5337,27 @@
             "required": false,
             "deprecated": false,
             "explode": true
+          },
+          {
+            "name": "group_id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "query",
+            "required": false,
+            "deprecated": false,
+            "explode": true
+          },
+          {
+            "name": "source",
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "required": false,
+            "deprecated": false,
+            "explode": true
           }
         ],
         "responses": {
@@ -5095,7 +5368,7 @@
                 "schema": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/components/schemas/AccountBinding"
+                    "$ref": "#/components/schemas/AccessAssignment"
                   }
                 }
               }
@@ -5110,27 +5383,27 @@
             "CookieSecurityScheme": []
           }
         ],
-        "operationId": "list_account_bindings"
+        "operationId": "list_access_assignments"
       },
       "post": {
-        "summary": "Assign a remote account to a user on a target.",
+        "summary": "Assign a user an account on a target: permission both to connect to the target and to\nsign in there as that account. Nothing else is needed.",
         "requestBody": {
           "content": {
             "application/json; charset=utf-8": {
               "schema": {
-                "$ref": "#/components/schemas/CreateAccountBindingRequest"
+                "$ref": "#/components/schemas/CreateAccessAssignmentRequest"
               }
             }
           },
           "required": true
         },
         "responses": {
-          "201": {
+          "200": {
             "description": "",
             "content": {
               "application/json; charset=utf-8": {
                 "schema": {
-                  "$ref": "#/components/schemas/AccountBinding"
+                  "$ref": "#/components/schemas/AccessAssignment"
                 }
               }
             }
@@ -5174,12 +5447,12 @@
             "CookieSecurityScheme": []
           }
         ],
-        "operationId": "create_account_binding"
+        "operationId": "create_access_assignment"
       }
     },
-    "/account-bindings/options": {
+    "/access-assignments/options": {
       "get": {
-        "summary": "What can be assigned to a user on a target: the user's directory account as the\ndirectory names it now, the target's configured local and managed accounts, and the\nauthentication methods each kind can use there.",
+        "summary": "What can be assigned to a user on a target: its accounts (a linked directory account\nwith the name it would sign this user in as), and the user's access there now.",
         "parameters": [
           {
             "name": "user_id",
@@ -5210,17 +5483,7 @@
             "content": {
               "application/json; charset=utf-8": {
                 "schema": {
-                  "$ref": "#/components/schemas/AccountBindingOptions"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "",
-            "content": {
-              "application/json; charset=utf-8": {
-                "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/AccessAssignmentOptions"
                 }
               }
             }
@@ -5244,12 +5507,12 @@
             "CookieSecurityScheme": []
           }
         ],
-        "operationId": "get_account_binding_options"
+        "operationId": "get_access_assignment_options"
       }
     },
-    "/account-bindings/{id}": {
+    "/access-assignments/{id}": {
       "put": {
-        "summary": "Change an assignment: its local account name, directory name format, authentication,\nwhether it is enabled, and its expiry. The user's live sessions on the target end.",
+        "summary": "Change a direct assignment: its account, whether it is enabled, its expiry. The\nuser's live sessions on the target end.",
         "parameters": [
           {
             "name": "id",
@@ -5267,7 +5530,7 @@
           "content": {
             "application/json; charset=utf-8": {
               "schema": {
-                "$ref": "#/components/schemas/UpdateAccountBindingRequest"
+                "$ref": "#/components/schemas/UpdateAccessAssignmentRequest"
               }
             }
           },
@@ -5279,7 +5542,7 @@
             "content": {
               "application/json; charset=utf-8": {
                 "schema": {
-                  "$ref": "#/components/schemas/AccountBinding"
+                  "$ref": "#/components/schemas/AccessAssignment"
                 }
               }
             }
@@ -5295,7 +5558,24 @@
             }
           },
           "404": {
-            "description": ""
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -5306,10 +5586,10 @@
             "CookieSecurityScheme": []
           }
         ],
-        "operationId": "update_account_binding"
+        "operationId": "update_access_assignment"
       },
       "delete": {
-        "summary": "Revoke an assignment. The user's live sessions on the target end.",
+        "summary": "Revoke a direct assignment. The user's live sessions on the target end. A group's\nassignments are not touched: exclude the user from the group's grant for that.",
         "parameters": [
           {
             "name": "id",
@@ -5339,34 +5619,620 @@
             "CookieSecurityScheme": []
           }
         ],
-        "operationId": "delete_account_binding"
+        "operationId": "delete_access_assignment"
+      }
+    },
+    "/access-assignments/bulk": {
+      "post": {
+        "summary": "Enable, disable or revoke several direct assignments at once; with `dry_run`, only\nsay which would change.",
+        "requestBody": {
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkAccessAssignmentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkAccessAssignmentResult"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "bulk_update_access_assignments"
+      }
+    },
+    "/access-groups": {
+      "get": {
+        "summary": "The access groups (roles), with how many members and grants each has.",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AccessGroupView"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "list_access_groups"
+      }
+    },
+    "/access-groups/{id}/grants": {
+      "get": {
+        "summary": "What a group grants.",
+        "parameters": [
+          {
+            "name": "id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AccessGroupGrantView"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "list_access_group_grants"
+      },
+      "post": {
+        "summary": "Let a group's members connect to a target as an account. With `dry_run`, only say\nwho would gain access.",
+        "parameters": [
+          {
+            "name": "id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAccessGroupGrantRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessGroupGrantChange"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "create_access_group_grant"
+      }
+    },
+    "/access-groups/{id}/grants/{grant_id}": {
+      "delete": {
+        "summary": "Stop a group granting a target and account. Members who had it through nothing else\nlose it, and their sessions on the target end. With `dry_run`, only say who.",
+        "parameters": [
+          {
+            "name": "id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          },
+          {
+            "name": "grant_id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          },
+          {
+            "name": "dry_run",
+            "schema": {
+              "type": "boolean"
+            },
+            "in": "query",
+            "required": false,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessGroupGrantChange"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "delete_access_group_grant"
+      }
+    },
+    "/access-group-grants/{grant_id}/exclusions": {
+      "post": {
+        "summary": "Revoke a group-derived assignment for one member: exclude them from the grant. Their\ndirect assignments and the group's other members are untouched.",
+        "parameters": [
+          {
+            "name": "grant_id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/ExcludeFromGrantRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessAssignment"
+                }
+              }
+            }
+          },
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "exclude_from_access_group_grant"
+      }
+    },
+    "/access-group-exclusions/{id}": {
+      "delete": {
+        "summary": "Put an excluded member back into a group's grant.",
+        "parameters": [
+          {
+            "name": "id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessAssignment"
+                }
+              }
+            }
+          },
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "delete_access_group_exclusion"
+      }
+    },
+    "/access-migration/reviews": {
+      "get": {
+        "summary": "The access-control migration's report; `status` filters it (`pending` for what waits\nfor a decision).",
+        "parameters": [
+          {
+            "name": "status",
+            "schema": {
+              "$ref": "#/components/schemas/AccessMigrationStatus"
+            },
+            "in": "query",
+            "required": false,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/MigrationReviewView"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "list_access_migration_reviews"
+      }
+    },
+    "/access-migration/reviews/{id}/confirm": {
+      "post": {
+        "summary": "Confirm a pending item with the account to grant: a direct assignment for a user's\npermission, a group grant for a group's.",
+        "parameters": [
+          {
+            "name": "id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfirmMigrationReviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/MigrationReviewView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "confirm_access_migration_review"
+      }
+    },
+    "/access-migration/reviews/{id}/reject": {
+      "post": {
+        "summary": "Decide a pending item grants nothing.",
+        "parameters": [
+          {
+            "name": "id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/RejectMigrationReviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/MigrationReviewView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": ""
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "reject_access_migration_review"
       }
     }
   },
   "components": {
     "schemas": {
-      "AccountBinding": {
+      "AccessAssignment": {
         "type": "object",
-        "title": "AccountBinding",
-        "description": "A remote account assigned to a user on a target.",
+        "title": "AccessAssignment",
+        "description": "One effective assignment: a user's access to a target as an account.",
         "required": [
-          "id",
           "user_id",
           "username",
           "target_id",
           "target_name",
           "protocol",
-          "account_kind",
-          "auth_method",
+          "source",
           "enabled",
-          "created_at",
-          "updated_at",
-          "has_target_access"
+          "status",
+          "note"
         ],
         "properties": {
           "id": {
             "type": "string",
-            "format": "uuid"
+            "format": "uuid",
+            "description": "The direct assignment; `None` for a group-derived one."
           },
           "user_id": {
             "type": "string",
@@ -5381,29 +6247,49 @@
             "format": "uuid"
           },
           "target_name": {
-            "type": "string",
-            "description": "Empty if the target has been deleted."
+            "type": "string"
           },
           "protocol": {
             "type": "string",
-            "description": "`rdp` or `ssh`."
+            "description": "`rdp`, `ssh`, `mysql`, `postgres`, `http`, `kubernetes` or `vnc`."
+          },
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "account": {
+            "type": "string",
+            "description": "The account as people read it; `None` where the protocol has none."
           },
           "account_kind": {
             "$ref": "#/components/schemas/TargetAccountKind"
           },
-          "account_name": {
-            "type": "string",
-            "description": "A local account's name, as configured. Directory accounts are read from the\ndirectory, and managed ones are the target's."
-          },
-          "managed_account": {
-            "type": "string",
-            "description": "The target's configured account, for a managed assignment."
-          },
-          "username_format": {
-            "$ref": "#/components/schemas/DirectoryUsernameFormat"
-          },
           "auth_method": {
             "$ref": "#/components/schemas/TargetAccountAuthMethod"
+          },
+          "credential_source": {
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/AccessAssignmentSource"
+          },
+          "origin": {
+            "$ref": "#/components/schemas/AccessAssignmentOrigin"
+          },
+          "group_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "group_name": {
+            "type": "string"
+          },
+          "grant_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "exclusion_id": {
+            "type": "string",
+            "format": "uuid"
           },
           "enabled": {
             "type": "boolean"
@@ -5412,9 +6298,14 @@
             "type": "string",
             "format": "date-time"
           },
-          "created_by": {
-            "type": "string",
-            "format": "uuid"
+          "status": {
+            "$ref": "#/components/schemas/AccessAssignmentStatus"
+          },
+          "problem": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
           },
           "created_at": {
             "type": "string",
@@ -5423,95 +6314,224 @@
           "updated_at": {
             "type": "string",
             "format": "date-time"
-          },
-          "problem": {
-            "type": "string",
-            "description": "Why the assignment cannot be used now (disabled, expired, the user's directory link\nchanged, the target no longer authenticates this way), if it cannot."
-          },
-          "has_target_access": {
-            "type": "boolean",
-            "description": "Whether the user's roles let them reach the target at all. An assignment does not."
           }
         }
       },
-      "AccountBindingOptions": {
+      "AccessAssignmentBulkAction": {
+        "type": "string",
+        "enum": [
+          "enable",
+          "disable",
+          "revoke"
+        ]
+      },
+      "AccessAssignmentOptions": {
         "type": "object",
-        "title": "AccountBindingOptions",
-        "description": "What can be assigned to a user on a target.",
+        "title": "AccessAssignmentOptions",
         "required": [
           "protocol",
-          "has_target_access",
+          "uses_accounts",
           "directory_linked",
-          "directory_accounts",
-          "local_accounts",
-          "kinds"
+          "accounts",
+          "current"
         ],
         "properties": {
           "protocol": {
-            "type": "string",
-            "description": "`rdp` or `ssh`."
+            "type": "string"
           },
-          "has_target_access": {
-            "type": "boolean"
+          "uses_accounts": {
+            "type": "boolean",
+            "description": "Whether assignments on this target name an account."
           },
           "directory_linked": {
-            "type": "boolean",
-            "description": "Whether the user is linked to a directory entry."
+            "type": "boolean"
           },
-          "directory_accounts": {
+          "accounts": {
             "type": "array",
-            "description": "The user's directory account, as each format names it, read from the directory now.",
             "items": {
-              "$ref": "#/components/schemas/DirectoryAccountName"
+              "$ref": "#/components/schemas/AssignableAccount"
             }
           },
-          "directory_problem": {
-            "type": "string",
-            "description": "Why the directory account could not be read, when it could not."
-          },
-          "local_accounts": {
+          "current": {
             "type": "array",
-            "description": "Local accounts configured for this target: an RDP target's assignable accounts, and\nnames already assigned to someone on it. Configured, not checked on the server.",
+            "description": "The user's access to the target as it is now.",
+            "items": {
+              "$ref": "#/components/schemas/AccessAssignment"
+            }
+          }
+        }
+      },
+      "AccessAssignmentOrigin": {
+        "type": "string",
+        "description": "Where a direct assignment came from.",
+        "enum": [
+          "direct",
+          "migrated",
+          "review"
+        ]
+      },
+      "AccessAssignmentSource": {
+        "type": "string",
+        "description": "Where an assignment comes from.",
+        "enum": [
+          "direct",
+          "group"
+        ]
+      },
+      "AccessAssignmentStatus": {
+        "type": "string",
+        "description": "Whether an effective assignment can be used now.",
+        "enum": [
+          "active",
+          "disabled",
+          "expired",
+          "excluded",
+          "invalid"
+        ]
+      },
+      "AccessGroupGrantChange": {
+        "type": "object",
+        "title": "AccessGroupGrantChange",
+        "description": "What a change to a group's grants does (or would do).",
+        "required": [
+          "affected_users",
+          "summary",
+          "applied"
+        ],
+        "properties": {
+          "grant": {
+            "$ref": "#/components/schemas/AccessGroupGrantView"
+          },
+          "affected_users": {
+            "type": "array",
+            "description": "The members whose access changes: who gains it, or who loses it.",
             "items": {
               "type": "string"
             }
           },
-          "managed_account": {
-            "type": "string",
-            "description": "The target's own account, for a managed assignment."
+          "summary": {
+            "type": "string"
           },
-          "kinds": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/AccountKindOption"
-            }
+          "applied": {
+            "type": "boolean"
           }
         }
       },
-      "AccountKindOption": {
+      "AccessGroupGrantView": {
         "type": "object",
-        "title": "AccountKindOption",
-        "description": "A way an account of some kind can sign in to a target.",
+        "title": "AccessGroupGrantView",
+        "description": "What a group grants: a target, as an account (or the target itself where the protocol has\nno accounts).",
         "required": [
-          "account_kind",
-          "auth_methods"
+          "id",
+          "group_id",
+          "target_id",
+          "target_name",
+          "protocol",
+          "excluded_count",
+          "created_at"
         ],
         "properties": {
-          "account_kind": {
-            "$ref": "#/components/schemas/TargetAccountKind"
-          },
-          "auth_methods": {
-            "type": "array",
-            "description": "The authentication methods it can use there; empty when the kind cannot be used.",
-            "items": {
-              "$ref": "#/components/schemas/TargetAccountAuthMethod"
-            }
-          },
-          "problem": {
+          "id": {
             "type": "string",
-            "description": "Why it cannot be used, when it cannot."
+            "format": "uuid"
+          },
+          "group_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "target_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "target_name": {
+            "type": "string"
+          },
+          "protocol": {
+            "type": "string"
+          },
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "account": {
+            "type": "string"
+          },
+          "excluded_count": {
+            "type": "integer",
+            "format": "uint32",
+            "description": "Members excluded from it."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
           }
         }
+      },
+      "AccessGroupView": {
+        "type": "object",
+        "title": "AccessGroupView",
+        "description": "An access group: a role, as Access Control uses it.",
+        "required": [
+          "id",
+          "name",
+          "description",
+          "is_default",
+          "member_count",
+          "grant_count",
+          "sso_managed"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "is_default": {
+            "type": "boolean",
+            "description": "New users join it."
+          },
+          "member_count": {
+            "type": "integer",
+            "format": "uint32",
+            "description": "Active members."
+          },
+          "grant_count": {
+            "type": "integer",
+            "format": "uint32"
+          },
+          "sso_managed": {
+            "type": "boolean",
+            "description": "An SSO provider's role mappings name it, so its membership is managed at sign-in."
+          }
+        }
+      },
+      "AccessMigrationCategory": {
+        "type": "string",
+        "description": "What the migration found.",
+        "enum": [
+          "migrated",
+          "already_matching",
+          "duplicate",
+          "no_account",
+          "overlapping",
+          "ineffective",
+          "ambiguous"
+        ]
+      },
+      "AccessMigrationStatus": {
+        "type": "string",
+        "description": "Whether an administrator has to decide.",
+        "enum": [
+          "info",
+          "pending",
+          "confirmed",
+          "rejected"
+        ]
       },
       "AddSshKnownHostRequest": {
         "type": "object",
@@ -5802,6 +6822,65 @@
           }
         }
       },
+      "AssignableAccount": {
+        "type": "object",
+        "title": "AssignableAccount",
+        "description": "An account that can be assigned to a user on a target.",
+        "required": [
+          "id",
+          "account",
+          "kind",
+          "auth_method",
+          "credential_source",
+          "enabled"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "account": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TargetAccountKind"
+          },
+          "auth_method": {
+            "$ref": "#/components/schemas/TargetAccountAuthMethod"
+          },
+          "credential_source": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "signs_in_as": {
+            "type": "string",
+            "description": "For a linked directory account: the name it signs this user in as, read from the\ndirectory now."
+          },
+          "problem": {
+            "type": "string",
+            "description": "Why it cannot be assigned to this user now, if it cannot."
+          }
+        }
+      },
+      "AssignableAccountRef": {
+        "type": "object",
+        "title": "AssignableAccountRef",
+        "required": [
+          "id",
+          "account"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "account": {
+            "type": "string"
+          }
+        }
+      },
       "AutoCredentials": {
         "type": "object",
         "title": "AutoCredentials"
@@ -6015,6 +7094,56 @@
           "Dark"
         ]
       },
+      "BulkAccessAssignmentRequest": {
+        "type": "object",
+        "title": "BulkAccessAssignmentRequest",
+        "required": [
+          "ids",
+          "action"
+        ],
+        "properties": {
+          "ids": {
+            "type": "array",
+            "description": "Direct assignments only; a group-derived one is changed through its group.",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "action": {
+            "$ref": "#/components/schemas/AccessAssignmentBulkAction"
+          },
+          "dry_run": {
+            "type": "boolean",
+            "description": "Only say what would change.",
+            "default": false
+          }
+        }
+      },
+      "BulkAccessAssignmentResult": {
+        "type": "object",
+        "title": "BulkAccessAssignmentResult",
+        "required": [
+          "affected",
+          "summary",
+          "applied"
+        ],
+        "properties": {
+          "affected": {
+            "type": "array",
+            "description": "The assignments it changes (or would), as they are before the change.",
+            "items": {
+              "$ref": "#/components/schemas/AccessAssignment"
+            }
+          },
+          "summary": {
+            "type": "string"
+          },
+          "applied": {
+            "type": "boolean"
+          }
+        }
+      },
       "CheckHealthResponse": {
         "type": "object",
         "title": "CheckHealthResponse",
@@ -6053,14 +7182,27 @@
           }
         }
       },
-      "CreateAccountBindingRequest": {
+      "ConfirmMigrationReviewRequest": {
         "type": "object",
-        "title": "CreateAccountBindingRequest",
+        "title": "ConfirmMigrationReviewRequest",
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The account to grant; required on a target with accounts."
+          },
+          "note": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      },
+      "CreateAccessAssignmentRequest": {
+        "type": "object",
+        "title": "CreateAccessAssignmentRequest",
         "required": [
           "user_id",
-          "target_id",
-          "account_kind",
-          "auth_method"
+          "target_id"
         ],
         "properties": {
           "user_id": {
@@ -6071,19 +7213,10 @@
             "type": "string",
             "format": "uuid"
           },
-          "account_kind": {
-            "$ref": "#/components/schemas/TargetAccountKind"
-          },
-          "account_name": {
+          "account_id": {
             "type": "string",
-            "description": "A local account's name: `name`, or `COMPUTER\\name` on a Windows target. Not taken for\na directory or managed account.",
-            "maxLength": 256
-          },
-          "username_format": {
-            "$ref": "#/components/schemas/DirectoryUsernameFormat"
-          },
-          "auth_method": {
-            "$ref": "#/components/schemas/TargetAccountAuthMethod"
+            "format": "uuid",
+            "description": "The target's account; required on RDP, SSH, MySQL and PostgreSQL, absent elsewhere."
           },
           "enabled": {
             "type": "boolean",
@@ -6092,6 +7225,32 @@
           "expires_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "note": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      },
+      "CreateAccessGroupGrantRequest": {
+        "type": "object",
+        "title": "CreateAccessGroupGrantRequest",
+        "required": [
+          "target_id"
+        ],
+        "properties": {
+          "target_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "dry_run": {
+            "type": "boolean",
+            "description": "Only say who would gain access.",
+            "default": false
           }
         }
       },
@@ -6326,23 +7485,6 @@
         "type": "object",
         "title": "DeveloperToolsCredentials"
       },
-      "DirectoryAccountName": {
-        "type": "object",
-        "title": "DirectoryAccountName",
-        "description": "A directory account name in one of the formats a target may know it by.",
-        "required": [
-          "format",
-          "account"
-        ],
-        "properties": {
-          "format": {
-            "$ref": "#/components/schemas/DirectoryUsernameFormat"
-          },
-          "account": {
-            "type": "string"
-          }
-        }
-      },
       "DirectoryUsernameFormat": {
         "type": "string",
         "description": "How a directory account is named to the target.",
@@ -6352,6 +7494,23 @@
           "account_name",
           "account_at_domain"
         ]
+      },
+      "ExcludeFromGrantRequest": {
+        "type": "object",
+        "title": "ExcludeFromGrantRequest",
+        "required": [
+          "user_id"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "note": {
+            "type": "string",
+            "default": ""
+          }
+        }
       },
       "ExistingCertificateCredential": {
         "type": "object",
@@ -6986,6 +8145,89 @@
           "Require"
         ]
       },
+      "MigrationReviewView": {
+        "type": "object",
+        "title": "MigrationReviewView",
+        "description": "A permission the access-control migration looked at.",
+        "required": [
+          "id",
+          "category",
+          "status",
+          "legacy_permission",
+          "reason",
+          "candidates",
+          "sso_managed",
+          "resolution",
+          "created_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "category": {
+            "$ref": "#/components/schemas/AccessMigrationCategory"
+          },
+          "status": {
+            "$ref": "#/components/schemas/AccessMigrationStatus"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "username": {
+            "type": "string"
+          },
+          "group_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "group_name": {
+            "type": "string"
+          },
+          "target_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "target_name": {
+            "type": "string"
+          },
+          "legacy_permission": {
+            "type": "string",
+            "description": "The earlier permission, in words."
+          },
+          "reason": {
+            "type": "string",
+            "description": "What the migration did, or why it could not."
+          },
+          "candidates": {
+            "type": "array",
+            "description": "The accounts an administrator may choose from.",
+            "items": {
+              "$ref": "#/components/schemas/AssignableAccountRef"
+            }
+          },
+          "sso_managed": {
+            "type": "boolean",
+            "description": "The group's membership is managed by an SSO provider's role mappings."
+          },
+          "resolution": {
+            "type": "string"
+          },
+          "resolved_by": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "resolved_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
       "NewOtpCredential": {
         "type": "object",
         "title": "NewOtpCredential",
@@ -7529,104 +8771,19 @@
           "3.2"
         ]
       },
-      "RdpDomainUsernameFormat": {
-        "type": "string",
-        "description": "How a directory account is named to an RDP target.",
-        "enum": [
-          "upn",
-          "down_level"
-        ]
-      },
-      "RdpLocalAccountAssignment": {
-        "type": "object",
-        "title": "RdpLocalAccountAssignment",
-        "description": "A Windows account of an RDP target, and the Warpgate users allowed to sign in as it.",
-        "required": [
-          "username"
-        ],
-        "properties": {
-          "username": {
-            "type": "string",
-            "description": "The account's name: `name`, which takes the target's computer name (its `domain`)\nwhen one is set, or `COMPUTER\\name`.",
-            "maxLength": 256,
-            "minLength": 1
-          },
-          "users": {
-            "type": "array",
-            "description": "The Warpgate users the account is assigned to. Nobody else may sign in as it.",
-            "default": [],
-            "items": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        }
-      },
       "RdpTargetAuth": {
         "type": "object",
         "oneOf": [
           {
             "$ref": "#/components/schemas/RdpTargetAuth_RdpTargetPasswordAuth"
-          },
-          {
-            "$ref": "#/components/schemas/RdpTargetAuth_RdpTargetDomainAccountAuth"
-          },
-          {
-            "$ref": "#/components/schemas/RdpTargetAuth_RdpTargetLocalAccountAuth"
           }
         ],
         "discriminator": {
           "propertyName": "kind",
           "mapping": {
-            "Password": "#/components/schemas/RdpTargetAuth_RdpTargetPasswordAuth",
-            "DomainAccount": "#/components/schemas/RdpTargetAuth_RdpTargetDomainAccountAuth",
-            "LocalAccount": "#/components/schemas/RdpTargetAuth_RdpTargetLocalAccountAuth"
+            "Password": "#/components/schemas/RdpTargetAuth_RdpTargetPasswordAuth"
           }
         }
-      },
-      "RdpTargetAuth_RdpTargetDomainAccountAuth": {
-        "allOf": [
-          {
-            "type": "object",
-            "required": [
-              "kind"
-            ],
-            "properties": {
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "DomainAccount"
-                ],
-                "example": "DomainAccount"
-              }
-            }
-          },
-          {
-            "$ref": "#/components/schemas/RdpTargetDomainAccountAuth"
-          }
-        ]
-      },
-      "RdpTargetAuth_RdpTargetLocalAccountAuth": {
-        "allOf": [
-          {
-            "type": "object",
-            "required": [
-              "kind"
-            ],
-            "properties": {
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "LocalAccount"
-                ],
-                "example": "LocalAccount"
-              }
-            }
-          },
-          {
-            "$ref": "#/components/schemas/RdpTargetLocalAccountAuth"
-          }
-        ]
       },
       "RdpTargetAuth_RdpTargetPasswordAuth": {
         "allOf": [
@@ -7657,31 +8814,6 @@
           "lossless",
           "graphics_pipeline"
         ]
-      },
-      "RdpTargetDomainAccountAuth": {
-        "type": "object",
-        "title": "RdpTargetDomainAccountAuth",
-        "description": "Sign in as the connecting user's own directory account: the account their Warpgate user\nis linked to, which the user cannot choose, and a password they type, which is checked\nagainst the directory and used for this one connection only.",
-        "properties": {
-          "username_format": {
-            "$ref": "#/components/schemas/RdpDomainUsernameFormat"
-          }
-        }
-      },
-      "RdpTargetLocalAccountAuth": {
-        "type": "object",
-        "title": "RdpTargetLocalAccountAuth",
-        "description": "Sign in as a Windows account assigned to the connecting user: a local account of the\ntarget (or any account the target accepts), which the user may use only if it is assigned\nto them, and a password they type, used for this one connection only.",
-        "properties": {
-          "accounts": {
-            "type": "array",
-            "description": "The accounts users may sign in as, and who may use each.",
-            "default": [],
-            "items": {
-              "$ref": "#/components/schemas/RdpLocalAccountAssignment"
-            }
-          }
-        }
       },
       "RdpTargetPasswordAuth": {
         "type": "object",
@@ -7912,6 +9044,16 @@
             "$ref": "#/components/schemas/S3StorageConfig"
           }
         ]
+      },
+      "RejectMigrationReviewRequest": {
+        "type": "object",
+        "title": "RejectMigrationReviewRequest",
+        "properties": {
+          "note": {
+            "type": "string",
+            "default": ""
+          }
+        }
       },
       "RejectSessionRequest": {
         "type": "object",
@@ -8840,23 +9982,291 @@
           }
         }
       },
+      "TargetAccount": {
+        "type": "object",
+        "title": "TargetAccount",
+        "description": "An account in a target's inventory. Its credential is never returned: a password shows\nblank, a secret reference shows as the reference.",
+        "required": [
+          "id",
+          "target_id",
+          "kind",
+          "name",
+          "display_name",
+          "auth_method",
+          "credential_source",
+          "enabled",
+          "is_primary",
+          "description",
+          "assignment_count",
+          "group_grant_count",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "target_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TargetAccountKind"
+          },
+          "name": {
+            "type": "string",
+            "description": "As configured; empty for a linked directory account."
+          },
+          "display_name": {
+            "type": "string",
+            "description": "As people read it: `WIN-SRV-01\\support`, \"Linked directory account (each user's own)\"."
+          },
+          "domain": {
+            "type": "string"
+          },
+          "auth_method": {
+            "$ref": "#/components/schemas/TargetAccountAuthMethod"
+          },
+          "credential": {
+            "$ref": "#/components/schemas/TargetAccountCredential"
+          },
+          "credential_source": {
+            "type": "string",
+            "description": "Where the credential comes from, in words: \"Encrypted password\", \"Secret reference\",\n\"Warpgate SSH keys\", ..., \"Typed by the user when connecting\"."
+          },
+          "username_format": {
+            "$ref": "#/components/schemas/DirectoryUsernameFormat"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "is_primary": {
+            "type": "boolean"
+          },
+          "description": {
+            "type": "string"
+          },
+          "assignment_count": {
+            "type": "integer",
+            "format": "uint32",
+            "description": "Direct assignments of it, and access-group grants of it."
+          },
+          "group_grant_count": {
+            "type": "integer",
+            "format": "uint32"
+          },
+          "problem": {
+            "type": "string",
+            "description": "Why it cannot sign in to its target as configured, if it cannot."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
       "TargetAccountAuthMethod": {
         "type": "string",
-        "description": "How Warpgate authenticates a bound account to the target.",
+        "description": "How Warpgate authenticates an account to the target.",
         "enum": [
-          "directory_password",
+          "stored_credential",
           "typed_password",
-          "target_credential"
+          "directory_password"
         ]
+      },
+      "TargetAccountCredential": {
+        "type": "object",
+        "description": "What Warpgate signs a target account in with, when it holds the credential itself: a\npassword (stored encrypted, or a secret reference), Warpgate's SSH client keys, a\ncertificate a secret backend signs, or a cloud role. Which ones a protocol takes:\n[`TargetAccountCredential::supports`].",
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/TargetAccountCredential_TargetAccountPasswordCredential"
+          },
+          {
+            "$ref": "#/components/schemas/TargetAccountCredential_SshTargetPublicKeyAuth"
+          },
+          {
+            "$ref": "#/components/schemas/TargetAccountCredential_SshTargetCertificateAuth"
+          },
+          {
+            "$ref": "#/components/schemas/TargetAccountCredential_TargetAccountIamRoleCredential"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "kind",
+          "mapping": {
+            "Password": "#/components/schemas/TargetAccountCredential_TargetAccountPasswordCredential",
+            "PublicKey": "#/components/schemas/TargetAccountCredential_SshTargetPublicKeyAuth",
+            "Certificate": "#/components/schemas/TargetAccountCredential_SshTargetCertificateAuth",
+            "IamRole": "#/components/schemas/TargetAccountCredential_TargetAccountIamRoleCredential"
+          }
+        }
+      },
+      "TargetAccountCredential_SshTargetCertificateAuth": {
+        "allOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "Certificate"
+                ],
+                "example": "Certificate"
+              }
+            }
+          },
+          {
+            "$ref": "#/components/schemas/SshTargetCertificateAuth"
+          }
+        ]
+      },
+      "TargetAccountCredential_SshTargetPublicKeyAuth": {
+        "allOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "PublicKey"
+                ],
+                "example": "PublicKey"
+              }
+            }
+          },
+          {
+            "$ref": "#/components/schemas/SshTargetPublicKeyAuth"
+          }
+        ]
+      },
+      "TargetAccountCredential_TargetAccountIamRoleCredential": {
+        "allOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "IamRole"
+                ],
+                "example": "IamRole"
+              }
+            }
+          },
+          {
+            "$ref": "#/components/schemas/TargetAccountIamRoleCredential"
+          }
+        ]
+      },
+      "TargetAccountCredential_TargetAccountPasswordCredential": {
+        "allOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "Password"
+                ],
+                "example": "Password"
+              }
+            }
+          },
+          {
+            "$ref": "#/components/schemas/TargetAccountPasswordCredential"
+          }
+        ]
+      },
+      "TargetAccountDataRequest": {
+        "type": "object",
+        "title": "TargetAccountDataRequest",
+        "description": "An account as an administrator sets it up.",
+        "required": [
+          "kind",
+          "name",
+          "auth_method"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/TargetAccountKind"
+          },
+          "name": {
+            "type": "string",
+            "description": "`deploy`, `WIN-SRV-01\\support`, `CORP\\sqladmin`, `svc@corp.example.com`. Empty for a\nlinked directory account, and, on SSH, for \"the user's Warpgate username\".",
+            "maxLength": 256
+          },
+          "domain": {
+            "type": "string",
+            "description": "RDP: the computer (local account) or the domain's NetBIOS name (directory account)\nthe account belongs to, when its name does not say.",
+            "maxLength": 256
+          },
+          "auth_method": {
+            "$ref": "#/components/schemas/TargetAccountAuthMethod"
+          },
+          "credential": {
+            "$ref": "#/components/schemas/TargetAccountCredential"
+          },
+          "username_format": {
+            "$ref": "#/components/schemas/DirectoryUsernameFormat"
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "is_primary": {
+            "type": "boolean",
+            "description": "The target's primary account (one per target): jump-host hops and ticket connections\nwithout an assignment sign in as it. It grants nobody anything.",
+            "default": false
+          },
+          "description": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      },
+      "TargetAccountIamRoleCredential": {
+        "type": "object",
+        "title": "TargetAccountIamRoleCredential",
+        "description": "A short-lived credential from the cloud provider (an AWS IAM role); nothing is stored."
       },
       "TargetAccountKind": {
         "type": "string",
-        "description": "What kind of remote account a binding names.",
+        "description": "What kind of identity an account is.",
         "enum": [
-          "directory",
           "local",
-          "managed"
+          "domain",
+          "directory"
         ]
+      },
+      "TargetAccountPasswordCredential": {
+        "type": "object",
+        "title": "TargetAccountPasswordCredential",
+        "description": "A password Warpgate keeps for a target account: encrypted at rest, or a reference to a\nsecret in a secret backend (Vault / OpenBao). Never returned once saved.",
+        "required": [
+          "password"
+        ],
+        "properties": {
+          "password": {
+            "type": "string"
+          }
+        }
       },
       "TargetClickAction": {
         "type": "string",
@@ -9313,15 +10723,10 @@
           },
           "interactive_logon": {
             "type": "boolean",
-            "description": "Show the target's own sign-in screen instead of logging on automatically.\nThe stored credentials still pass network-level authentication (CredSSP)."
+            "description": "Show the target's own sign-in screen instead of logging on automatically, for\naccounts with a stored credential. That credential still passes network-level\nauthentication (CredSSP). Accounts signed in with a password the user types always\nlog on automatically."
           },
           "tls_security": {
             "$ref": "#/components/schemas/RdpTlsSecurity"
-          },
-          "require_account_binding": {
-            "type": "boolean",
-            "description": "Users may sign in only as accounts assigned to them on this target (Access Control,\naccount access); a user with none is refused. Without it, a user with assigned\naccounts is still held to them, and one with none signs in as the target is set up.",
-            "default": false
           }
         }
       },
@@ -9356,11 +10761,6 @@
           "jump_host": {
             "type": "string",
             "format": "uuid"
-          },
-          "require_account_binding": {
-            "type": "boolean",
-            "description": "Users may sign in only as accounts assigned to them on this target (Access Control,\naccount access); a user with none is refused. Without it, a user with assigned\naccounts is still held to them, and one with none signs in as the target is set up.",
-            "default": false
           }
         }
       },
@@ -9722,23 +11122,16 @@
           }
         }
       },
-      "UpdateAccountBindingRequest": {
+      "UpdateAccessAssignmentRequest": {
         "type": "object",
-        "title": "UpdateAccountBindingRequest",
+        "title": "UpdateAccessAssignmentRequest",
         "required": [
-          "auth_method",
           "enabled"
         ],
         "properties": {
-          "account_name": {
+          "account_id": {
             "type": "string",
-            "maxLength": 256
-          },
-          "username_format": {
-            "$ref": "#/components/schemas/DirectoryUsernameFormat"
-          },
-          "auth_method": {
-            "$ref": "#/components/schemas/TargetAccountAuthMethod"
+            "format": "uuid"
           },
           "enabled": {
             "type": "boolean"
@@ -9746,6 +11139,10 @@
           "expires_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "note": {
+            "type": "string",
+            "default": ""
           }
         }
       },

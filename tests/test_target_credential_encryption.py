@@ -59,13 +59,26 @@ def _config_warnings(wg):
 
 
 def _stored_password(config_path, target_name):
-    """The MySQL target password exactly as it sits in the database."""
+    """The MySQL target password exactly as it sits in the database.
+
+    Since target accounts (m00098) it is kept once, in the target's primary account; the
+    target's own settings hold none.
+    """
     with open_wg_sqlite_db(config_path) as db:
-        row = db.execute(
+        options = db.execute(
             "SELECT options FROM targets WHERE name = ?", (target_name,)
         ).fetchone()
-    assert row is not None, f"target {target_name} is not in the database"
-    return json.loads(row[0])["mysql"]["auth"]["password"]
+        row = db.execute(
+            "SELECT a.credential FROM target_accounts a JOIN targets t ON t.id = a.target_id"
+            " WHERE t.name = ? AND a.is_primary",
+            (target_name,),
+        ).fetchone()
+    assert options is not None, f"target {target_name} is not in the database"
+    assert json.loads(options[0])["mysql"]["auth"]["password"] == "", (
+        "the target's settings keep no copy of the password"
+    )
+    assert row is not None, f"target {target_name} has no primary account"
+    return json.loads(row[0])["password"]
 
 
 def _snapshot_passwords(config_path):

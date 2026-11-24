@@ -34,6 +34,10 @@ pub struct TargetSSHOptions {
     #[serde(default = "_default_ssh_port")]
     #[oai(validator(minimum(value = "1")))]
     pub port: u16,
+    // `username` and `auth` are the account a connection signs in as. Stored targets keep them
+    // blank: the accounts live in the target's Accounts (`target_accounts`), and a connection
+    // fills them in from the account Access Control authorized. The admin API shows the
+    // target's primary account here, for API clients written before accounts existed.
     #[serde(default = "_default_username")]
     pub username: String,
     #[serde(default)]
@@ -42,12 +46,6 @@ pub struct TargetSSHOptions {
     pub auth: SSHTargetAuth,
     #[serde(default)]
     pub jump_host: Option<Uuid>,
-    /// Users may sign in only as accounts assigned to them on this target (Access Control,
-    /// account access); a user with none is refused. Without it, a user with assigned
-    /// accounts is still held to them, and one with none signs in as the target is set up.
-    #[serde(default)]
-    #[oai(default)]
-    pub require_account_binding: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Union)]
@@ -299,6 +297,10 @@ pub struct TargetRdpOptions {
     #[oai(validator(minimum(value = "1")))]
     pub port: u16,
 
+    // `username`, `domain` and `auth` are kept for API clients written before target accounts
+    // existed: the admin API shows the target's primary account here and saves what is sent
+    // into it. Stored targets keep them blank, and connections never read them: an RDP
+    // connection signs in as the account Access Control authorized (`rdp_account`).
     #[serde(default = "_default_username")]
     pub username: String,
 
@@ -324,8 +326,10 @@ pub struct TargetRdpOptions {
     #[serde(default)]
     pub compression: RdpTargetCompression,
 
-    /// Show the target's own sign-in screen instead of logging on automatically.
-    /// The stored credentials still pass network-level authentication (CredSSP).
+    /// Show the target's own sign-in screen instead of logging on automatically, for
+    /// accounts with a stored credential. That credential still passes network-level
+    /// authentication (CredSSP). Accounts signed in with a password the user types always
+    /// log on automatically.
     #[serde(default)]
     pub interactive_logon: bool,
 
@@ -334,13 +338,6 @@ pub struct TargetRdpOptions {
     // description wraps the enum in allOf, which typescript-fetch misgenerates.
     #[serde(default)]
     pub tls_security: RdpTlsSecurity,
-
-    /// Users may sign in only as accounts assigned to them on this target (Access Control,
-    /// account access); a user with none is refused. Without it, a user with assigned
-    /// accounts is still held to them, and one with none signs in as the target is set up.
-    #[serde(default)]
-    #[oai(default)]
-    pub require_account_binding: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default, Enum)]
@@ -357,21 +354,15 @@ pub enum RdpTlsSecurity {
     Tls10Unsafe,
 }
 
+// One kind only since target accounts: the directory-account and assigned-account sign-in
+// modes became account kinds (`target_accounts`), and who may use them became Access Control
+// assignments. Migration m00098 moved existing targets' settings there.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Union)]
 #[serde(tag = "kind")]
 #[oai(discriminator_name = "kind", one_of)]
 pub enum RdpTargetAuth {
     #[serde(rename = "password")]
     Password(RdpTargetPasswordAuth),
-    /// Each user signs in to the target as their own directory (Active Directory) account,
-    /// with the password they type when connecting. Warpgate keeps no password for it.
-    #[serde(rename = "domain_account")]
-    DomainAccount(RdpTargetDomainAccountAuth),
-    /// Each user signs in to the target as a Windows account an administrator assigned to
-    /// them here, with that account's password, typed when connecting. Warpgate keeps no
-    /// password for it, and no user may sign in as an account not assigned to them.
-    #[serde(rename = "local_account")]
-    LocalAccount(RdpTargetLocalAccountAuth),
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Object)]
@@ -379,55 +370,163 @@ pub struct RdpTargetPasswordAuth {
     pub password: MaybeSecretRef,
 }
 
-/// Sign in as the connecting user's own directory account: the account their Warpgate user
-/// is linked to, which the user cannot choose, and a password they type, which is checked
-/// against the directory and used for this one connection only.
+/// A password Warpgate keeps for a target account: encrypted at rest, or a reference to a
+/// secret in a secret backend (Vault / OpenBao). Never returned once saved.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Object, Default)]
-pub struct RdpTargetDomainAccountAuth {
-    // How the account is named to the target. A plain comment: a field description wraps
-    // the enum in allOf, which typescript-fetch misgenerates. Optional in the API too.
+pub struct TargetAccountPasswordCredential {
     #[serde(default)]
-    #[oai(default)]
-    pub username_format: RdpDomainUsernameFormat,
+    pub password: MaybeSecretRef,
 }
 
-/// How a directory account is named to an RDP target.
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default, Enum)]
-pub enum RdpDomainUsernameFormat {
-    /// `alice@corp.example.com`, the account's user principal name.
-    #[default]
-    #[serde(rename = "upn")]
-    #[oai(rename = "upn")]
-    Upn,
-    /// `CORP\alice`: the account name, with the target's domain, or the directory's DNS
-    /// domain where the target has none.
-    #[serde(rename = "down_level")]
-    #[oai(rename = "down_level")]
-    DownLevel,
-}
-
-/// Sign in as a Windows account assigned to the connecting user: a local account of the
-/// target (or any account the target accepts), which the user may use only if it is assigned
-/// to them, and a password they type, used for this one connection only.
+/// A short-lived credential from the cloud provider (an AWS IAM role); nothing is stored.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Object, Default)]
-pub struct RdpTargetLocalAccountAuth {
-    /// The accounts users may sign in as, and who may use each.
-    #[serde(default)]
-    #[oai(default)]
-    pub accounts: Vec<RdpLocalAccountAssignment>,
+pub struct TargetAccountIamRoleCredential {}
+
+/// What Warpgate signs a target account in with, when it holds the credential itself: a
+/// password (stored encrypted, or a secret reference), Warpgate's SSH client keys, a
+/// certificate a secret backend signs, or a cloud role. Which ones a protocol takes:
+/// [`TargetAccountCredential::supports`].
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Union)]
+#[serde(tag = "kind")]
+#[oai(discriminator_name = "kind", one_of)]
+pub enum TargetAccountCredential {
+    #[serde(rename = "password")]
+    Password(TargetAccountPasswordCredential),
+    #[serde(rename = "publickey")]
+    PublicKey(SshTargetPublicKeyAuth),
+    #[serde(rename = "certificate")]
+    Certificate(SshTargetCertificateAuth),
+    #[serde(rename = "iam_role")]
+    IamRole(TargetAccountIamRoleCredential),
 }
 
-/// A Windows account of an RDP target, and the Warpgate users allowed to sign in as it.
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Object)]
-pub struct RdpLocalAccountAssignment {
-    /// The account's name: `name`, which takes the target's computer name (its `domain`)
-    /// when one is set, or `COMPUTER\name`.
-    #[oai(validator(min_length = 1, max_length = 256))]
-    pub username: String,
-    /// The Warpgate users the account is assigned to. Nobody else may sign in as it.
-    #[serde(default)]
-    #[oai(default)]
-    pub users: Vec<Uuid>,
+impl TargetAccountCredential {
+    /// The credential's kind, as stored and as the audit log names it.
+    pub const fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Password(_) => "password",
+            Self::PublicKey(_) => "publickey",
+            Self::Certificate(_) => "certificate",
+            Self::IamRole(_) => "iam_role",
+        }
+    }
+
+    /// Whether an account of a target of `protocol` can sign in with this credential.
+    pub const fn supports(&self, protocol: Protocol) -> bool {
+        matches!(
+            (protocol, self),
+            (Protocol::Rdp, Self::Password(_))
+                | (Protocol::Ssh, _)
+                | (
+                    Protocol::MySql | Protocol::Postgres,
+                    Self::Password(_) | Self::IamRole(_)
+                )
+        )
+    }
+
+    /// The password, for a password credential.
+    pub const fn password(&self) -> Option<&MaybeSecretRef> {
+        match self {
+            Self::Password(credential) => Some(&credential.password),
+            Self::PublicKey(_) | Self::Certificate(_) | Self::IamRole(_) => None,
+        }
+    }
+
+    /// Every secret reference it uses.
+    pub fn secret_references(&self) -> Vec<SecretRef> {
+        self.password()
+            .and_then(MaybeSecretRef::as_reference)
+            .cloned()
+            .into_iter()
+            .collect()
+    }
+
+    /// The credential as an SSH target's authentication.
+    pub fn to_ssh_auth(&self) -> SSHTargetAuth {
+        match self {
+            Self::Password(credential) => SSHTargetAuth::Password(SshTargetPasswordAuth {
+                password: credential.password.clone(),
+            }),
+            Self::PublicKey(auth) => SSHTargetAuth::PublicKey(auth.clone()),
+            Self::Certificate(auth) => SSHTargetAuth::Certificate(auth.clone()),
+            Self::IamRole(_) => SSHTargetAuth::IamRole(SshTargetIamRoleAuth {}),
+        }
+    }
+
+    /// An SSH target's authentication as an account credential.
+    pub fn from_ssh_auth(auth: &SSHTargetAuth) -> Self {
+        match auth {
+            SSHTargetAuth::Password(auth) => Self::Password(TargetAccountPasswordCredential {
+                password: auth.password.clone(),
+            }),
+            SSHTargetAuth::PublicKey(auth) => Self::PublicKey(auth.clone()),
+            SSHTargetAuth::Certificate(auth) => Self::Certificate(auth.clone()),
+            SSHTargetAuth::IamRole(_) => Self::IamRole(TargetAccountIamRoleCredential {}),
+        }
+    }
+
+    /// The credential as a database target's authentication; `None` for SSH-only kinds.
+    pub fn to_database_auth(&self) -> Option<DatabaseTargetAuth> {
+        match self {
+            Self::Password(credential) => {
+                Some(DatabaseTargetAuth::Password(DatabaseTargetPasswordAuth {
+                    password: credential.password.clone(),
+                }))
+            }
+            Self::IamRole(_) => Some(DatabaseTargetAuth::IamRole(DatabaseTargetIamRoleAuth {})),
+            Self::PublicKey(_) | Self::Certificate(_) => None,
+        }
+    }
+
+    /// A database target's authentication as an account credential.
+    pub fn from_database_auth(auth: &DatabaseTargetAuth) -> Self {
+        match auth {
+            DatabaseTargetAuth::Password(auth) => Self::Password(TargetAccountPasswordCredential {
+                password: auth.password.clone(),
+            }),
+            DatabaseTargetAuth::IamRole(_) => Self::IamRole(TargetAccountIamRoleCredential {}),
+        }
+    }
+
+    /// Whether this is a password credential with no password in it: what the admin API
+    /// sends back for a password it does not show.
+    pub fn is_blank_password(&self) -> bool {
+        match self {
+            Self::Password(credential) => match &credential.password {
+                MaybeSecretRef::Inline(secret) => secret.stored_value().is_empty(),
+                MaybeSecretRef::Reference(_) => false,
+                MaybeSecretRef::Malformed(raw) => raw.is_empty(),
+            },
+            Self::PublicKey(_) | Self::Certificate(_) | Self::IamRole(_) => false,
+        }
+    }
+
+    /// An update's credential, with a blank password standing for the stored one: the admin
+    /// API never returns a stored password, so a client that did not change it sends it back
+    /// blank.
+    #[must_use]
+    pub fn keeping_stored_password(self, stored: Option<&Self>) -> Self {
+        match (self.is_blank_password(), stored) {
+            (true, Some(stored @ Self::Password(_))) => stored.clone(),
+            _ => self,
+        }
+    }
+}
+
+impl StoredSecrets for TargetAccountCredential {
+    fn stored_secrets_mut(&mut self) -> Vec<&mut StoredSecret> {
+        match self {
+            Self::Password(credential) => {
+                let slot = &mut credential.password;
+                // Only looks like a reference; it may be a plaintext password
+                if let MaybeSecretRef::Malformed(raw) = slot {
+                    *slot = MaybeSecretRef::Inline(std::mem::take(raw).into());
+                }
+                slot.inline_mut().into_iter().collect()
+            }
+            Self::PublicKey(_) | Self::Certificate(_) | Self::IamRole(_) => vec![],
+        }
+    }
 }
 
 impl Default for RdpTargetAuth {
@@ -638,8 +737,6 @@ impl TargetSecrets for TargetRdpOptions {
     fn secrets_mut(&mut self) -> Vec<&mut MaybeSecretRef> {
         match &mut self.auth {
             RdpTargetAuth::Password(auth) => vec![&mut auth.password],
-            // The password is the user's, typed when connecting, and never stored.
-            RdpTargetAuth::DomainAccount(_) | RdpTargetAuth::LocalAccount(_) => vec![],
         }
     }
 }
@@ -993,61 +1090,121 @@ mod tests {
         assert_eq!(malformed_options().stored_secrets_mut().len(), 1);
     }
 
-    /// A domain-account target stores no password, so it has no secret to encrypt or resolve,
-    /// and its username format defaults to the UPN when the stored options predate it.
+    /// Stored options from before target accounts still read: the removed account-binding
+    /// switch is ignored, not an error (m00098 also strips it).
     #[test]
-    fn a_domain_account_target_keeps_no_secret() {
-        use super::{
-            RdpDomainUsernameFormat, RdpTargetAuth, RdpTargetDomainAccountAuth, TargetSecrets,
-        };
-
-        let mut rdp: TargetRdpOptions =
-            serde_json::from_str(r#"{"auth":{"kind":"domain_account"}}"#).unwrap();
-        assert_eq!(
-            rdp.auth,
-            RdpTargetAuth::DomainAccount(RdpTargetDomainAccountAuth {
-                username_format: RdpDomainUsernameFormat::Upn,
-            })
-        );
-        assert!(rdp.secrets_mut().is_empty());
-
-        let rdp: TargetRdpOptions = serde_json::from_str(
-            r#"{"auth":{"kind":"domain_account","username_format":"down_level"}}"#,
-        )
-        .unwrap();
-        let json = serde_json::to_value(&rdp.auth).unwrap();
-        assert_eq!(json["kind"], "domain_account");
-        assert_eq!(json["username_format"], "down_level");
+    fn options_with_the_retired_assignment_switch_still_read() {
+        let rdp: TargetRdpOptions =
+            serde_json::from_str(r#"{"host":"h","require_account_binding":true}"#).unwrap();
+        assert_eq!(rdp.host, "h");
+        let ssh: TargetSSHOptions =
+            serde_json::from_str(r#"{"host":"h","require_account_binding":true}"#).unwrap();
+        assert_eq!(ssh.host, "h");
     }
 
-    /// A local-account target stores who may use each account, and no password.
-    #[test]
-    fn a_local_account_target_keeps_assignments_and_no_secret() {
-        use super::{
-            RdpLocalAccountAssignment, RdpTargetAuth, RdpTargetLocalAccountAuth, TargetSecrets,
+    mod account_credentials {
+        use std::str::FromStr;
+
+        use super::super::{
+            DatabaseTargetAuth, MaybeSecretRef, SSHTargetAuth, SshTargetCertificateAuth,
+            SshTargetPublicKeyAuth, TargetAccountCredential, TargetAccountIamRoleCredential,
+            TargetAccountPasswordCredential,
         };
+        use super::{REFERENCE, reference};
+        use crate::{Protocol, StoredSecrets};
 
-        let mut rdp: TargetRdpOptions =
-            serde_json::from_str(r#"{"auth":{"kind":"local_account"}}"#).unwrap();
-        assert_eq!(
-            rdp.auth,
-            RdpTargetAuth::LocalAccount(RdpTargetLocalAccountAuth { accounts: vec![] })
-        );
-        assert!(rdp.secrets_mut().is_empty());
-
-        let user = uuid::Uuid::from_u128(7);
-        let rdp: TargetRdpOptions = serde_json::from_str(&format!(
-            r#"{{"auth":{{"kind":"local_account","accounts":[{{"username":"SRV01\\operator","users":["{user}"]}}]}}}}"#
-        ))
-        .unwrap();
-        assert_eq!(
-            rdp.auth,
-            RdpTargetAuth::LocalAccount(RdpTargetLocalAccountAuth {
-                accounts: vec![RdpLocalAccountAssignment {
-                    username: r"SRV01\operator".to_owned(),
-                    users: vec![user],
-                }],
+        fn password(value: &str) -> TargetAccountCredential {
+            TargetAccountCredential::Password(TargetAccountPasswordCredential {
+                password: MaybeSecretRef::from_str(value).unwrap(),
             })
-        );
+        }
+
+        /// Stored with the same tags as the targets' own credentials.
+        #[test]
+        fn stored_with_lowercase_kinds() {
+            let stored = serde_json::to_value(password("p")).unwrap();
+            assert_eq!(stored["kind"], "password");
+            let key = TargetAccountCredential::PublicKey(SshTargetPublicKeyAuth::default());
+            assert_eq!(serde_json::to_value(&key).unwrap()["kind"], "publickey");
+            let back: TargetAccountCredential =
+                serde_json::from_value(serde_json::json!({"kind": "iam_role"})).unwrap();
+            assert_eq!(
+                back,
+                TargetAccountCredential::IamRole(TargetAccountIamRoleCredential {})
+            );
+        }
+
+        /// A password is the one slot to encrypt; a reference is not one.
+        #[test]
+        fn only_an_inline_password_is_a_stored_secret() {
+            assert_eq!(password("p").stored_secrets_mut().len(), 1);
+            let mut by_reference =
+                TargetAccountCredential::Password(TargetAccountPasswordCredential {
+                    password: reference(),
+                });
+            assert!(by_reference.stored_secrets_mut().is_empty());
+            assert_eq!(by_reference.secret_references()[0].to_string(), REFERENCE);
+            assert!(
+                TargetAccountCredential::PublicKey(SshTargetPublicKeyAuth::default())
+                    .stored_secrets_mut()
+                    .is_empty()
+            );
+        }
+
+        /// 13: redacted, an account keeps no readable password.
+        #[test]
+        fn redaction_blanks_the_password() {
+            let redacted = password("hunter2").redacted();
+            assert!(redacted.is_blank_password());
+            assert_eq!(
+                serde_json::to_value(&redacted).unwrap()["password"],
+                "",
+                "the password is not returned"
+            );
+        }
+
+        /// A blank password in an update keeps the stored one; anything else replaces it.
+        #[test]
+        fn a_blank_password_keeps_the_stored_one() {
+            let stored = password("old");
+            assert_eq!(password("").keeping_stored_password(Some(&stored)), stored);
+            assert_eq!(
+                password("new").keeping_stored_password(Some(&stored)),
+                password("new")
+            );
+            let key = TargetAccountCredential::PublicKey(SshTargetPublicKeyAuth::default());
+            assert_eq!(key.clone().keeping_stored_password(Some(&stored)), key);
+        }
+
+        #[test]
+        fn each_protocol_takes_its_own_kinds() {
+            let certificate =
+                TargetAccountCredential::Certificate(SshTargetCertificateAuth::default());
+            let iam = TargetAccountCredential::IamRole(TargetAccountIamRoleCredential {});
+            assert!(password("p").supports(Protocol::Rdp));
+            assert!(!certificate.supports(Protocol::Rdp));
+            assert!(certificate.supports(Protocol::Ssh));
+            assert!(iam.supports(Protocol::Postgres));
+            assert!(!certificate.supports(Protocol::MySql));
+            assert!(!password("p").supports(Protocol::Http));
+        }
+
+        #[test]
+        fn converts_to_and_from_protocol_auth() {
+            let ssh = password("p").to_ssh_auth();
+            assert!(matches!(ssh, SSHTargetAuth::Password(_)));
+            assert_eq!(TargetAccountCredential::from_ssh_auth(&ssh), password("p"));
+            let database = password("p").to_database_auth().unwrap();
+            assert!(matches!(database, DatabaseTargetAuth::Password(_)));
+            assert_eq!(
+                TargetAccountCredential::from_database_auth(&database),
+                password("p")
+            );
+            assert!(
+                TargetAccountCredential::PublicKey(SshTargetPublicKeyAuth::default())
+                    .to_database_auth()
+                    .is_none()
+            );
+        }
     }
 }

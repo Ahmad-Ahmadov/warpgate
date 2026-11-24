@@ -135,19 +135,15 @@ export const NAV_SECTIONS: NavSection[] = [
                 requires: 'usersEdit',
             },
             {
-                id: 'access-roles',
-                label: 'Access roles',
-                href: '#/config/access-roles',
-                match: '/config/access-roles',
+                // Assignments, access groups and the migration review: the one
+                // place access is granted. Replaces "Access roles" and
+                // "Account access"; their routes still lead here.
+                id: 'access-control',
+                label: 'Access control',
+                href: '#/config/access-control',
+                match: '/config/access-control',
+                alsoMatch: ['/config/access-roles', '/config/account-access'],
                 icon: ICONS.shield,
-                requires: 'accessRolesEdit',
-            },
-            {
-                id: 'account-access',
-                label: 'Account access',
-                href: '#/config/account-access',
-                match: '/config/account-access',
-                icon: ICONS.user,
                 requires: 'accessRolesAssign',
             },
             {

@@ -78,7 +78,7 @@
             return
         }
         await api.deleteRole(role)
-        replace('/config/access-roles')
+        replace('/config/access-control/groups')
     }
 </script>
 
@@ -88,7 +88,7 @@
             <div class="page-summary-bar">
                 <div>
                     <h1>{role.name}</h1>
-                    <div class="text-muted">role</div>
+                    <div class="text-muted">access group</div>
                 </div>
             </div>
 
@@ -138,7 +138,14 @@
         </Button>
     </div>
 
-    <h4 class="mt-5">Assigned users</h4>
+    <p class="mt-4">
+        <a href="#/config/access-control/groups?group={params.id}">
+            What this group grants, and the assignments it makes
+        </a>
+        (Access Control)
+    </p>
+
+    <h4 class="mt-5">Members</h4>
 
     <ItemList load={loadUsers}>
         {#snippet item(user)}
@@ -160,11 +167,11 @@
             </a>
         {/snippet}
         {#snippet empty()}
-            <Callout>This role has no users assigned to it</Callout>
+            <Callout>This group has no members</Callout>
         {/snippet}
     </ItemList>
 
-    <h4 class="mt-4">Assigned targets</h4>
+    <h4 class="mt-4">Targets it grants</h4>
 
     <ItemList load={loadTargets}>
         {#snippet item(target)}
@@ -186,23 +193,23 @@
             </a>
         {/snippet}
         {#snippet empty()}
-            <Callout>This role has no targets assigned to it</Callout>
+            <Callout>This group grants no target</Callout>
         {/snippet}
     </ItemList>
 </div>
 
 <ConfirmDialog
     bind:open={removing}
-    title="Delete {role?.name ?? 'this role'}?"
-    confirmLabel="Delete role"
+    title="Delete {role?.name ?? 'this group'}?"
+    confirmLabel="Delete group"
     confirmText={role?.name}
-    confirmTextLabel="role name"
+    confirmTextLabel="group name"
     onconfirm={confirmRemove}
     oncancel={() => (removing = false)}
 >
     <p>
-        Every user holding this role loses it, and every target that grants
-        access through it stops granting that access. Neither list is shown
-        here, so there is no way to see from this screen how many are affected.
+        Every member leaves it, and every assignment it makes ends: its grants
+        and its exclusions are deleted, and members lose access they had only
+        through it. Access Control, Access groups, lists both before you do.
     </p>
 </ConfirmDialog>

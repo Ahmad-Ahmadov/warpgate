@@ -19,8 +19,12 @@
      *     regenerate, with the user picker for protocols that take a username
      *   - "Connect" opens a web SSH or desktop session, gated on
      *     webClientsEnabled and the three protocols that support it
-     *   - role toggles write through immediately; the rest of the form saves
-     *     on "Update configuration"
+     *   - the rest of the form saves on "Update configuration"
+     *
+     * Who may connect is not set here: it is Access Control's (user, target,
+     * account). This page holds the target's connection settings and, for RDP,
+     * SSH, MySQL and PostgreSQL, its Accounts. Saving the settings sends their
+     * legacy account fields blank, so it never touches the accounts.
      *   - the access-control and self-service switches save on change, which
      *     is why they stay switches rather than becoming checkboxes
      *
@@ -29,8 +33,8 @@
      * its blast radius is not visible from the dialog.
      */
     import {
+        AccessAssignmentStatus,
         api,
-        type Role,
         type Target,
         type TargetGroup,
     } from 'admin/lib/api'
@@ -68,6 +72,7 @@
     import ProtocolDocs from './ProtocolDocs.svelte'
     import TargetRdpOptions from './rdp/Options.svelte'
     import TargetSshOptions from './ssh/Options.svelte'
+    import TargetAccounts from './TargetAccounts.svelte'
     import TargetVncOptions from './vnc/Options.svelte'
 
     interface Props {
@@ -98,7 +103,6 @@
             ? { kind: 'Target', id: target.id, name: target.name }
             : undefined,
     )
-    let roleIsAllowed: Record<string, boolean> = $state({})
     let instructionsOpen = $state(false)
     let deleteOpen = $state(false)
     let groups: TargetGroup[] = $state([])
@@ -111,14 +115,55 @@
         return target
     }
 
-    async function loadRoles() {
+    /** Who may connect now, as Access Control has it. */
+    async function loadAccess() {
         if (!target) {
-            return []
+            return { active: 0, total: 0 }
         }
-        const allRoles = await api.getRoles()
-        const allowedRoles = await api.getTargetRoles(target)
-        roleIsAllowed = Object.fromEntries(allowedRoles.map(r => [r.id, true]))
-        return allRoles
+        const assignments = await api.listAccessAssignments({ targetId: target.id })
+        return {
+            active: assignments.filter(a => a.status === AccessAssignmentStatus.Active)
+                .length,
+            total: assignments.length,
+        }
+    }
+
+    /**
+     * The settings as they are saved: with their legacy account fields blank.
+     * Accounts live in the Accounts section; anything non-blank here would be
+     * taken for an update of the primary account.
+     */
+    function withoutAccountFields(t: Target): Target {
+        const options = t.options
+        switch (options.kind) {
+            case 'Rdp':
+                return {
+                    ...t,
+                    options: {
+                        ...options,
+                        username: '',
+                        domain: undefined,
+                        auth: { kind: 'Password', password: '' },
+                    },
+                }
+            case 'Ssh':
+                return {
+                    ...t,
+                    options: { ...options, username: '', auth: { kind: 'PublicKey' } },
+                }
+            case 'MySql':
+            case 'Postgres':
+                return {
+                    ...t,
+                    options: {
+                        ...options,
+                        username: '',
+                        auth: { kind: 'Password', password: '' },
+                    },
+                }
+            default:
+                return t
+        }
     }
 
     async function update() {
@@ -132,7 +177,7 @@
             }
             target = await api.updateTarget({
                 id: params.id,
-                targetDataRequest: target,
+                targetDataRequest: withoutAccountFields(target),
             })
             toast.success('Target saved')
         } catch (err) {
@@ -160,19 +205,6 @@
             }
         } catch (err) {
             error = await stringifyError(err)
-        }
-    }
-
-    async function toggleRole(role: Role) {
-        if (!target) {
-            return
-        }
-        if (roleIsAllowed[role.id]) {
-            await api.deleteTargetRole({ id: target.id, roleId: role.id })
-            roleIsAllowed = { ...roleIsAllowed, [role.id]: false }
-        } else {
-            await api.addTargetRole({ id: target.id, roleId: role.id })
-            roleIsAllowed = { ...roleIsAllowed, [role.id]: true }
         }
     }
 
@@ -271,27 +303,39 @@
                         {/if}
                     </Section>
 
-                    <Section
-                        id="roles"
-                        title="Roles"
-                        bodyTitle="Allow access for roles"
-                    >
-                        <Loadable promise={loadRoles()}>
-                            {#snippet children(roles)}
-                                <ul class="role-list">
-                                    {#each roles as role (role.id)}
-                                        <li>
-                                            <Toggle
-                                                label={role.name}
-                                                hint={role.description ||
-                                                    undefined}
-                                                checked={roleIsAllowed[role.id]}
-                                                disabled={!$adminPermissions.targetsEdit}
-                                                onchange={() => toggleRole(role)}
-                                            />
-                                        </li>
-                                    {/each}
-                                </ul>
+                    {#if target.options.kind === 'Rdp' || target.options.kind === 'Ssh' || target.options.kind === 'MySql' || target.options.kind === 'Postgres'}
+                        <Section id="accounts" title="Accounts">
+                            <TargetAccounts
+                                targetId={target.id}
+                                targetName={target.name}
+                                protocol={target.options.kind as
+                                    | 'Rdp'
+                                    | 'Ssh'
+                                    | 'MySql'
+                                    | 'Postgres'}
+                            />
+                        </Section>
+                    {/if}
+
+                    <Section id="access" title="Access">
+                        <Loadable promise={loadAccess()}>
+                            {#snippet children(access)}
+                                <p class="access-summary">
+                                    {access.active} active assignment{access.active === 1
+                                        ? ''
+                                        : 's'}{access.total > access.active
+                                        ? ` (${access.total - access.active} not in force)`
+                                        : ''}.
+                                    Users connect only through an assignment, direct or
+                                    through an access group; nothing on this page grants
+                                    access.
+                                </p>
+                                <a
+                                    class="access-link"
+                                    href="#/config/access-control?target={target.id}"
+                                >
+                                    Manage access in Access Control
+                                </a>
                             {/snippet}
                         </Loadable>
                     </Section>
@@ -515,9 +559,10 @@
             onconfirm={remove}
         >
             <p>
-                Deleting this target removes it from every role that grants
-                access to it, and from the connection history shown against past
-                sessions. This cannot be undone.
+                Deleting this target deletes its accounts and revokes every
+                assignment and access-group grant of it, and removes it from
+                the connection history shown against past sessions. This cannot
+                be undone.
             </p>
         </ConfirmDialog>
     {/snippet}
@@ -563,13 +608,15 @@
         margin-bottom: var(--wg-space-lg);
     }
 
-    .role-list {
-        list-style: none;
-        margin: 0;
-        padding: 0;
-        display: flex;
-        flex-direction: column;
-        gap: var(--wg-space-md);
+    .access-summary {
+        margin: 0 0 var(--wg-space-sm);
+        font: var(--wg-text-body-md);
+        color: var(--wg-text-muted);
+    }
+
+    .access-link {
+        color: var(--wg-primary);
+        font: var(--wg-text-label-md);
     }
 
     .field {
