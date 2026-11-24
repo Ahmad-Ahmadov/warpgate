@@ -286,7 +286,7 @@
         if (accounts.length < 2) {
             return false
         }
-        chosenBinding = accounts[0].bindingId ?? ''
+        chosenBinding = accounts[0]?.bindingId ?? ''
         accountChoice = { targetId, accounts }
         return true
     }

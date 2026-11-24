@@ -205,14 +205,15 @@
                     return
                 }
                 options = loaded
+                const firstFormat = loaded.directoryAccounts[0]?.format
                 if (
                     !editing &&
-                    loaded.directoryAccounts.length &&
+                    firstFormat &&
                     !loaded.directoryAccounts.some(
                         a => a.format === usernameFormat,
                     )
                 ) {
-                    usernameFormat = loaded.directoryAccounts[0].format
+                    usernameFormat = firstFormat
                 }
             })
             .catch(async e => {
@@ -228,8 +229,9 @@
     // Only the methods the kind can use there are offered; keep the choice valid.
     $effect(() => {
         const methods = kindOption?.authMethods ?? []
-        if (methods.length && !(methods as string[]).includes(authMethod)) {
-            authMethod = methods[0]
+        const firstMethod = methods[0]
+        if (firstMethod && !(methods as string[]).includes(authMethod)) {
+            authMethod = firstMethod
         }
     })
 
