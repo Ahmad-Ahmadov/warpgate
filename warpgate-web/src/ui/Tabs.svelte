@@ -156,16 +156,21 @@
         font: var(--wg-text-label-md);
         white-space: nowrap;
         cursor: pointer;
+        border-radius: var(--wg-radius-control) var(--wg-radius-control) 0 0;
         transition:
+            background var(--wg-duration-fast) var(--wg-easing),
             color var(--wg-duration-fast) var(--wg-easing),
             border-color var(--wg-duration-fast) var(--wg-easing);
     }
 
     .wg-tab:hover:not(:disabled) {
+        background: var(--wg-surface-container-high);
         color: var(--wg-text);
     }
 
-    .wg-tab-active {
+    .wg-tab-active,
+    .wg-tab-active:hover:not(:disabled) {
+        background: var(--wg-primary-tint);
         color: var(--wg-primary);
         border-bottom-color: var(--wg-primary);
     }

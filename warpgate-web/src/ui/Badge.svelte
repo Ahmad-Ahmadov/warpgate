@@ -5,6 +5,7 @@
         | 'success'
         | 'warning'
         | 'danger'
+        | 'info'
 </script>
 
 <script lang="ts">
@@ -71,9 +72,10 @@
     }
 
     /*
-     * Colour accents sit on the border and the text, never the fill. DESIGN.md
-     * keeps badge backgrounds subdued so that a row of them does not turn a
-     * table into a colour chart — the accent is enough to sort them by eye.
+     * Colour accents sit on the border and the text; the fill is only a
+     * low-alpha tint of the same accent (`--wg-*-tint`). DESIGN.md keeps badge
+     * backgrounds subdued so that a row of them does not turn a table into a
+     * colour chart — the tint helps sort them by eye without shouting.
      */
     .wg-badge {
         display: inline-flex;
@@ -95,21 +97,31 @@
 
     .wg-badge-primary {
         border-color: var(--wg-primary);
+        background: var(--wg-primary-tint);
         color: var(--wg-primary);
     }
 
     .wg-badge-success {
         border-color: var(--wg-tertiary);
+        background: var(--wg-tertiary-tint);
         color: var(--wg-tertiary);
     }
 
     .wg-badge-warning {
         border-color: var(--wg-secondary);
+        background: var(--wg-secondary-tint);
         color: var(--wg-secondary);
     }
 
     .wg-badge-danger {
         border-color: var(--wg-error);
+        background: var(--wg-error-tint);
         color: var(--wg-error);
+    }
+
+    .wg-badge-info {
+        border-color: var(--wg-info);
+        background: var(--wg-info-tint);
+        color: var(--wg-info);
     }
 </style>

@@ -578,6 +578,7 @@
     >
         {#snippet empty()}
             <EmptyState
+                icon="target"
                 title={kindFilter === 'all'
                     ? "You don't have access to any targets yet"
                     : 'No targets of that kind'}
@@ -612,7 +613,11 @@
             {@const detail = detailFor(target)}
             <li class="card" aria-busy={openingTarget?.id === target.id}>
                 <div class="card-head">
-                    <span class="card-icon" aria-hidden="true">
+                    <span
+                        class="card-icon"
+                        data-kind={target.kind}
+                        aria-hidden="true"
+                    >
                         <svg
                             viewBox="0 0 16 16"
                             width="18"
@@ -860,12 +865,15 @@
         background: var(--wg-surface-container);
         border: var(--wg-border-width) solid var(--wg-border);
         border-radius: var(--wg-radius-panel);
-        transition: border-color var(--wg-duration-fast) var(--wg-easing);
+        transition:
+            background var(--wg-duration-fast) var(--wg-easing),
+            border-color var(--wg-duration-fast) var(--wg-easing);
     }
 
-    /* The card is not a control; its link and buttons are. The border says
-     * which card the pointer or the focus is in. */
+    /* The card is not a control; its link and buttons are. The border (and a
+     * faint lift of the fill) says which card the pointer or the focus is in. */
     .card:hover {
+        background: var(--wg-surface-container-high);
         border-color: var(--wg-border-strong);
     }
 
@@ -884,23 +892,48 @@
         min-width: 0;
     }
 
+    /*
+     * The kind icon sits on a tint of its family's accent, so a grid of mixed
+     * targets sorts by eye: shells and clusters blue, desktops cyan, web
+     * green, databases amber. The label beside it still says the kind.
+     */
     .card-icon {
+        --kind: var(--wg-primary);
+        --kind-tint: var(--wg-primary-tint);
+
         display: inline-flex;
         align-items: center;
         justify-content: center;
         flex: none;
         width: 2.25rem;
         height: 2.25rem;
-        border: var(--wg-border-width) solid var(--wg-border);
+        border: var(--wg-border-width) solid transparent;
         border-radius: var(--wg-radius-md);
-        background: var(--wg-surface-container-high);
-        color: var(--wg-text-muted);
-        transition: color var(--wg-duration-fast) var(--wg-easing);
+        background: var(--kind-tint);
+        color: var(--kind);
+        transition: border-color var(--wg-duration-fast) var(--wg-easing);
+    }
+
+    .card-icon[data-kind="Rdp"],
+    .card-icon[data-kind="Vnc"] {
+        --kind: var(--wg-info);
+        --kind-tint: var(--wg-info-tint);
+    }
+
+    .card-icon[data-kind="Http"] {
+        --kind: var(--wg-tertiary);
+        --kind-tint: var(--wg-tertiary-tint);
+    }
+
+    .card-icon[data-kind="MySql"],
+    .card-icon[data-kind="Postgres"] {
+        --kind: var(--wg-secondary);
+        --kind-tint: var(--wg-secondary-tint);
     }
 
     .card:hover .card-icon,
     .card:focus-within .card-icon {
-        color: var(--wg-primary);
+        border-color: var(--kind);
     }
 
     .card-title {

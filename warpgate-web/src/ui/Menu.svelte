@@ -465,11 +465,12 @@
         text-align: left;
         text-decoration: none;
         cursor: pointer;
+        transition: background var(--wg-duration-fast) var(--wg-easing);
     }
 
     .wg-menu-item:hover:not([aria-disabled="true"]),
     .wg-menu-item:focus-visible {
-        background: var(--wg-surface-container-highest);
+        background: var(--wg-primary-tint);
     }
 
     .wg-menu-item:focus-visible {

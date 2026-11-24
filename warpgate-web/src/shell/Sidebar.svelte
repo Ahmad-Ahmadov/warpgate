@@ -254,9 +254,10 @@
         outline-offset: calc(-1 * var(--wg-focus-ring-width));
     }
 
-    .wg-nav-active {
-        background: var(--wg-surface-container-highest);
-        color: var(--wg-text);
+    .wg-nav-active,
+    .wg-nav-active:hover {
+        background: var(--wg-primary-tint);
+        color: var(--wg-primary);
         /* A left edge rather than a fill alone: the active item stays
          * identifiable in the collapsed rail, where the label is gone. */
         box-shadow: inset 2px 0 0 var(--wg-primary);

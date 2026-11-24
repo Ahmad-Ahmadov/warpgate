@@ -9,9 +9,9 @@
      *   Toast        floating, transient, global, about an action just taken
      *   StatusMarker a row's state, not a message about it
      *
-     * Colour lives on the left edge and the marker; the fill stays subdued,
-     * per DESIGN.md's rule that accents sit on border and glyph so a page of
-     * these does not become a colour chart.
+     * Colour lives on the left edge and the marker; the fill is only a faint
+     * wash of the same tone, per DESIGN.md's rule that accents sit on border
+     * and glyph so a page of these does not become a colour chart.
      *
      * Live-region policy matches Toast: polite by default, assertive only for
      * `danger`, because a page rendering three info callouts should not
@@ -89,6 +89,11 @@
         gap: var(--wg-space-sm);
         padding: var(--wg-space-md);
         background: var(--wg-surface-container);
+        /* The tone's low-alpha tint, layered over the container */
+        background-image: linear-gradient(
+            var(--tone-tint, transparent),
+            var(--tone-tint, transparent)
+        );
         border: var(--wg-border-width) solid var(--wg-border);
         border-left: 2px solid var(--tone, var(--wg-border-strong));
         border-radius: var(--wg-radius-panel);
@@ -98,15 +103,19 @@
 
     .wg-callout-info {
         --tone: var(--wg-primary);
+        --tone-tint: var(--wg-primary-tint);
     }
     .wg-callout-success {
         --tone: var(--wg-tertiary);
+        --tone-tint: var(--wg-tertiary-tint);
     }
     .wg-callout-warning {
         --tone: var(--wg-secondary);
+        --tone-tint: var(--wg-secondary-tint);
     }
     .wg-callout-danger {
         --tone: var(--wg-error);
+        --tone-tint: var(--wg-error-tint);
     }
 
     /* Optically centred against the first line of text rather than the box */

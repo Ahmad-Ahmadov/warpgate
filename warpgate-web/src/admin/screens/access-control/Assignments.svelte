@@ -21,6 +21,7 @@
         type User,
     } from 'admin/lib/api'
     import { stringifyError } from 'common/errors'
+    import ProtocolLabel from 'common/ProtocolLabel.svelte'
     import Badge from 'ui/Badge.svelte'
     import Button from 'ui/Button.svelte'
     import Callout from 'ui/Callout.svelte'
@@ -506,6 +507,7 @@
     />
     <div class="toolbar-end">
         <Button
+            icon="plus"
             variant="primary"
             size="compact"
             disabled={!$adminPermissions.accessRolesAssign}
@@ -526,6 +528,7 @@
             Disable
         </Button>
         <Button
+            icon="trash"
             size="compact"
             variant="destructive"
             onclick={() => previewBulk(AccessAssignmentBulkAction.Revoke)}
@@ -546,11 +549,13 @@
     <SkeletonRow rows={5} columns={[1, 2, 2, 1, 2, 2, 2, 1, 1]} />
 {:else if !shown.length}
     <EmptyState
+        icon={assignments.length ? 'search' : 'access'}
         title={assignments.length ? 'Nothing matches' : 'No access assigned'}
         hint="Users connect to a target only through an assignment: direct, or through an access group."
     >
         {#snippet action()}
             <Button
+                icon="plus"
                 variant="primary"
                 size="compact"
                 disabled={!$adminPermissions.accessRolesAssign}
@@ -610,7 +615,11 @@
                                 {a.targetName || '(deleted target)'}
                             </a>
                         </td>
-                        <td class="wg-mono">{a.protocol.toUpperCase()}</td>
+                        <td class="wg-mono">
+                            <ProtocolLabel protocol={a.protocol}>
+                                {a.protocol.toUpperCase()}
+                            </ProtocolLabel>
+                        </td>
                         <td class="wg-mono">{a.account ?? '—'}</td>
                         <td>
                             {#if a.authMethod}
@@ -624,7 +633,7 @@
                         <td>
                             {#if a.source === AccessAssignmentSource.Group}
                                 <Badge
-                                    tone="primary"
+                                    tone="info"
                                     href="#/config/access-control/groups?group={a.groupId}"
                                 >
                                     Group: {a.groupName}
@@ -652,6 +661,7 @@
                             <div class="row-actions">
                                 {#if a.source === AccessAssignmentSource.Direct}
                                     <Button
+                                        icon="edit"
                                         variant="ghost"
                                         size="compact"
                                         disabled={!$adminPermissions.accessRolesAssign}
@@ -668,6 +678,7 @@
                                         {a.enabled ? 'Disable' : 'Enable'}
                                     </Button>
                                     <Button
+                                        icon="trash"
                                         variant="destructive"
                                         size="compact"
                                         disabled={!$adminPermissions.accessRolesAssign}

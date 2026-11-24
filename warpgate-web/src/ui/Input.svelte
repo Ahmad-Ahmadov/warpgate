@@ -227,6 +227,10 @@
         height: var(--wg-control-height-compact);
     }
 
+    .wg-input-shell:hover:not(:focus-within):not(.wg-input-invalid):not(.wg-input-disabled) {
+        border-color: var(--wg-outline);
+    }
+
     .wg-input-shell:focus-within {
         border-color: var(--wg-primary);
         outline: var(--wg-focus-ring);

@@ -80,6 +80,7 @@
             />
         {/if}
         <Button
+            icon="plus"
             variant="primary"
             size="compact"
             disabled={!$adminPermissions.usersCreate}
@@ -113,12 +114,14 @@
 
     {#snippet empty()}
         <EmptyState
+            icon="user"
             size="compact"
             title="No users yet"
             hint="Users sign in to reach the targets their roles allow."
         >
             {#snippet action()}
                 <Button
+                    icon="plus"
                     variant="primary"
                     size="compact"
                     disabled={!$adminPermissions.usersCreate}

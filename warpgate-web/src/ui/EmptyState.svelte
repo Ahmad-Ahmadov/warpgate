@@ -10,8 +10,12 @@
      *    "add one".
      */
     import type { Snippet } from 'svelte'
+    import Icon from './Icon.svelte'
+    import type { IconName } from './icons'
 
     interface Props {
+        /** An icon from `ui/icons.ts`, shown above the title in a tinted disc. */
+        icon?: IconName
         title: string
         hint?: string
         /** 'compact' fits inside a table body; 'page' stands alone. */
@@ -21,6 +25,7 @@
     }
 
     let {
+        icon,
         title,
         hint,
         size = 'page',
@@ -30,6 +35,11 @@
 </script>
 
 <div class="wg-empty wg-empty-{size} {className}">
+    {#if icon}
+        <span class="wg-empty-icon">
+            <Icon name={icon} size={size === 'compact' ? 16 : 20} />
+        </span>
+    {/if}
     <p class="wg-empty-title">{title}</p>
     {#if hint}
         <p class="wg-empty-hint">{hint}</p>
@@ -57,6 +67,24 @@
 
     .wg-empty-compact {
         padding: var(--wg-space-xl) var(--wg-space-lg);
+    }
+
+    .wg-empty-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 2.75rem;
+        height: 2.75rem;
+        margin-bottom: var(--wg-space-sm);
+        border-radius: 50%;
+        background: var(--wg-primary-tint);
+        color: var(--wg-primary);
+    }
+
+    .wg-empty-compact .wg-empty-icon {
+        width: 2.25rem;
+        height: 2.25rem;
+        margin-bottom: var(--wg-space-xs);
     }
 
     .wg-empty-title {

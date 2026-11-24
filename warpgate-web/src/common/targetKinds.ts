@@ -33,3 +33,23 @@ export const TARGET_KIND_ICONS: Record<TargetKind, string> = {
     [TargetKind.Vnc]: DESKTOP_ICON,
     [TargetKind.Rdp]: DESKTOP_ICON,
 }
+
+const PROTOCOL_KINDS: Record<string, TargetKind> = {
+    ssh: TargetKind.Ssh,
+    http: TargetKind.Http,
+    mysql: TargetKind.MySql,
+    postgres: TargetKind.Postgres,
+    postgresql: TargetKind.Postgres,
+    kubernetes: TargetKind.Kubernetes,
+    vnc: TargetKind.Vnc,
+    rdp: TargetKind.Rdp,
+}
+
+/**
+ * The kind icon for a protocol as sessions and assignments name it ("SSH",
+ * "rdp", "PostgreSQL"); `undefined` for one this does not know.
+ */
+export function protocolIcon(protocol: string): string | undefined {
+    const kind = PROTOCOL_KINDS[protocol.trim().toLowerCase()]
+    return kind ? TARGET_KIND_ICONS[kind] : undefined
+}

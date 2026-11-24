@@ -10,10 +10,14 @@
 <script lang="ts">
     import type { Snippet } from 'svelte'
     import { AsyncAction, AsyncState } from './asyncAction.svelte'
+    import Icon from './Icon.svelte'
+    import type { IconName } from './icons'
     import Spinner from './Spinner.svelte'
 
     interface Props {
         variant?: ButtonVariant
+        /** A leading icon from `ui/icons.ts`, drawn before the label. */
+        icon?: IconName
         size?: ButtonSize
         type?: 'button' | 'submit' | 'reset'
         disabled?: boolean
@@ -43,6 +47,7 @@
 
     let {
         variant = 'secondary',
+        icon,
         size = 'standard',
         type = 'button',
         disabled = false,
@@ -89,6 +94,9 @@
     onclick={handleClick}
 >
     {#if showLabel}
+        {#if icon}
+            <Icon name={icon} size={size === 'compact' ? 14 : 16} />
+        {/if}
         {@render children?.()}
     {/if}
 
@@ -159,7 +167,8 @@
         transition:
             background var(--wg-duration-fast) var(--wg-easing),
             border-color var(--wg-duration-fast) var(--wg-easing),
-            color var(--wg-duration-fast) var(--wg-easing);
+            color var(--wg-duration-fast) var(--wg-easing),
+            box-shadow var(--wg-duration-fast) var(--wg-easing);
     }
 
     .wg-btn-compact {
@@ -197,6 +206,7 @@
     .wg-btn-primary:hover:not(:disabled) {
         background: var(--wg-primary-container);
         color: var(--wg-on-primary-container);
+        box-shadow: 0 0 0 3px var(--wg-primary-tint);
     }
     .wg-btn-primary:active:not(:disabled) {
         background: var(--wg-inverse-primary);
@@ -211,6 +221,7 @@
     }
     .wg-btn-secondary:hover:not(:disabled) {
         background: var(--wg-surface-container-high);
+        border-color: var(--wg-outline);
     }
     .wg-btn-secondary:active:not(:disabled) {
         background: var(--wg-surface-container-highest);
@@ -242,7 +253,7 @@
         color: var(--wg-text-muted);
     }
     .wg-btn-ghost:hover:not(:disabled) {
-        background: var(--wg-surface-container-high);
+        background: var(--wg-primary-tint);
         color: var(--wg-text);
     }
 

@@ -1,15 +1,17 @@
 import type { AdminPermissionKey } from 'admin/lib/store'
 import type { AdminPermissions } from 'gateway/lib/api'
+import { ICONS } from 'ui/icons'
 
 /**
  * Sidebar navigation, gated on the same ADMIN_PERMISSIONS keys the palette
  * uses. One list, one gate — a nav item the operator cannot reach is absent,
  * not disabled, for the same disclosure reason.
  *
- * `icon` is a path drawn on a 16×16 viewBox. Icons are inline paths rather
- * than a FontAwesome import because the collapsed rail renders them at every
- * route and the existing @fortawesome packages are only pulled in by screens
- * that have not migrated yet.
+ * `icon` is a path drawn on a 16×16 viewBox, from the shared set in
+ * `ui/icons.ts`. Icons are inline paths rather than a FontAwesome import
+ * because the collapsed rail renders them at every route and the existing
+ * @fortawesome packages are only pulled in by screens that have not migrated
+ * yet.
  */
 
 export interface NavItem {
@@ -31,23 +33,6 @@ export interface NavSection {
     id: string
     label: string
     items: NavItem[]
-}
-
-const ICONS = {
-    sessions: 'M2 4h12M2 8h12M2 12h8',
-    requests: 'M8 2v6l4 2M8 14A6 6 0 108 2a6 6 0 000 12z',
-    shield: 'M8 2l5 2v4c0 3-2 5.5-5 6-3-.5-5-3-5-6V4l5-2z',
-    network: 'M8 2v4M8 10v4M3 8h10M4 5l8 6M12 5l-8 6',
-    log: 'M4 2h8v12H4zM6 5h4M6 8h4M6 11h2',
-    overview: 'M2 2h5v5H2zM9 2h5v3H9zM9 7h5v7H9zM2 9h5v5H2z',
-    target: 'M8 2a6 6 0 100 12A6 6 0 008 2zm0 3a3 3 0 100 6 3 3 0 000-6z',
-    group: 'M3 4h4v4H3zM9 4h4v4H9zM3 10h4v4H3zM9 10h4v4H9z',
-    user: 'M8 8a3 3 0 100-6 3 3 0 000 6zM2 14c0-3 2.5-4.5 6-4.5S14 11 14 14',
-    key: 'M10 2a4 4 0 00-3.5 6L2 12.5V14h2l.5-1.5H6V11h1.5l.5-.5A4 4 0 1010 2z',
-    ticket: 'M2 5h12v2a1.5 1.5 0 000 3v2H2v-2a1.5 1.5 0 000-3z',
-    sliders: 'M2 5h8M12 5h2M2 11h2M6 11h8M10 3v4M4 9v4',
-    directory: 'M2 3h5l1 2h6v8H2z',
-    vault: 'M2 3h12v10H2zM8 6a2 2 0 100 4 2 2 0 000-4zM8 8h3M4 13v1M12 13v1',
 }
 
 export const NAV_SECTIONS: NavSection[] = [
@@ -143,7 +128,7 @@ export const NAV_SECTIONS: NavSection[] = [
                 href: '#/config/access-control',
                 match: '/config/access-control',
                 alsoMatch: ['/config/access-roles', '/config/account-access'],
-                icon: ICONS.shield,
+                icon: ICONS.access,
                 requires: 'accessRolesAssign',
             },
             {

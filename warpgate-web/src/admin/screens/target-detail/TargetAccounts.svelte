@@ -399,6 +399,7 @@
                         <td>
                             <div class="row-actions">
                                 <Button
+                                    icon="edit"
                                     variant="ghost"
                                     size="compact"
                                     disabled={!$adminPermissions.targetsEdit}
@@ -407,6 +408,7 @@
                                     Edit
                                 </Button>
                                 <Button
+                                    icon="trash"
                                     variant="destructive"
                                     size="compact"
                                     disabled={!$adminPermissions.targetsEdit}
@@ -424,7 +426,7 @@
 {/if}
 
 <div class="add">
-    <Button size="compact" disabled={!$adminPermissions.targetsEdit} onclick={openAdd}>
+    <Button icon="plus" size="compact" disabled={!$adminPermissions.targetsEdit} onclick={openAdd}>
         Add account
     </Button>
 </div>

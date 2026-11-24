@@ -25,6 +25,7 @@
     import { autosave } from 'common/autosave'
     import GettingStarted from 'common/GettingStarted.svelte'
     import type { LoadOptions, PaginatedResponse } from 'common/ItemList.svelte'
+    import ProtocolLabel from 'common/ProtocolLabel.svelte'
     import { sessionRecordingStatus } from 'common/recordings'
     import { formatDistanceStrict } from 'date-fns'
     import { serverInfo } from 'gateway/lib/store'
@@ -191,6 +192,7 @@
 
         {#if $adminPermissions.sessionsTerminate && activeSessionCount}
             <Button
+                icon="close"
                 variant="destructive"
                 size="compact"
                 onclick={() => (closeAllOpen = true)}
@@ -238,7 +240,7 @@
             </td>
             <td class="wg-mono">{userOf(session)}</td>
             <td class="wg-mono">{targetsOf(session)}</td>
-            <td>{session.protocol}</td>
+            <td><ProtocolLabel protocol={session.protocol} /></td>
             <td class="wg-mono">{session.remoteAddress ?? '—'}</td>
             <td><RelativeDate date={session.started} /></td>
             <td class="num">{durationOf(session)}</td>
@@ -259,12 +261,14 @@
         {#snippet empty()}
             {#if canViewRecordings && $showRecordedOnly}
                 <EmptyState
+                    icon="recording"
                     size="compact"
                     title="No recorded sessions"
                     hint="Turn off Has recording to see every session."
                 />
             {:else}
                 <EmptyState
+                    icon="sessions"
                     size="compact"
                     title="No sessions"
                     hint="Connections appear here as soon as a user opens one."

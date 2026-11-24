@@ -30,40 +30,50 @@
      * Colour — dark (authoritative; DESIGN.md frontmatter palette)
      * --------------------------------------------------------------- */
 
-    /* Substrates, lowest to highest elevation */
-    --wg-surface-container-lowest: #0b0f13;
-    --wg-surface: #101418;
-    --wg-surface-dim: #101418;
-    --wg-surface-container-low: #181c20;
-    --wg-surface-container: #1c2024;
-    --wg-surface-container-high: #262a2f;
-    --wg-surface-container-highest: #31353a;
-    --wg-surface-bright: #363a3e;
-    --wg-surface-variant: #31353a;
+    /*
+     * Substrates, lowest to highest elevation. A faint blue cast (rather than
+     * neutral grey) separates the tiers a little more clearly and reads as
+     * calmer next to the blue accents; the steps between tiers are unchanged
+     * in spirit, slightly wider in fact.
+     */
+    --wg-surface-container-lowest: #0a0e14;
+    --wg-surface: #0f141b;
+    --wg-surface-dim: #0f141b;
+    --wg-surface-container-low: #151b23;
+    --wg-surface-container: #1a212a;
+    --wg-surface-container-high: #232b35;
+    --wg-surface-container-highest: #2d3641;
+    --wg-surface-bright: #353e49;
+    --wg-surface-variant: #2d3641;
 
-    /* Ink */
-    --wg-on-surface: #e0e3e8;
-    --wg-on-surface-variant: #c3c6d2;
-    --wg-outline: #8d919c;
-    --wg-outline-variant: #424750;
+    /* Ink — a touch brighter than before for body text */
+    --wg-on-surface: #e4e9f1;
+    --wg-on-surface-variant: #c6ccd9;
+    --wg-outline: #8e96a4;
+    --wg-outline-variant: #3f4855;
 
-    /* Primary — interactive targets, selection, focus */
-    --wg-primary: #a9c7ff;
-    --wg-on-primary: #003063;
-    --wg-primary-container: #7ba7f0;
-    --wg-on-primary-container: #003b77;
+    /* Primary — interactive targets, selection, focus. A clearer, slightly
+     * more saturated blue than M3's #a9c7ff; 8.6:1 on the canvas. */
+    --wg-primary: #8db4ff;
+    --wg-on-primary: #00285c;
+    --wg-primary-container: #7aa5ff;
+    --wg-on-primary-container: #002a63;
 
     /* Secondary / amber — live connections, warning tier */
-    --wg-secondary: #ffb94e;
+    --wg-secondary: #ffbc57;
     --wg-on-secondary: #452b00;
     --wg-secondary-container: #c88601;
     --wg-on-secondary-container: #3f2700;
 
     /* Tertiary / green — healthy, verified, nominal */
-    --wg-tertiary: #69dc9d;
+    --wg-tertiary: #5fe0a0;
     --wg-on-tertiary: #003920;
     --wg-tertiary-container: #46bb7f;
     --wg-on-tertiary-container: #004629;
+
+    /* Info / cyan — neutral facts worth noticing: an origin, a source */
+    --wg-info: #5ad1e6;
+    --wg-on-info: #00363f;
 
     /*
      * Error — re-hued from M3's #ffb4ab, a salmon that reads as a warning
@@ -76,9 +86,22 @@
     --wg-error-container: #93000a;
     --wg-on-error-container: #ffdad6;
 
-    --wg-inverse-surface: #e0e3e8;
+    --wg-inverse-surface: #e4e9f1;
     --wg-inverse-on-surface: #2d3135;
     --wg-inverse-primary: #2e5ea2;
+
+    /*
+     * Tints — low-alpha washes of the accents, for the background of a
+     * selected row, an active tab or navigation item, and badges that carry
+     * a meaning. Text on a tint keeps the accent's own contrast: the wash
+     * shifts the substrate by well under one tonal step.
+     */
+    --wg-primary-tint: rgb(141 180 255 / 0.14);
+    --wg-primary-tint-strong: rgb(141 180 255 / 0.22);
+    --wg-secondary-tint: rgb(255 188 87 / 0.13);
+    --wg-tertiary-tint: rgb(95 224 160 / 0.13);
+    --wg-error-tint: rgb(255 123 123 / 0.13);
+    --wg-info-tint: rgb(90 209 230 / 0.13);
 
     /* ---------------------------------------------------------------
      * Semantic aliases — what components actually reference
@@ -114,10 +137,10 @@
      */
     --wg-text: var(--wg-on-surface);
     --wg-text-muted: var(--wg-on-surface-variant);
-    --wg-text-subtle: #9da0ac;
+    --wg-text-subtle: #a0a7b5;
 
     --wg-row-hover: var(--wg-surface-container-high);
-    --wg-row-selected: var(--wg-surface-container-highest);
+    --wg-row-selected: var(--wg-primary-tint);
     --wg-row-stripe: var(--wg-surface-container-low);
 
     /*
@@ -237,7 +260,7 @@
      * --------------------------------------------------------------- */
 
     --wg-duration-instant: 70ms;
-    --wg-duration-fast: 125ms;
+    --wg-duration-fast: 150ms;
     --wg-duration-normal: 200ms;
     --wg-easing: cubic-bezier(0.2, 0, 0.13, 1);
 }
@@ -254,34 +277,37 @@
         color-scheme: light;
 
         --wg-surface-container-lowest: #ffffff;
-        --wg-surface: #f5faff;
-        --wg-surface-dim: #eaeef4;
-        --wg-surface-container-low: #eff4fa;
-        --wg-surface-container: #eaeef4;
-        --wg-surface-container-high: #e4e9ee;
-        --wg-surface-container-highest: #dee3e8;
-        --wg-surface-bright: #f5faff;
-        --wg-surface-variant: #dee3e8;
+        --wg-surface: #f6f8fc;
+        --wg-surface-dim: #ebeff5;
+        --wg-surface-container-low: #f0f3f8;
+        --wg-surface-container: #e9eef5;
+        --wg-surface-container-high: #e2e8f0;
+        --wg-surface-container-highest: #dbe2eb;
+        --wg-surface-bright: #f6f8fc;
+        --wg-surface-variant: #dbe2eb;
 
-        --wg-on-surface: #181c20;
-        --wg-on-surface-variant: #444650;
-        --wg-outline: #747782;
-        --wg-outline-variant: #c3c6d2;
+        --wg-on-surface: #141a22;
+        --wg-on-surface-variant: #414857;
+        --wg-outline: #6f7686;
+        --wg-outline-variant: #c4cad6;
 
-        --wg-primary: #3d5f90;
+        --wg-primary: #2b5fd9;
         --wg-on-primary: #ffffff;
-        --wg-primary-container: #d6e3ff;
-        --wg-on-primary-container: #001c38;
+        --wg-primary-container: #dbe5ff;
+        --wg-on-primary-container: #062a6b;
 
-        --wg-secondary: #815500;
+        --wg-secondary: #8a5700;
         --wg-on-secondary: #ffffff;
         --wg-secondary-container: #ffddb5;
         --wg-on-secondary-container: #271900;
 
-        --wg-tertiary: #016d41;
+        --wg-tertiary: #0b7a48;
         --wg-on-tertiary: #ffffff;
         --wg-tertiary-container: #86f9b8;
         --wg-on-tertiary-container: #002110;
+
+        --wg-info: #0b7489;
+        --wg-on-info: #ffffff;
 
         /* L*=41 rather than M3's 43: 43 measures 4.48 on the highest
          * surface, the same near-miss the dark theme had. */
@@ -294,8 +320,15 @@
         --wg-inverse-on-surface: #ecf1f7;
         --wg-inverse-primary: #a9c7ff;
 
+        --wg-primary-tint: rgb(43 95 217 / 0.1);
+        --wg-primary-tint-strong: rgb(43 95 217 / 0.16);
+        --wg-secondary-tint: rgb(138 87 0 / 0.1);
+        --wg-tertiary-tint: rgb(11 122 72 / 0.1);
+        --wg-error-tint: rgb(175 52 60 / 0.1);
+        --wg-info-tint: rgb(11 116 137 / 0.1);
+
         --wg-surface-sunken: var(--wg-surface-container-low);
-        --wg-text-subtle: #60636d;
+        --wg-text-subtle: #5b6270;
         --wg-shadow-overlay: 0 4px 16px rgb(0 0 0 / 0.15);
     }
 }
@@ -304,34 +337,37 @@
     color-scheme: light;
 
     --wg-surface-container-lowest: #ffffff;
-    --wg-surface: #f5faff;
-    --wg-surface-dim: #eaeef4;
-    --wg-surface-container-low: #eff4fa;
-    --wg-surface-container: #eaeef4;
-    --wg-surface-container-high: #e4e9ee;
-    --wg-surface-container-highest: #dee3e8;
-    --wg-surface-bright: #f5faff;
-    --wg-surface-variant: #dee3e8;
+    --wg-surface: #f6f8fc;
+    --wg-surface-dim: #ebeff5;
+    --wg-surface-container-low: #f0f3f8;
+    --wg-surface-container: #e9eef5;
+    --wg-surface-container-high: #e2e8f0;
+    --wg-surface-container-highest: #dbe2eb;
+    --wg-surface-bright: #f6f8fc;
+    --wg-surface-variant: #dbe2eb;
 
-    --wg-on-surface: #181c20;
-    --wg-on-surface-variant: #444650;
-    --wg-outline: #747782;
-    --wg-outline-variant: #c3c6d2;
+    --wg-on-surface: #141a22;
+    --wg-on-surface-variant: #414857;
+    --wg-outline: #6f7686;
+    --wg-outline-variant: #c4cad6;
 
-    --wg-primary: #3d5f90;
+    --wg-primary: #2b5fd9;
     --wg-on-primary: #ffffff;
-    --wg-primary-container: #d6e3ff;
-    --wg-on-primary-container: #001c38;
+    --wg-primary-container: #dbe5ff;
+    --wg-on-primary-container: #062a6b;
 
-    --wg-secondary: #815500;
+    --wg-secondary: #8a5700;
     --wg-on-secondary: #ffffff;
     --wg-secondary-container: #ffddb5;
     --wg-on-secondary-container: #271900;
 
-    --wg-tertiary: #016d41;
+    --wg-tertiary: #0b7a48;
     --wg-on-tertiary: #ffffff;
     --wg-tertiary-container: #86f9b8;
     --wg-on-tertiary-container: #002110;
+
+    --wg-info: #0b7489;
+    --wg-on-info: #ffffff;
 
     --wg-error: #af343c;
     --wg-on-error: #ffffff;
@@ -342,8 +378,15 @@
     --wg-inverse-on-surface: #ecf1f7;
     --wg-inverse-primary: #a9c7ff;
 
+    --wg-primary-tint: rgb(43 95 217 / 0.1);
+    --wg-primary-tint-strong: rgb(43 95 217 / 0.16);
+    --wg-secondary-tint: rgb(138 87 0 / 0.1);
+    --wg-tertiary-tint: rgb(11 122 72 / 0.1);
+    --wg-error-tint: rgb(175 52 60 / 0.1);
+    --wg-info-tint: rgb(11 116 137 / 0.1);
+
     --wg-surface-sunken: var(--wg-surface-container-low);
-    --wg-text-subtle: #60636d;
+    --wg-text-subtle: #5b6270;
     --wg-shadow-overlay: 0 4px 16px rgb(0 0 0 / 0.15);
 }
 

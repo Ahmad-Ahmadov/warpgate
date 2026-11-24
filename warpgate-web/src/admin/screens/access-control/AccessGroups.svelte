@@ -19,6 +19,7 @@
         type TargetAccount,
     } from 'admin/lib/api'
     import { stringifyError } from 'common/errors'
+    import ProtocolLabel from 'common/ProtocolLabel.svelte'
     import Badge from 'ui/Badge.svelte'
     import Button from 'ui/Button.svelte'
     import Callout from 'ui/Callout.svelte'
@@ -268,11 +269,13 @@
     <SkeletonRow rows={4} columns={[2, 1, 1]} />
 {:else if !groups.length}
     <EmptyState
+        icon="users"
         title="No access groups"
         hint="Groups are optional: they grant the same access to many users at once. Direct assignments work without them."
     >
         {#snippet action()}
             <Button
+                icon="plus"
                 variant="primary"
                 size="compact"
                 disabled={!$adminPermissions.accessRolesCreate}
@@ -353,11 +356,16 @@
                                         <td>
                                             <a href="#/config/targets/{grant.targetId}">{grant.targetName}</a>
                                         </td>
-                                        <td class="wg-mono">{grant.protocol.toUpperCase()}</td>
+                                        <td class="wg-mono">
+                                            <ProtocolLabel protocol={grant.protocol}>
+                                                {grant.protocol.toUpperCase()}
+                                            </ProtocolLabel>
+                                        </td>
                                         <td class="wg-mono">{grant.account ?? '—'}</td>
                                         <td>{grant.excludedCount}</td>
                                         <td class="actions">
                                             <Button
+                                                icon="trash"
                                                 variant="destructive"
                                                 size="compact"
                                                 disabled={!$adminPermissions.accessRolesAssign}
@@ -391,6 +399,7 @@
                         />
                     {/if}
                     <Button
+                        icon="plus"
                         size="compact"
                         disabled={!$adminPermissions.accessRolesAssign ||
                             !grantTarget ||

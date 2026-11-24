@@ -150,6 +150,10 @@
         height: var(--wg-control-height-compact);
     }
 
+    .wg-select-shell:hover:not(:focus-within):not(.wg-select-invalid):not(.wg-select-disabled) {
+        border-color: var(--wg-outline);
+    }
+
     .wg-select-shell:focus-within {
         border-color: var(--wg-primary);
         outline: var(--wg-focus-ring);

@@ -134,6 +134,7 @@
     <SkeletonRow rows={4} columns={[3, 2, 2]} />
 {:else if !items.length}
     <EmptyState
+        icon="check"
         title="Nothing to review"
         hint="The upgrade found no earlier permissions to migrate."
     />
@@ -191,6 +192,7 @@
                         oninput={e => (notes[item.id] = (e.target as HTMLInputElement).value)}
                     />
                     <Button
+                        icon="check"
                         size="compact"
                         variant="primary"
                         disabled={!$adminPermissions.accessRolesAssign ||
@@ -200,6 +202,7 @@
                         Confirm
                     </Button>
                     <Button
+                        icon="close"
                         size="compact"
                         variant="ghost"
                         disabled={!$adminPermissions.accessRolesAssign}

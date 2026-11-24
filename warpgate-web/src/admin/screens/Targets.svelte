@@ -17,6 +17,7 @@
     import { api, type Target, type TargetGroup } from 'admin/lib/api'
     import { autosave } from 'common/autosave'
     import { stringifyError } from 'common/errors'
+    import ProtocolLabel from 'common/ProtocolLabel.svelte'
     import {
         orderForGroupedList,
         type ResolvedGroup,
@@ -157,6 +158,7 @@
             />
         {/if}
         <Button
+            icon="plus"
             variant="primary"
             size="compact"
             disabled={!$adminPermissions.targetsCreate}
@@ -214,7 +216,9 @@
             <td class="wg-mono">{target.name}</td>
             <td class="wg-mono muted">{addressOf(target)}</td>
             <td>
-                {PROTOCOL_LABELS[target.options.kind] ?? target.options.kind}
+                <ProtocolLabel protocol={target.options.kind}>
+                    {PROTOCOL_LABELS[target.options.kind] ?? target.options.kind}
+                </ProtocolLabel>
             </td>
             <td>
                 {#if target.requireApproval}
@@ -234,12 +238,14 @@
 
         {#snippet empty()}
             <EmptyState
+                icon="target"
                 size="compact"
                 title="No targets yet"
                 hint="Targets are destinations on the internal network that your users connect to."
             >
                 {#snippet action()}
                     <Button
+                        icon="plus"
                         variant="primary"
                         size="compact"
                         disabled={!$adminPermissions.targetsCreate}

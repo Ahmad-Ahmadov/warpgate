@@ -459,6 +459,10 @@
         font-variant-numeric: tabular-nums;
     }
 
+    :global(.wg-table tbody tr) {
+        transition: background var(--wg-duration-fast) var(--wg-easing);
+    }
+
     :global(.wg-table-dense th),
     :global(.wg-table-dense td) {
         height: var(--wg-row-height-dense);

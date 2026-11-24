@@ -61,6 +61,7 @@
     import Button from 'ui/Button.svelte'
     import Callout from 'ui/Callout.svelte'
     import ConfirmDialog from 'ui/ConfirmDialog.svelte'
+    import Icon from 'ui/Icon.svelte'
     import Input from 'ui/Input.svelte'
     import Modal from 'ui/Modal.svelte'
     import Select from 'ui/Select.svelte'
@@ -334,6 +335,7 @@
                                     class="access-link"
                                     href="#/config/access-control?target={target.id}"
                                 >
+                                    <Icon name="access" size={14} />
                                     Manage access in Access Control
                                 </a>
                             {/snippet}
@@ -484,7 +486,7 @@
         <div class="action-bar">
             <div class="action-bar-start">
                 {#if canUseWebClient}
-                    <Button click={connect}>Connect</Button>
+                    <Button icon="connect" click={connect}>Connect</Button>
                 {/if}
                 <Button onclick={() => (instructionsOpen = true)}>
                     Access instructions
@@ -498,6 +500,7 @@
                 Update configuration
             </Button>
             <Button
+                icon="trash"
                 variant="destructive"
                 disabled={!$adminPermissions.targetsDelete}
                 onclick={() => (deleteOpen = true)}
@@ -615,6 +618,9 @@
     }
 
     .access-link {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--wg-space-xs);
         color: var(--wg-primary);
         font: var(--wg-text-label-md);
     }
