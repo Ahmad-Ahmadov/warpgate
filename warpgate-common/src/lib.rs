@@ -1,3 +1,4 @@
+mod access_rules;
 pub mod api;
 pub mod audit;
 pub mod auth;
@@ -15,6 +16,7 @@ mod try_macro;
 mod types;
 pub mod version;
 
+pub use access_rules::*;
 pub use config::*;
 pub use error::{UserFacingReason, WarpgateError, io_connect_reason};
 pub use helpers::password_policy::{PasswordPolicy, PasswordPolicyViolation, validate_password};

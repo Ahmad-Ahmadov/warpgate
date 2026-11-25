@@ -52,13 +52,23 @@ pub async fn resolve_admin_approval(
             .await
             .register_approved_target_session(approved)
             .await?),
-        PolledGate::Pending => Err(gate_response(
-            &target_name,
-            "Waiting for approval",
-            "An administrator has been asked to approve this session. This page will \
-             continue automatically once they do.",
-            true,
-        )),
+        PolledGate::Pending => {
+            // An access policy asked for this one: say why, for which account, and for how long.
+            let message = services
+                .pending_approval_notice(session_id, &target_name)
+                .await
+                .unwrap_or_else(|| {
+                    "An administrator has been asked to approve this session. This page will \
+                     continue automatically once they do."
+                        .to_owned()
+                });
+            Err(gate_response(
+                &target_name,
+                "Waiting for approval",
+                &message,
+                true,
+            ))
+        }
         PolledGate::Refused => Err(gate_response(
             &target_name,
             "Session not approved",

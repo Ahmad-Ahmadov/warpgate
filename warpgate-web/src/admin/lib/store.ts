@@ -72,7 +72,7 @@ export const ADMIN_PERMISSIONS = [
     },
     {
         key: 'accessRolesAssign' as const,
-        label: 'Assign',
+        label: 'Grant access',
         category: 'Access control' as const,
     },
     {

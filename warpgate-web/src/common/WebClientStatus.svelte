@@ -24,7 +24,11 @@
             return 'Disconnected'
         }
         if (phase?.phase === 'awaiting_approval') {
-            return 'Waiting for an administrator to approve this session…'
+            // An access policy asked for this one: say why, for which account, and for how long.
+            return (
+                phase.notice ??
+                'Waiting for an administrator to approve this session…'
+            )
         }
         if (socket?.state === SocketState.Connecting && socket.attempt > 0) {
             return `Reconnecting (attempt ${socket.attempt})`

@@ -53,7 +53,12 @@ pub enum LiveSessionPhase {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum SessionPhase {
-    AwaitingApproval,
+    AwaitingApproval {
+        /// Why approval is needed, for which account, and how long the request waits: set when
+        /// an access policy asked for it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        notice: Option<String>,
+    },
     Connecting,
     Connected,
     Closed {
@@ -65,7 +70,7 @@ pub enum SessionPhase {
 impl From<LiveSessionPhase> for SessionPhase {
     fn from(phase: LiveSessionPhase) -> Self {
         match phase {
-            LiveSessionPhase::AwaitingApproval => Self::AwaitingApproval,
+            LiveSessionPhase::AwaitingApproval => Self::AwaitingApproval { notice: None },
             LiveSessionPhase::Connecting => Self::Connecting,
             LiveSessionPhase::Connected => Self::Connected,
         }
@@ -209,6 +214,13 @@ impl<M: Sheddable + From<SessionPhase>> WebSession<M> {
 
     pub async fn set_phase(&self, phase: LiveSessionPhase) {
         self.transition(phase.into()).await;
+    }
+
+    /// The session is waiting for an approval; `notice` says why, when there is more to say
+    /// than "an administrator has to approve it".
+    pub async fn set_awaiting_approval(&self, notice: Option<String>) {
+        self.transition(SessionPhase::AwaitingApproval { notice })
+            .await;
     }
 
     async fn transition(&self, phase: SessionPhase) {
@@ -376,6 +388,7 @@ where
     M: Sheddable + From<SessionPhase>,
     O: Send + Sync,
 {
+    let target_name = authorization.target().name.clone();
     admit_target_session(
         services,
         session.server_handle(),
@@ -385,7 +398,11 @@ where
             credentials: RememberApprovalBy::Nothing,
         },
         || async {
-            session.set_phase(LiveSessionPhase::AwaitingApproval).await;
+            let session_id = session.server_handle().lock().await.user_session_id();
+            let notice = services
+                .pending_approval_notice(session_id, &target_name)
+                .await;
+            session.set_awaiting_approval(notice).await;
             Ok(())
         },
     )

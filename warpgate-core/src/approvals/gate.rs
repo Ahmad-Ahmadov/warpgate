@@ -158,28 +158,46 @@ impl Services {
         Fut: Future<Output = Result<(), E>>,
     {
         let subject = connection.subject_for(session_id, &authorization);
-        if !authorization.target().require_approval {
-            return Ok(GateOutcome::Approved(ApprovedTarget::new(authorization)));
-        }
+        // None: this connection needs no approval. A policy's approvals are single use and
+        // bound to the account, so they are never remembered; the target's own setting still is.
+        let ask = match requirement_for(&self.db, &authorization).await? {
+            Requirement::None => {
+                return Ok(GateOutcome::Approved(ApprovedTarget::new(authorization)));
+            }
+            Requirement::TargetSetting => None,
+            Requirement::Policy(ask) => Some(ask),
+        };
 
         let session_id = subject.session_id;
 
-        if self.admin_approval_is_remembered(&subject).await? {
+        if ask.is_none() && self.admin_approval_is_remembered(&subject).await? {
             subject.emit_bypassed_event();
             return Ok(GateOutcome::Approved(ApprovedTarget::new(authorization)));
         }
 
+        if let Some(ask) = &ask {
+            self.prepare_policy_request(&subject, ask).await?;
+        }
+
         let mut guard = PendingApproval::guarding(self.db.clone(), &subject);
-        if matches!(
-            self.announce_admin_request(&subject).await?,
-            Advertised::TicketExhausted
-        ) {
-            return Ok(GateOutcome::Refused);
+        match self.announce_admin_request(&subject).await? {
+            Advertised::TicketExhausted => return Ok(GateOutcome::Refused),
+            Advertised::Asked => {
+                if let Some(ask) = &ask {
+                    self.emit_policy_request(&authorization, &subject, ask)
+                        .await?;
+                }
+            }
+            Advertised::AlreadyAdvertised => {}
         }
 
         notify_waiting().await?;
 
-        let timeout = self.admin_approval_timeout().await?;
+        let timeout = if ask.is_some() {
+            self.policy_wait(&subject).await?
+        } else {
+            self.admin_approval_timeout().await?
+        };
         // audite event has already been emitted by the resolving code
         let decision = match await_row_decision(
             &self.db,
@@ -224,6 +242,17 @@ impl Services {
 
         match decision {
             ApprovalDecision::Approved(_) => {
+                if ask.is_some() {
+                    match self.spend_policy_approval(&authorization, &subject).await? {
+                        Spent::Yes => {}
+                        // Lapsed, spent, or for another account: it may be asked again.
+                        Spent::NeedsNewRequest => {
+                            self.discard_policy_request(&subject).await?;
+                            return Ok(GateOutcome::Expired);
+                        }
+                        Spent::Refused => return Ok(GateOutcome::Refused),
+                    }
+                }
                 Ok(GateOutcome::Approved(ApprovedTarget::new(authorization)))
             }
             ApprovalDecision::Rejected => Ok(GateOutcome::Refused),
@@ -251,15 +280,23 @@ impl Services {
         session_id: UserSessionId,
         connection: GatedConnection,
     ) -> Result<PolledGate<O>, WarpgateError> {
-        if !authorization.target().require_approval {
-            return Ok(PolledGate::Approved(ApprovedTarget::new(authorization)));
-        }
+        let ask = match requirement_for(&self.db, &authorization).await? {
+            Requirement::None => {
+                return Ok(PolledGate::Approved(ApprovedTarget::new(authorization)));
+            }
+            Requirement::TargetSetting => None,
+            Requirement::Policy(ask) => Some(ask),
+        };
 
         let subject = connection.subject_for(session_id, &authorization);
 
-        if self.admin_approval_is_remembered(&subject).await? {
+        if ask.is_none() && self.admin_approval_is_remembered(&subject).await? {
             subject.emit_bypassed_event();
             return Ok(PolledGate::Approved(ApprovedTarget::new(authorization)));
+        }
+
+        if let Some(ask) = &ask {
+            self.prepare_policy_request(&subject, ask).await?;
         }
 
         let key = SessionApprovalRequest::Key::new(
@@ -280,7 +317,14 @@ impl Services {
             // stays honest.
             return Ok(match self.announce_admin_request(&subject).await? {
                 Advertised::TicketExhausted => PolledGate::Refused,
-                _ => PolledGate::Pending,
+                Advertised::Asked => {
+                    if let Some(ask) = &ask {
+                        self.emit_policy_request(&authorization, &subject, ask)
+                            .await?;
+                    }
+                    PolledGate::Pending
+                }
+                Advertised::AlreadyAdvertised => PolledGate::Pending,
             });
         };
 
@@ -289,9 +333,18 @@ impl Services {
                 // request again, spending the ticket if needed
                 Ok(match self.announce_admin_request(&subject).await? {
                     Advertised::TicketExhausted => PolledGate::Refused,
-                    _ => PolledGate::Pending,
+                    Advertised::Asked => {
+                        if let Some(ask) = &ask {
+                            self.emit_policy_request(&authorization, &subject, ask)
+                                .await?;
+                        }
+                        PolledGate::Pending
+                    }
+                    Advertised::AlreadyAdvertised => PolledGate::Pending,
                 })
             }
+            // A policy request's expiry was applied just above, by `prepare_policy_request`.
+            RowState::Pending if ask.is_some() => Ok(PolledGate::Pending),
             RowState::Pending => {
                 let timeout = self.admin_approval_timeout().await?;
                 #[allow(clippy::cast_possible_wrap)]
@@ -311,7 +364,29 @@ impl Services {
                 mark_consumed(&self.db, key).await?;
                 match decision {
                     ApprovalDecision::Approved(_) => {
-                        Ok(PolledGate::Approved(ApprovedTarget::new(authorization)))
+                        let Some(ask) = &ask else {
+                            return Ok(PolledGate::Approved(ApprovedTarget::new(authorization)));
+                        };
+                        match self.spend_policy_approval(&authorization, &subject).await? {
+                            Spent::Yes => {
+                                Ok(PolledGate::Approved(ApprovedTarget::new(authorization)))
+                            }
+                            Spent::Refused => Ok(PolledGate::Refused),
+                            // Lapsed, spent, or for another account: ask again.
+                            Spent::NeedsNewRequest => {
+                                self.discard_policy_request(&subject).await?;
+                                self.prepare_policy_request(&subject, ask).await?;
+                                Ok(match self.announce_admin_request(&subject).await? {
+                                    Advertised::TicketExhausted => PolledGate::Refused,
+                                    Advertised::Asked => {
+                                        self.emit_policy_request(&authorization, &subject, ask)
+                                            .await?;
+                                        PolledGate::Pending
+                                    }
+                                    Advertised::AlreadyAdvertised => PolledGate::Pending,
+                                })
+                            }
+                        }
                     }
                     ApprovalDecision::Rejected => Ok(PolledGate::Refused),
                 }

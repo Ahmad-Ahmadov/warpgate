@@ -1,6 +1,7 @@
 use poem_openapi::OpenApi;
 
 mod access_control;
+mod access_policies;
 mod admin_roles;
 mod certificate_credentials;
 pub mod cluster_notifications;
@@ -99,6 +100,7 @@ pub fn get() -> impl OpenApi {
                 access_control::AssignmentsApi,
                 access_control::AccessGroupsApi,
                 access_control::MigrationReviewApi,
+                access_policies::AccessPoliciesApi,
             ),
         ),
     )

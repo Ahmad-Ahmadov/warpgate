@@ -161,6 +161,7 @@ impl Services {
             .await?;
         let mut allowed: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
         let mut lost: HashSet<UserSessionId> = HashSet::new();
+        let mut lost_access: HashSet<(Uuid, Uuid)> = HashSet::new();
         for (session, target, user) in open {
             // Sessions without a user (e.g. the admin token) are not role-admitted.
             let Some(user) = user else { continue };
@@ -175,6 +176,13 @@ impl Services {
             };
             if !targets.contains(&target) {
                 lost.insert(session);
+                lost_access.insert((user, target));
+            }
+        }
+        // Say, once, that access ran out where that is what happened to it.
+        for (user, target) in lost_access {
+            if let Err(error) = crate::access_control::audit_expired(&self.db, user, target).await {
+                warn!("Failed to audit expired access: {error}");
             }
         }
         self.close_admitted_sessions(AdmittedSessions(lost.into_iter().collect()))

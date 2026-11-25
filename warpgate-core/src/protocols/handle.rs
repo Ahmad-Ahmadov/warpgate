@@ -7,7 +7,7 @@ use tracing::{Instrument, info_span};
 use uuid::Uuid;
 use warpgate_common::auth::AuthStateUserInfo;
 use warpgate_common::{
-    NodeId, Protocol, Target, TargetOptionsVariant, TargetSessionId, UserSessionId, WarpgateError,
+    NodeId, Protocol, TargetOptionsVariant, TargetSessionId, UserSessionId, WarpgateError,
 };
 use warpgate_db_entities::TargetSession::TargetSessionOpenOutcome;
 use warpgate_db_entities::{TargetSession, UserSession};
@@ -139,7 +139,7 @@ impl WarpgateServerHandle {
     ) -> Result<TargetSessionStart<O>, WarpgateError> {
         self.stamp_target_session_identity(&authorization).await?;
 
-        if self.needs_target_approval(authorization.target()).await? {
+        if self.needs_target_approval(&authorization).await? {
             return Ok(TargetSessionStart::NeedsApproval(authorization));
         }
 
@@ -211,12 +211,25 @@ impl WarpgateServerHandle {
         Ok(target_session.id)
     }
 
-    async fn needs_target_approval(&self, target: &Target) -> Result<bool, WarpgateError> {
-        if !target.require_approval {
+    /// Whether the connection must wait at the approval gate: the target asks for approval, or
+    /// an access policy does. A policy that denies refuses it here ([`access_policy`]).
+    ///
+    /// A connection that joins a target session already open in this user session is not a new
+    /// start: it is neither asked again nor refused because a schedule has closed since.
+    ///
+    /// [`access_policy`]: crate::access_policy
+    async fn needs_target_approval<O>(
+        &self,
+        authorization: &TargetAuthorization<O>,
+    ) -> Result<bool, WarpgateError> {
+        let target = authorization.target();
+        if TargetSession::is_open(&self.db, self.user_session_id, target.id).await? {
             return Ok(false);
         }
-        // skip the check if there is already a matching open target session in this user session
-        Ok(!TargetSession::is_open(&self.db, self.user_session_id, target.id).await?)
+        Ok(!matches!(
+            crate::approvals::requirement_for(&self.db, authorization).await?,
+            crate::approvals::Requirement::None
+        ))
     }
 
     /// Wraps a client stream, adding rate limiters. Wrapping happens at connection time

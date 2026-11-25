@@ -1,6 +1,7 @@
 #![feature(gethostname)]
 
 pub mod access_control;
+pub mod access_policy;
 pub mod analytics;
 pub mod approvals;
 pub mod auth;

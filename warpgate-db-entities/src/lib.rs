@@ -6,10 +6,12 @@
 macro_rules! with_every_entity {
     ($callback:ident) => {
         $callback![
+            AccessApprovalContext,
             AccessAssignment,
             AccessGroupExclusion,
             AccessGroupGrant,
             AccessMigrationReview,
+            AccessPolicy,
             AdminRole,
             ApiToken,
             CertificateCredential,

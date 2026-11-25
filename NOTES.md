@@ -3584,3 +3584,138 @@ cd tests && poetry run pytest    # the whole suite
 - **Changing a group's membership** (roles API, SSO, LDAP) is audited as before
   (`AccessRoleGranted1` / `AccessRoleRevoked1`). It does not list each assignment gained or
   lost.
+
+## Access policies: schedules and approvals (m00099)
+
+Access Control says *who* may connect as *which account*. Policies say *when* a connection
+may start and whether it then needs an approval. They are written in the Grant Access dialog
+(a schedule for one assignment) and in Access Control → Policies (a schedule for a user, an
+access group, a target, or a pair). **Nothing here is decided in the browser**: the browser
+writes rules down; the server reads them, in each rule's own timezone, when a connection
+starts.
+
+### The rules
+
+`AccessRules` (`warpgate-common/src/access_rules.rs`), stored as JSON:
+
+- `timezone`: an IANA name (`Europe/Berlin`). Windows are read in it, daylight saving
+  included. Instants are always UTC; the clock is converted per evaluation by `chrono-tz`,
+  which carries the IANA database in the binary (no host tzdata, no server-local time).
+- `windows`: weekly time ranges, each with days, `start`, `end` and an action (`allow`,
+  `require_approval`, `deny`). `end < start` runs overnight (the evening of the chosen day and
+  the morning after it); `24:00` is the end of the day. The most restrictive window containing
+  the moment wins.
+- `outside`: the action when no window contains the moment. No windows at all means "always
+  `outside`".
+- `approval`: `request_expiry_seconds`, `valid_for_seconds`, `approver_user_ids`,
+  `approver_role_ids`.
+
+### Precedence (security first; `warpgate-core/src/access_policy.rs`)
+
+A policy applies to a connection when every scope column it fills in matches (user, access
+group the user is an active member of, target, account). A direct assignment's own schedule is
+a policy scoped to that user, target and account (`access_policies.assignment_id`), edited with
+the assignment and deleted with it. Several can apply; they combine by **restriction, never by
+specificity, age or order**:
+
+1. any `deny` denies, and nobody can approve it;
+2. otherwise any `require_approval` requires it: the request carries the *shortest* request
+   expiry and the *shortest* approval validity among the policies, and whoever approves must
+   satisfy *every* policy's approver list;
+3. otherwise `allow`.
+
+No applicable policy is `allow`: a connection nothing covers behaves exactly as before. A
+policy whose rules cannot be read counts as `deny`. Where the account is not yet settled
+(several accounts assigned, none named) a policy on any of them applies, which can only
+tighten the result, and a connection that would need an approval is refused with the usual
+"choose an account" message instead of asking for an approval that has no account to bind to.
+Policies only restrict; they never grant access.
+
+### Where it is enforced
+
+Every protocol already passes through one admission path, so the evaluator sits there rather
+than in each protocol:
+
+- `WarpgateServerHandle::start_target_session` (`protocols/handle.rs`): a `deny` refuses with
+  `WarpgateError::AccessPolicyDenied` (audited `AccessPolicyDenied1`); approval makes it
+  `NeedsApproval`. A connection joining a target session already open in the same user session
+  is not a new start, and is neither re-asked nor refused.
+- the approval gate (`approvals/gate.rs`, `approvals/policy.rs`), used by SSH, RDP, VNC, web
+  SSH and desktop, HTTP, Kubernetes, and (through `db_auth.rs`) MySQL and PostgreSQL.
+
+So native SSH, native RDP (mstsc), the browser clients and the database clients cannot go
+around a rule the browser also shows. A schedule never ends a session that is already open.
+Revoking, disabling or expiring access still does, as before (the sweep also audits an
+expiry now: `AccessAssignmentChanged1` with `action=expired`).
+
+### Approvals
+
+One approval system, extended, not duplicated. A policy's request is a row in
+`session_approval_requests` (found, decided and audited like any other) plus a context row
+(`access_approval_contexts`, same key): why, which account, `expires_at`, `valid_for_seconds`,
+`valid_until`, `used_at`, and the approver lists as they were when it was asked.
+
+- **Two clocks.** The *request* lapses unanswered at `expires_at`; nobody can approve it after
+  (`record_decision` refuses and closes it, and it disappears from the approvers' list). An
+  *approval*, once given, can start a connection until `valid_until`. Separate settings, both
+  checked on the server. An approval's validity is never a session length.
+- **Statuses**, derived from the request and its context so they cannot disagree with it:
+  `pending`, `approved`, `rejected`, `expired` (nobody answered, or approved but not used in
+  time), `used` (a connection started on it), `abandoned` (the connection went away).
+- **Bound.** The statement that spends an approval checks the user, the target and the account.
+- **Single use.** Spending is one conditional `UPDATE`; of any number of racing connections,
+  exactly one changes the row. The approver's scope choice (once / this target / all targets)
+  is ignored for a policy's request: it is `Once`, and never remembered.
+- **Never an override.** Spending re-evaluates at that moment: a policy that now denies, or an
+  assignment that was revoked, disabled or has expired, refuses the connection
+  (`AccessApprovalRefused1`).
+- **Approvers.** A request names approvers (users and/or access groups) or leaves it to any
+  administrator with `approve_sessions`. Nobody approves their own request, not even with
+  `targets_edit`. Rejecting stays open to anyone who may see it (it only restricts).
+- **Reasons.** Approvers see the policy, the reason, the account, the deadline and who may
+  approve; the user is told the same (native SSH message, the web clients' waiting state, the
+  HTTP waiting page).
+
+### Audit events (new)
+
+`AccessPolicyChanged1`, `AccessPolicyDenied1`, `AccessApprovalRequested1`,
+`AccessApprovalConsumed1`, `AccessApprovalRefused1`; existing `AccessAssignmentChanged1`
+gains `expired`; the existing `SessionApproval{Requested,Resolved,TimedOut}1` events still fire
+for the same requests. Nothing carries a credential.
+
+### API
+
+`/access-policies` (list, create, update, delete; `access_roles_assign`), `/access-approvals`
+(history with statuses; `approve_sessions`). Existing `/access-assignments` create and update
+take `rules` (and update takes `remove_rules`); omitting `rules` leaves the schedule alone, so
+existing callers are unaffected. `/session-approvals` items gain `policy_name`, `reason`,
+`account`, `expires_at`, `valid_for_seconds`, `approvers` and `can_approve`. The OpenAPI schema
+was edited by hand (see "API schema is committed").
+
+### Dependency
+
+`chrono` and `chrono-tz` were added to `warpgate-core/Cargo.toml`; `Cargo.lock` was **not**
+regenerated here. A build that passes `--locked` fails until it is.
+
+### Tests (written, not run here)
+
+```sh
+cargo test -p warpgate-common access_rules
+cargo test -p warpgate-core --features sqlite access_policy
+cargo test -p warpgate-core --features sqlite approvals
+cd tests && poetry run pytest test_access_policies.py test_access_control.py test_admin_approval_*.py
+```
+
+### Not done, and why
+
+- **No cron expressions, holidays or date-specific exceptions**: weekly windows only.
+- **A window closing does not end a session.** A separate "maximum session length" policy
+  would; there is none.
+- **The native RDP hold screen** does not draw the reason or deadline (SSH, the browser
+  clients and HTTP do); the connection is held and refused as for any other approval.
+- **MySQL/PostgreSQL clients** can only be told "denied" or wait; the reason is in the audit
+  log and the approvers' view.
+- **Approvals do not survive a lost connection**, except over HTTP. A request from SSH, RDP,
+  a database client, or the browser's SSH and desktop clients is held by the connection that
+  asked, and is abandoned when that connection ends; only HTTP polls with its login session, so
+  an approval given there can be used later, within its validity.

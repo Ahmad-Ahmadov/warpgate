@@ -456,6 +456,69 @@ pub async fn usable_assignments(
     .collect())
 }
 
+/// Audit that a user's access to a target ran out, when expiry is what took it: they have
+/// no usable assignment there now, and one of the assignments they had has expired. Called
+/// when the sweep ends the user's sessions for want of access, so it is said once per loss,
+/// next to what it caused.
+pub async fn audit_expired(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+    target_id: Uuid,
+) -> Result<(), sea_orm::DbErr> {
+    let all = effective_assignments(
+        db,
+        AssignmentFilter {
+            user_id: Some(user_id),
+            target_id: Some(target_id),
+            ..Default::default()
+        },
+        OffsetDateTime::now_utc(),
+    )
+    .await?;
+    if all.iter().any(EffectiveAssignment::usable) {
+        return Ok(());
+    }
+    let Some(expired) = all
+        .iter()
+        .find(|assignment| assignment.problem == Some("expired"))
+    else {
+        return Ok(());
+    };
+    let username = User::Entity::find_by_id(user_id)
+        .one(db)
+        .await?
+        .map(|user| user.username)
+        .unwrap_or_default();
+    let target_name = warpgate_db_entities::Target::Entity::find_by_id(target_id)
+        .one(db)
+        .await?
+        .map(|target| target.name)
+        .unwrap_or_default();
+    AuditEvent::AccessAssignmentChanged {
+        action: "expired".to_owned(),
+        assignment_id: match &expired.source {
+            AssignmentSource::Direct { assignment_id, .. } => Some(*assignment_id),
+            AssignmentSource::Group { .. } => None,
+        },
+        user_id,
+        username,
+        target_id,
+        target_name,
+        account: expired
+            .account
+            .as_ref()
+            .map(TargetAccount::Model::display_name)
+            .unwrap_or_default(),
+        account_id: expired.account_id,
+        source: expired.source.describe(),
+        previous_state: "in force".to_owned(),
+        new_state: "expired".to_owned(),
+        actor_user_id: None,
+    }
+    .emit();
+    Ok(())
+}
+
 /// Whether `user_id` may reach `target_id` at all: they hold a usable assignment there.
 pub async fn has_access(
     db: &DatabaseConnection,
@@ -662,7 +725,7 @@ pub async fn primary_account(
 
 /// Whether a name a client sent names `account` (not counting a directory account, whose
 /// name is the user's own and has to be looked up).
-fn names_account(account: &TargetAccount::Model, name: &str) -> bool {
+pub(crate) fn names_account(account: &TargetAccount::Model, name: &str) -> bool {
     let name = name.trim();
     account.id.to_string() == name
         || (!account.name.is_empty() && account.name.trim().eq_ignore_ascii_case(name))

@@ -113,11 +113,7 @@ impl StatusTransition {
     }
 
     /// returns change count
-    async fn apply(
-        self,
-        db: &DatabaseConnection,
-        which: Condition,
-    ) -> Result<u64, WarpgateError> {
+    async fn apply(self, db: &DatabaseConnection, which: Condition) -> Result<u64, WarpgateError> {
         let mut query = Entity::update_many()
             .col_expr(Column::Status, self.to.into())
             .filter(which)
@@ -464,16 +460,30 @@ pub async fn abandon_requests_for_session(
     db: &DatabaseConnection,
     session_id: UserSessionId,
 ) -> Result<(), WarpgateError> {
-    abandon_each(db, Column::SessionId.eq(session_id).into_condition()).await
+    abandon_each(db, Column::SessionId.eq(session_id).into_condition(), false).await
 }
 
-async fn abandon_each(db: &DatabaseConnection, which: Condition) -> Result<(), WarpgateError> {
+/// `keep_policy_requests`: leave alone a pending request an access policy asked for that is
+/// still inside its own expiry, which can be longer than the sweep's lifetime.
+async fn abandon_each(
+    db: &DatabaseConnection,
+    which: Condition,
+    keep_policy_requests: bool,
+) -> Result<(), WarpgateError> {
     let pending = Entity::find()
         .filter(which)
         .filter(Column::Status.eq(ApprovalRequestStatus::Pending))
         .all(db)
         .await?;
+    let now = OffsetDateTime::now_utc();
     for row in pending {
+        if keep_policy_requests
+            && super::AccessApprovalContext::find(db, row.session_id, row.kind, &row.target)
+                .await?
+                .is_some_and(|context| context.expires_at > now)
+        {
+            continue;
+        }
         settle_request_internal(
             db,
             &row,
@@ -521,7 +531,23 @@ pub async fn abandon_all_requested_before(
     db: &DatabaseConnection,
     cutoff: OffsetDateTime,
 ) -> Result<(), WarpgateError> {
-    abandon_each(db, Column::Started.lt(cutoff).into_condition()).await
+    abandon_each(db, Column::Started.lt(cutoff).into_condition(), true).await
+}
+
+/// Remove an approved request so its key can be asked again: an access policy's approvals are
+/// single use, and one that was used or has lapsed is no longer an answer.
+pub async fn forget_approved(
+    db: &DatabaseConnection,
+    session_id: UserSessionId,
+    kind: ApprovalKind,
+    target: &str,
+) -> Result<u64, WarpgateError> {
+    Ok(Entity::delete_many()
+        .filter(Key::new(session_id, kind, target).into_condition())
+        .filter(Column::Status.eq(ApprovalRequestStatus::Approved))
+        .exec(db)
+        .await?
+        .rows_affected)
 }
 
 pub async fn delete_all_before(
@@ -537,5 +563,6 @@ pub async fn delete_all_before(
         .filter(inactive)
         .exec(db)
         .await?;
+    super::AccessApprovalContext::delete_orphans_before(db, cutoff).await?;
     Ok(())
 }

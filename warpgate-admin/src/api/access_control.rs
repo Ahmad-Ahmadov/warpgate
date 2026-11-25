@@ -26,13 +26,16 @@ use time::OffsetDateTime;
 use tracing::warn;
 use uuid::Uuid;
 use warpgate_common::audit::AuditEvent;
-use warpgate_common::{AdminPermission, Protocol, TargetAccountCredential, WarpgateError};
+use warpgate_common::{
+    AccessRules, AdminPermission, Protocol, TargetAccountCredential, WarpgateError,
+};
 use warpgate_core::Services;
 use warpgate_core::access_control::{
     AssignmentFilter, AssignmentOrigin, AssignmentSource, DirectoryUsernameFormat,
     EffectiveAssignment, TargetAccountAuthMethod, TargetAccountKind, check_account,
     close_sessions_on_target, effective_assignments, protocol_of, uses_accounts,
 };
+use warpgate_core::access_policy::{self, PolicyError};
 use warpgate_core::rdp_account::directory_account_names;
 use warpgate_core::resources::target_accounts::{
     self, TargetAccountDataRequest, redacted_credential,
@@ -40,11 +43,12 @@ use warpgate_core::resources::target_accounts::{
 use warpgate_core::resources::{ResourceError, access_groups};
 use warpgate_db_entities::AccessMigrationReview::{MigrationCategory, MigrationStatus};
 use warpgate_db_entities::{
-    AccessAssignment, AccessGroupGrant, AccessMigrationReview, Role, Target, TargetAccount, User,
-    UserRoleAssignment,
+    AccessAssignment, AccessGroupGrant, AccessMigrationReview, AccessPolicy, Role, Target,
+    TargetAccount, User, UserRoleAssignment,
 };
 
 use super::AdminContext;
+use super::access_policies::audit_changed;
 
 // ---------------------------------------------------------------------------------------
 // Presentation
@@ -140,6 +144,10 @@ struct AssignmentView {
     status: AssignmentStatus,
     problem: Option<String>,
     note: String,
+    /// The assignment's own schedule and approval rules: when connections may start, and what
+    /// is asked for outside those times. Only a direct assignment has them; none means the
+    /// assignment itself adds no timing rule (access policies may still apply).
+    rules: Option<AccessRules>,
     created_at: Option<OffsetDateTime>,
     updated_at: Option<OffsetDateTime>,
 }
@@ -149,6 +157,8 @@ struct Lookup {
     users: HashMap<Uuid, String>,
     targets: HashMap<Uuid, (String, Protocol)>,
     direct: HashMap<Uuid, AccessAssignment::Model>,
+    /// Each direct assignment's own schedule, by assignment.
+    policies: HashMap<Uuid, AccessPolicy::Model>,
 }
 
 impl Lookup {
@@ -171,6 +181,13 @@ impl Lookup {
                 .await?
                 .into_iter()
                 .map(|assignment| (assignment.id, assignment))
+                .collect(),
+            policies: AccessPolicy::Entity::find()
+                .filter(AccessPolicy::Column::AssignmentId.is_not_null())
+                .all(db)
+                .await?
+                .into_iter()
+                .filter_map(|policy| policy.assignment_id.map(|id| (id, policy)))
                 .collect(),
         })
     }
@@ -240,6 +257,9 @@ impl Lookup {
             status,
             problem: assignment.problem.map(str::to_owned),
             note: direct.map(|d| d.note.clone()).unwrap_or_default(),
+            rules: direct
+                .and_then(|d| self.policies.get(&d.id))
+                .and_then(|policy| policy.rules().ok()),
             created_at: direct.map(|d| d.created_at),
             updated_at: direct.map(|d| d.updated_at),
         }
@@ -643,6 +663,8 @@ struct CreateAccessAssignmentRequest {
     expires_at: Option<OffsetDateTime>,
     #[oai(default)]
     note: String,
+    /// When connections may start, and what is asked for outside those times. Omit for none.
+    rules: Option<AccessRules>,
 }
 
 const fn default_true() -> bool {
@@ -656,6 +678,12 @@ struct UpdateAccessAssignmentRequest {
     expires_at: Option<OffsetDateTime>,
     #[oai(default)]
     note: String,
+    /// Set (or replace) the assignment's own schedule and approval rules. Omitted: they are
+    /// left as they are.
+    rules: Option<AccessRules>,
+    /// Remove the assignment's own schedule and approval rules (when `rules` is omitted).
+    #[oai(default)]
+    remove_rules: bool,
 }
 
 #[derive(Enum, Clone, Copy, PartialEq, Eq)]
@@ -832,6 +860,73 @@ async fn account_name(db: &DatabaseConnection, account_id: Option<Uuid>) -> Stri
     }
 }
 
+fn rules_refusal(error: PolicyError) -> Result<SaveAccessAssignmentResponse, WarpgateError> {
+    match error {
+        PolicyError::Invalid(message) | PolicyError::Conflict(message) => {
+            Ok(SaveAccessAssignmentResponse::BadRequest(Json(message)))
+        }
+        PolicyError::NotFound => Ok(SaveAccessAssignmentResponse::NotFound(Json(
+            "Not found".into(),
+        ))),
+        PolicyError::Database(error) => Err(error.into()),
+    }
+}
+
+/// The name an assignment's own schedule goes by.
+async fn schedule_label(db: &DatabaseConnection, assignment: &AccessAssignment::Model) -> String {
+    let user = User::Entity::find_by_id(assignment.user_id)
+        .one(db)
+        .await
+        .ok()
+        .flatten()
+        .map(|user| user.username)
+        .unwrap_or_default();
+    let target = Target::Entity::find_by_id(assignment.target_id)
+        .one(db)
+        .await
+        .ok()
+        .flatten()
+        .map(|target| target.name)
+        .unwrap_or_default();
+    let account = account_name(db, assignment.target_account_id).await;
+    let label = if account.is_empty() {
+        format!("Schedule: {user} on {target}")
+    } else {
+        format!("Schedule: {user} on {target} as {account}")
+    };
+    label.chars().take(250).collect()
+}
+
+/// Save (`rules`), or remove (`remove`), the assignment's own schedule, audited.
+async fn apply_rules(
+    db: &DatabaseConnection,
+    assignment: &AccessAssignment::Model,
+    rules: Option<AccessRules>,
+    remove: bool,
+    actor: Uuid,
+) -> Result<(), PolicyError> {
+    if rules.is_none() && !remove {
+        return Ok(());
+    }
+    let before = access_policy::assignment_policy(db, assignment.id).await?;
+    let label = schedule_label(db, assignment).await;
+    let saved =
+        access_policy::save_assignment_rules(db, assignment, &label, rules, Some(actor)).await?;
+    match (before, saved) {
+        (before, Some(policy)) => {
+            let action = if before.is_some() {
+                "updated"
+            } else {
+                "created"
+            };
+            audit_changed(db, action, &policy, Some(actor)).await;
+        }
+        (Some(removed), None) => audit_changed(db, "deleted", &removed, Some(actor)).await,
+        (None, None) => {}
+    }
+    Ok(())
+}
+
 pub struct AssignmentsApi;
 
 #[OpenApi]
@@ -988,6 +1083,11 @@ impl AssignmentsApi {
         let db = &admin.services().db;
         let body = body.0;
         let actor = admin.auth.user_id();
+        if let Some(rules) = &body.rules
+            && let Err(error) = access_policy::check_rules(db, rules).await
+        {
+            return rules_refusal(error);
+        }
         match create_direct(
             db,
             body.user_id,
@@ -1001,9 +1101,14 @@ impl AssignmentsApi {
         )
         .await?
         {
-            Ok(assignment) => Ok(SaveAccessAssignmentResponse::Ok(Json(
-                present_direct(db, &assignment).await?,
-            ))),
+            Ok(assignment) => {
+                if let Err(error) = apply_rules(db, &assignment, body.rules, false, actor).await {
+                    return rules_refusal(error);
+                }
+                Ok(SaveAccessAssignmentResponse::Ok(Json(
+                    present_direct(db, &assignment).await?,
+                )))
+            }
             Err(refusal) => Ok(refusal),
         }
     }
@@ -1025,6 +1130,11 @@ impl AssignmentsApi {
         let services = admin.services();
         let db = &services.db;
         let body = body.0;
+        if let Some(rules) = &body.rules
+            && let Err(error) = access_policy::check_rules(db, rules).await
+        {
+            return rules_refusal(error);
+        }
         let Some(existing) = AccessAssignment::Entity::find_by_id(id.0).one(db).await? else {
             return Ok(SaveAccessAssignmentResponse::NotFound(Json(
                 "Assignment not found".into(),
@@ -1099,8 +1209,30 @@ impl AssignmentsApi {
             actor_user_id: Some(admin.auth.user_id()),
         }
         .emit();
-        // A session that signed in under the old terms ends: it must not outlive them.
-        end_sessions(services, [updated.user_id], updated.target_id).await;
+        if let Err(error) = apply_rules(
+            db,
+            &updated,
+            body.rules,
+            body.remove_rules,
+            admin.auth.user_id(),
+        )
+        .await
+        {
+            return rules_refusal(error);
+        }
+        // A session that signed in under terms this change took away ends: it must not
+        // outlive them. A change of schedule or approval rules alone does not end one: those
+        // decide whether a connection may start, never an open one.
+        let narrowed = (existing.enabled && !updated.enabled)
+            || existing.target_account_id != updated.target_account_id
+            || match (existing.expires_at, updated.expires_at) {
+                (None, Some(_)) => true,
+                (Some(old), Some(new)) => new < old,
+                _ => false,
+            };
+        if narrowed {
+            end_sessions(services, [updated.user_id], updated.target_id).await;
+        }
         Ok(SaveAccessAssignmentResponse::Ok(Json(
             present_direct(db, &updated).await?,
         )))
@@ -1342,6 +1474,10 @@ async fn revoke_direct(
     AccessAssignment::Entity::delete_by_id(assignment.id)
         .exec(db)
         .await?;
+    if let Some(schedule) = access_policy::assignment_policy(db, assignment.id).await? {
+        access_policy::delete_assignment_policy(db, assignment.id).await?;
+        audit_changed(db, "deleted", &schedule, Some(actor)).await;
+    }
     let username = User::Entity::find_by_id(assignment.user_id)
         .one(db)
         .await?

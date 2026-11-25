@@ -11,6 +11,8 @@
      *     with where it comes from and whether it can be used now.
      *   - Access groups: what each group (a role) grants its members; the
      *     group's settings and members stay on the role page.
+     *   - Policies: when connections may start, and what is asked for outside
+     *     those times (a schedule, an approval), for a user, group or target.
      *   - Migration review: what the upgrade could not map without widening
      *     anyone's access, waiting for a decision.
      *
@@ -22,8 +24,9 @@
     import AccessGroups from './AccessGroups.svelte'
     import Assignments from './Assignments.svelte'
     import MigrationReview from './MigrationReview.svelte'
+    import Policies from './Policies.svelte'
 
-    type TabValue = 'assignments' | 'groups' | 'review'
+    type TabValue = 'assignments' | 'groups' | 'policies' | 'review'
 
     interface Props {
         params?: { tab?: string }
@@ -34,7 +37,10 @@
     let { params = {}, defaultTab = 'assignments' }: Props = $props()
 
     function valid(value: string | undefined): TabValue {
-        return value === 'groups' || value === 'review' || value === 'assignments'
+        return value === 'groups' ||
+            value === 'policies' ||
+            value === 'review' ||
+            value === 'assignments'
             ? value
             : defaultTab
     }
@@ -66,6 +72,7 @@
     const tabs = $derived([
         { value: 'assignments' as const, label: 'Assignments' },
         { value: 'groups' as const, label: 'Access groups' },
+        { value: 'policies' as const, label: 'Policies' },
         {
             value: 'review' as const,
             label: 'Migration review',
@@ -87,11 +94,12 @@
 </div>
 
 <p class="intro">
-    Who may connect to which target, and as which remote account. An assignment
-    is the whole permission: users connect only through one that is in force,
-    made directly or by an access group. Second factors, approvals and session
-    limits still apply on top. Admin roles, which govern this console, are
-    separate.
+    Who may connect to which target, as which remote account, and when. Grant
+    Access gives a user an account on a target, directly or through an access
+    group; that is the whole permission. Policies limit when connections can
+    start and ask for approval outside working hours. Second factors and
+    session limits still apply on top. Admin roles, which govern this console,
+    are separate.
 </p>
 
 {#if pending}
@@ -111,6 +119,8 @@
             {/key}
         {:else if active === 'groups'}
             <AccessGroups {initialGroup} />
+        {:else if active === 'policies'}
+            <Policies />
         {:else}
             <MigrationReview onchange={refreshPending} />
         {/if}

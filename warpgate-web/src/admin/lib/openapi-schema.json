@@ -6209,10 +6209,332 @@
         ],
         "operationId": "reject_access_migration_review"
       }
+    },
+    "/access-policies": {
+      "get": {
+        "summary": "Every standing access policy. A direct assignment's own schedule is shown with the\nassignment, not here.",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AccessPolicy"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "list_access_policies"
+      },
+      "post": {
+        "summary": "Create a policy. It takes effect for connections started from now on; sessions that\nare already open are not ended by a schedule.",
+        "requestBody": {
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/AccessPolicyDataRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessPolicy"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "create_access_policy"
+      }
+    },
+    "/access-policies/{id}": {
+      "put": {
+        "summary": "Change a policy.",
+        "parameters": [
+          {
+            "name": "id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {
+                "$ref": "#/components/schemas/AccessPolicyDataRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessPolicy"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "update_access_policy"
+      },
+      "delete": {
+        "summary": "Delete a policy.",
+        "parameters": [
+          {
+            "name": "id",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "path",
+            "required": true,
+            "deprecated": false,
+            "explode": true
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "delete_access_policy"
+      }
+    },
+    "/access-approvals": {
+      "get": {
+        "summary": "The approval requests that access policies asked for, newest first, with what became of\neach. To decide a pending one, use `/session-approvals`.",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json; charset=utf-8": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AccessApproval"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "TokenSecurityScheme": []
+          },
+          {
+            "CookieSecurityScheme": []
+          }
+        ],
+        "operationId": "list_access_approvals"
+      }
     }
   },
   "components": {
     "schemas": {
+      "AccessApproval": {
+        "type": "object",
+        "title": "AccessApproval",
+        "description": "What became of an approval request, as a person reads it.",
+        "required": [
+          "id",
+          "target",
+          "username",
+          "policy_name",
+          "reason",
+          "status",
+          "requested_at",
+          "expires_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "With `target`, the key of the request: the same one `/session-approvals` uses."
+          },
+          "target": {
+            "type": "string"
+          },
+          "username": {
+            "type": "string"
+          },
+          "account": {
+            "type": "string",
+            "description": "The account the approval is for; none on a protocol without remote accounts."
+          },
+          "policy_name": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why approval was required."
+          },
+          "status": {
+            "$ref": "#/components/schemas/AccessApprovalStatus"
+          },
+          "requested_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the request lapses unanswered."
+          },
+          "valid_until": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The last moment an approval can start a connection; set once approved."
+          },
+          "used_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "resolved_by": {
+            "type": "string"
+          },
+          "resolved_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "AccessApprovalStatus": {
+        "type": "string",
+        "description": "What became of an approval request an access policy asked for.",
+        "enum": [
+          "pending",
+          "approved",
+          "rejected",
+          "expired",
+          "used",
+          "abandoned"
+        ]
+      },
       "AccessAssignment": {
         "type": "object",
         "title": "AccessAssignment",
@@ -6306,6 +6628,10 @@
           },
           "note": {
             "type": "string"
+          },
+          "rules": {
+            "$ref": "#/components/schemas/AccessRules",
+            "description": "The assignment's own schedule and approval rules: when connections may start, and what is asked for outside those times. Only a direct assignment has them."
           },
           "created_at": {
             "type": "string",
@@ -6532,6 +6858,243 @@
           "confirmed",
           "rejected"
         ]
+      },
+      "AccessPolicy": {
+        "type": "object",
+        "title": "AccessPolicy",
+        "description": "An access policy, with the names of what it covers.",
+        "required": [
+          "id",
+          "name",
+          "description",
+          "enabled",
+          "rules",
+          "summary",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "user_name": {
+            "type": "string"
+          },
+          "role_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "An access group."
+          },
+          "role_name": {
+            "type": "string"
+          },
+          "target_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "target_name": {
+            "type": "string"
+          },
+          "target_account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "account": {
+            "type": "string"
+          },
+          "rules": {
+            "$ref": "#/components/schemas/AccessRules"
+          },
+          "summary": {
+            "type": "string",
+            "description": "The rules in words, as the audit log and approvers read them."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "AccessPolicyDataRequest": {
+        "type": "object",
+        "title": "AccessPolicyDataRequest",
+        "required": [
+          "name",
+          "rules"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string",
+            "default": ""
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Cover one user."
+          },
+          "role_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Cover the members of an access group."
+          },
+          "target_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Cover one target."
+          },
+          "target_account_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Cover one account on the target (needs `target_id`)."
+          },
+          "rules": {
+            "$ref": "#/components/schemas/AccessRules"
+          }
+        }
+      },
+      "AccessRuleAction": {
+        "type": "string",
+        "description": "What a moment in time means for a connection. Ordered by how restrictive it is: `Allow` < `RequireApproval` < `Deny`, so the most restrictive of several is their `max`.",
+        "enum": [
+          "allow",
+          "require_approval",
+          "deny"
+        ]
+      },
+      "AccessRuleApproval": {
+        "type": "object",
+        "title": "AccessRuleApproval",
+        "description": "How an approval is asked for, and how long it is good, when the action is `RequireApproval`. Two separate clocks: the request lapses unanswered after `request_expiry_seconds`; an approval that was given can only be used to start a connection for `valid_for_seconds` after it was given.",
+        "properties": {
+          "request_expiry_seconds": {
+            "type": "integer",
+            "format": "uint32",
+            "description": "How long a request waits for an answer. Unset: the server's approval timeout."
+          },
+          "valid_for_seconds": {
+            "type": "integer",
+            "format": "uint32",
+            "description": "How long an approval can be used to start a connection. Unset: the same as the request's, from the moment it is given."
+          },
+          "approver_user_ids": {
+            "type": "array",
+            "description": "Who may approve. Both empty: any administrator allowed to approve sessions.",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "approver_role_ids": {
+            "type": "array",
+            "description": "Members of these roles may approve.",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        },
+        "required": [
+          "approver_user_ids",
+          "approver_role_ids"
+        ]
+      },
+      "AccessRuleWeekday": {
+        "type": "string",
+        "description": "A day of the week.",
+        "enum": [
+          "mon",
+          "tue",
+          "wed",
+          "thu",
+          "fri",
+          "sat",
+          "sun"
+        ]
+      },
+      "AccessRuleWindow": {
+        "type": "object",
+        "title": "AccessRuleWindow",
+        "description": "A weekly time range and what it means.",
+        "required": [
+          "days",
+          "start",
+          "end",
+          "action"
+        ],
+        "properties": {
+          "days": {
+            "type": "array",
+            "description": "The days it starts on. Empty means it never matches.",
+            "items": {
+              "$ref": "#/components/schemas/AccessRuleWeekday"
+            }
+          },
+          "start": {
+            "type": "string",
+            "description": "`HH:MM`, 24-hour, in the rules' timezone."
+          },
+          "end": {
+            "type": "string",
+            "description": "`HH:MM`, or `24:00` for the end of the day. Earlier than `start`: the range runs overnight, into the morning of the next day."
+          },
+          "action": {
+            "$ref": "#/components/schemas/AccessRuleAction"
+          }
+        }
+      },
+      "AccessRules": {
+        "type": "object",
+        "title": "AccessRules",
+        "description": "When a connection may start, and what to do otherwise.",
+        "required": [
+          "timezone",
+          "windows",
+          "outside",
+          "approval"
+        ],
+        "properties": {
+          "timezone": {
+            "type": "string",
+            "description": "An IANA timezone name (`Europe/Berlin`, `America/New_York`, `UTC`). The windows are read in it, daylight saving included."
+          },
+          "windows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccessRuleWindow"
+            }
+          },
+          "outside": {
+            "$ref": "#/components/schemas/AccessRuleAction"
+          },
+          "approval": {
+            "$ref": "#/components/schemas/AccessRuleApproval"
+          }
+        }
       },
       "AddSshKnownHostRequest": {
         "type": "object",
@@ -7229,6 +7792,10 @@
           "note": {
             "type": "string",
             "default": ""
+          },
+          "rules": {
+            "$ref": "#/components/schemas/AccessRules",
+            "description": "When connections may start, and what is asked for outside those times. Omit for none."
           }
         }
       },
@@ -9779,7 +10346,8 @@
           "protocol",
           "username",
           "target",
-          "started"
+          "started",
+          "can_approve"
         ],
         "properties": {
           "id": {
@@ -9804,6 +10372,36 @@
           "caching_grace_seconds": {
             "type": "integer",
             "format": "int64"
+          },
+          "policy_name": {
+            "type": "string",
+            "description": "The access policy that asked for this approval, when one did."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why approval is required."
+          },
+          "account": {
+            "type": "string",
+            "description": "The account the approval is for."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the request lapses unanswered; an approver cannot approve it after."
+          },
+          "valid_for_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How long an approval can start a connection once it is given."
+          },
+          "approvers": {
+            "type": "string",
+            "description": "Who may approve it, when the policy names approvers."
+          },
+          "can_approve": {
+            "type": "boolean",
+            "description": "Whether the administrator asking may approve it."
           }
         }
       },
@@ -11143,6 +11741,15 @@
           "note": {
             "type": "string",
             "default": ""
+          },
+          "rules": {
+            "$ref": "#/components/schemas/AccessRules",
+            "description": "Set (or replace) the assignment's own schedule and approval rules. Omitted: they are left as they are."
+          },
+          "remove_rules": {
+            "type": "boolean",
+            "description": "Remove the assignment's own schedule and approval rules (when `rules` is omitted).",
+            "default": false
           }
         }
       },

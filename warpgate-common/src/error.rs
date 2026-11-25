@@ -92,6 +92,10 @@ pub enum WarpgateError {
     SecretBackend(#[from] SecretError),
     #[error("an administrator did not approve this session")]
     SessionNotApproved,
+    /// An access policy refuses the connection (a schedule, or an approval that is no longer
+    /// good). The text is written for the user.
+    #[error("{0}")]
+    AccessPolicyDenied(String),
     #[error("cluster peer unreachable: {0}")]
     ClusterPeerUnreachable(String),
     #[error(transparent)]
@@ -126,6 +130,7 @@ impl UserFacingReason for WarpgateError {
             | Self::UserNotFound(_)
             | Self::UserAlreadyExists(_)
             | Self::SessionNotApproved
+            | Self::AccessPolicyDenied(_)
             | Self::UserSessionAlreadyAttributed
             | Self::UserSessionEnded
             | Self::NoAdminAccess
@@ -227,7 +232,9 @@ impl ResponseError for WarpgateError {
                 poem::http::StatusCode::FORBIDDEN
             }
             Self::SessionLimitReached => poem::http::StatusCode::TOO_MANY_REQUESTS,
-            Self::SessionNotApproved => poem::http::StatusCode::FORBIDDEN,
+            Self::SessionNotApproved | Self::AccessPolicyDenied(_) => {
+                poem::http::StatusCode::FORBIDDEN
+            }
             Self::ClusterPeerUnreachable(_) => poem::http::StatusCode::BAD_GATEWAY,
             _ => poem::http::StatusCode::INTERNAL_SERVER_ERROR,
         }

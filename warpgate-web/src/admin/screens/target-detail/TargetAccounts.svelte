@@ -365,7 +365,7 @@
                     <th scope="col">Type</th>
                     <th scope="col">Authentication</th>
                     <th scope="col">Credential</th>
-                    <th scope="col">Assigned</th>
+                    <th scope="col">Granted</th>
                     <th scope="col">Status</th>
                     <th scope="col"><span class="visually-hidden">Actions</span></th>
                 </tr>

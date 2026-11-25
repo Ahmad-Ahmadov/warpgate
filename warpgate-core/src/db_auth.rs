@@ -85,6 +85,14 @@ async fn hold_for_admin_approval<T: DbAuthTransport>(
     connection: GatedConnection,
     auth_ok: &mut Option<AuthOkPermit>,
 ) -> Result<GateOutcome, T::Error> {
+    // An access policy that denies is a denial the client is told about, not a failure of the
+    // login flow. (The gate refuses it as well; this is only so it ends as one.)
+    if let Err(WarpgateError::AccessPolicyDenied(reason)) =
+        crate::approvals::requirement_for(&services.db, &authorization).await
+    {
+        warn!(%reason, "An access policy refused the connection");
+        return Ok(GateOutcome::Refused);
+    }
     services
         .require_admin_approval(authorization, session_id, connection, || async move {
             transport.notify_awaiting_admin_approval(auth_ok).await

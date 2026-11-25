@@ -6,7 +6,7 @@ export type CloseReason =
     | 'disconnected'
 
 export type SessionPhase =
-    | { phase: 'awaiting_approval' }
+    | { phase: 'awaiting_approval'; notice?: string | null }
     | { phase: 'connecting' }
     | { phase: 'connected' }
     | { phase: 'closed'; reason: CloseReason; message: string | null }

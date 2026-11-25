@@ -97,9 +97,14 @@ pub enum Event {
     MenuRedraw(u16, u16),
     Menu(MenuEvent),
     ServerChannelOpenResult(Uuid, Result<ServerChannelId, russh::Error>),
-    AdminApprovalPending,
+    AdminApprovalPending {
+        /// Why approval is needed, when an access policy asked for it.
+        notice: Option<String>,
+    },
     AdminApprovalResolved {
         approved: Option<ApprovedTarget<TargetSSHOptions>>,
+        /// Why not, when there is more to say than "not approved".
+        note: Option<String>,
     },
 }
 
@@ -691,6 +696,8 @@ impl ServerSession {
         let cancel = self.disconnect_token.clone();
         let event_sender = self.event_sender.clone();
         let notify_sender = self.event_sender.clone();
+        let notice_services = self.services.clone();
+        let target_name = authorization.target().name.clone();
         let auth_state = self.auth_state.as_ref().map(|(state, _)| state.clone());
 
         tokio::spawn(async move {
@@ -706,23 +713,33 @@ impl ServerSession {
                     credentials,
                 },
                 || async move {
-                    let _ = notify_sender.send_once(Event::AdminApprovalPending).await;
+                    let notice = notice_services
+                        .pending_approval_notice(session_id, &target_name)
+                        .await;
+                    let _ = notify_sender
+                        .send_once(Event::AdminApprovalPending { notice })
+                        .await;
                     Ok::<_, WarpgateError>(())
                 },
             );
 
-            let approved = tokio::select! {
-                () = cancel.cancelled() => None,
-                outcome = gate => outcome.map_or_else(
-                    |error| {
+            let (approved, note) = tokio::select! {
+                () = cancel.cancelled() => (None, None),
+                outcome = gate => match outcome {
+                    Ok(GateOutcome::Approved(approved)) => (Some(approved), None),
+                    Ok(GateOutcome::Refused) => (None, None),
+                    Ok(GateOutcome::Expired) => (
+                        None,
+                        Some("The approval request expired or can no longer be used. Connect again to ask again.".to_owned()),
+                    ),
+                    Err(error) => {
                         error!(%error, "Failed to hold the session for administrator approval");
-                        None
-                    },
-                    GateOutcome::approved,
-                ),
+                        (None, Some(error.user_facing_reason()))
+                    }
+                },
             };
             let _ = event_sender
-                .send_once(Event::AdminApprovalResolved { approved })
+                .send_once(Event::AdminApprovalResolved { approved, note })
                 .await;
         });
     }
@@ -825,7 +842,18 @@ impl ServerSession {
                     .lock()
                     .await
                     .start_target_session(authorization)
-                    .await?;
+                    .await;
+                let started = match started {
+                    Ok(started) => started,
+                    // An access policy refuses the connection: say why, then end it.
+                    Err(WarpgateError::AccessPolicyDenied(reason)) => {
+                        self.emit_service_message(&reason)?;
+                        self.request_disconnect();
+                        self.disconnect_server().await;
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 match started {
                     TargetSessionStart::Started(admitted) => {
                         self.stamp_approved_target(admitted).await;
@@ -911,19 +939,27 @@ impl ServerSession {
                         error!(?err, "Menu loop action handler error");
                     }
                 }
-                Event::AdminApprovalPending => {
-                    self.emit_service_message(
-                        "Waiting for an administrator to approve this session...",
-                    )?;
+                Event::AdminApprovalPending { notice } => {
+                    match notice {
+                        Some(notice) => self.emit_service_message(&notice)?,
+                        None => self.emit_service_message(
+                            "Waiting for an administrator to approve this session...",
+                        )?,
+                    }
                 }
-                Event::AdminApprovalResolved { approved } => {
+                Event::AdminApprovalResolved { approved, note } => {
                     if !matches!(self.target, TargetSelection::AwaitingApproval) {
                         // The user has aborted the wait by now
                         return Ok(());
                     }
                     self.target = TargetSelection::None;
                     let Some(approved) = approved else {
-                        self.emit_service_message("Session was not approved by an administrator")?;
+                        match note {
+                            Some(note) => self.emit_service_message(&note)?,
+                            None => self.emit_service_message(
+                                "Session was not approved by an administrator",
+                            )?,
+                        }
                         self.request_disconnect();
                         self.disconnect_server().await;
                         return Ok(());
@@ -2561,7 +2597,18 @@ impl ServerSession {
             .lock()
             .await
             .start_target_session(authorization)
-            .await?;
+            .await;
+        let started = match started {
+            Ok(started) => started,
+            // An access policy refuses the connection: say why, then end it.
+            Err(WarpgateError::AccessPolicyDenied(reason)) => {
+                self.emit_service_message(&reason)?;
+                self.request_disconnect();
+                self.disconnect_server().await;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
         match started {
             TargetSessionStart::Started(admitted) => {
                 self.stamp_approved_target(admitted).await;

@@ -25,11 +25,14 @@ use crate::auth_state_store::TIMEOUT;
 use crate::helpers::i64_seconds_to_duration;
 
 mod gate;
+mod policy;
 mod self_approval;
 mod subject;
 mod wait;
 
 pub use gate::*;
+use policy::Spent;
+pub(crate) use policy::{Requirement, requirement_for};
 pub(crate) use self_approval::*;
 use subject::*;
 pub use wait::*;

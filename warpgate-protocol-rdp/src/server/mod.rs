@@ -918,6 +918,11 @@ async fn dial_if_pending(
                 viewer.refuse(Refusal::NotApproved).await;
                 return Ok(false);
             }
+            Err(WarpgateError::AccessPolicyDenied(reason)) => {
+                warn!(%reason, "An access policy refused the connection");
+                viewer.refuse(Refusal::Denied).await;
+                return Ok(false);
+            }
             Err(error) => return Err(error.into()),
         };
 

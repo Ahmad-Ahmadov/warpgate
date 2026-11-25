@@ -190,6 +190,64 @@ pub enum AuditEvent {
         account_id: Option<Uuid>,
         actor_user_id: Uuid,
     },
+    /// An administrator created, changed, enabled, disabled or deleted an access policy
+    /// (a schedule and approval rules for a user, group, target or assignment).
+    AccessPolicyChanged {
+        /// `created`, `updated` or `deleted`.
+        action: String,
+        policy_id: Uuid,
+        policy_name: String,
+        /// Who and what it covers, as text.
+        scope: String,
+        enabled: bool,
+        /// The rules in words; never anything secret.
+        rules: String,
+        actor_user_id: Option<Uuid>,
+    },
+    /// A connection was refused by an access policy, before anything was asked of an approver.
+    AccessPolicyDenied {
+        user_id: Uuid,
+        username: String,
+        target_id: Uuid,
+        target_name: String,
+        account: Option<String>,
+        policy_name: String,
+        reason: String,
+    },
+    /// A connection needs an approval because of an access policy: a request was made.
+    AccessApprovalRequested {
+        user_id: Uuid,
+        username: String,
+        target_id: Uuid,
+        target_name: String,
+        account: Option<String>,
+        policy_name: String,
+        reason: String,
+        /// When the request lapses if nobody answers.
+        expires_at: String,
+    },
+    /// An approval was used to start a connection, and can not be used again.
+    AccessApprovalConsumed {
+        user_id: Uuid,
+        username: String,
+        target_id: Uuid,
+        target_name: String,
+        account: Option<String>,
+        policy_name: String,
+        /// Who granted it.
+        approved_by: Option<String>,
+    },
+    /// A connection was refused because the approval it relied on was no longer good: it had
+    /// expired, been used, belonged to someone or something else, or the access under it was
+    /// gone.
+    AccessApprovalRefused {
+        user_id: Uuid,
+        username: String,
+        target_id: Uuid,
+        target_name: String,
+        account: Option<String>,
+        reason: String,
+    },
     /// The target logged a session on as an account the user may not use there (an account
     /// typed into the target's own sign-in screen, say), so Warpgate ended the session.
     TargetLogonRefused {
@@ -678,6 +736,122 @@ impl AuditEvent {
                     actor_user_id = %actor_user_id,
                     related_users = %format_related_ids(&related),
                     "Access migration review resolved"
+                );
+            }
+            Self::AccessPolicyChanged {
+                action,
+                policy_id,
+                policy_name,
+                scope,
+                enabled,
+                rules,
+                actor_user_id,
+            } => {
+                let related: Vec<Uuid> = actor_user_id.iter().copied().collect();
+                info!(
+                    target: "audit",
+                    _type = "AccessPolicyChanged1",
+                    action = %action,
+                    policy_id = %policy_id,
+                    policy_name = %policy_name,
+                    scope = %scope,
+                    enabled = *enabled,
+                    rules = %rules,
+                    actor_user_id = actor_user_id.map(|id| id.to_string()),
+                    related_users = %format_related_ids(&related),
+                    "Access policy changed"
+                );
+            }
+            Self::AccessPolicyDenied {
+                user_id,
+                username,
+                target_id,
+                target_name,
+                account,
+                policy_name,
+                reason,
+            } => {
+                tracing::warn!(
+                    target: "audit",
+                    _type = "AccessPolicyDenied1",
+                    user_id = %user_id,
+                    username = %username,
+                    target_id = %target_id,
+                    target_name = %target_name,
+                    account = account.as_deref(),
+                    policy_name = %policy_name,
+                    reason = %reason,
+                    related_users = %format_related_ids(&[*user_id]),
+                    "Refused a connection by an access policy"
+                );
+            }
+            Self::AccessApprovalRequested {
+                user_id,
+                username,
+                target_id,
+                target_name,
+                account,
+                policy_name,
+                reason,
+                expires_at,
+            } => {
+                info!(
+                    target: "audit",
+                    _type = "AccessApprovalRequested1",
+                    user_id = %user_id,
+                    username = %username,
+                    target_id = %target_id,
+                    target_name = %target_name,
+                    account = account.as_deref(),
+                    policy_name = %policy_name,
+                    reason = %reason,
+                    expires_at = %expires_at,
+                    related_users = %format_related_ids(&[*user_id]),
+                    "An access policy requires approval for a connection"
+                );
+            }
+            Self::AccessApprovalConsumed {
+                user_id,
+                username,
+                target_id,
+                target_name,
+                account,
+                policy_name,
+                approved_by,
+            } => {
+                info!(
+                    target: "audit",
+                    _type = "AccessApprovalConsumed1",
+                    user_id = %user_id,
+                    username = %username,
+                    target_id = %target_id,
+                    target_name = %target_name,
+                    account = account.as_deref(),
+                    policy_name = %policy_name,
+                    approved_by = approved_by.as_deref(),
+                    related_users = %format_related_ids(&[*user_id]),
+                    "An approval was used to start a connection"
+                );
+            }
+            Self::AccessApprovalRefused {
+                user_id,
+                username,
+                target_id,
+                target_name,
+                account,
+                reason,
+            } => {
+                tracing::warn!(
+                    target: "audit",
+                    _type = "AccessApprovalRefused1",
+                    user_id = %user_id,
+                    username = %username,
+                    target_id = %target_id,
+                    target_name = %target_name,
+                    account = account.as_deref(),
+                    reason = %reason,
+                    related_users = %format_related_ids(&[*user_id]),
+                    "Refused a connection: its approval was no longer good"
                 );
             }
             Self::TargetLogonRefused {

@@ -102,6 +102,7 @@ mod m00095_kubernetes_sessions;
 mod m00096_ldap_authenticate_users;
 mod m00097_target_account_bindings;
 mod m00098_unified_access_control;
+mod m00099_access_policies;
 
 pub(crate) mod helpers;
 
@@ -211,6 +212,7 @@ impl MigratorTrait for Migrator {
             Box::new(m00096_ldap_authenticate_users::Migration),
             Box::new(m00097_target_account_bindings::Migration),
             Box::new(m00098_unified_access_control::Migration),
+            Box::new(m00099_access_policies::Migration),
         ]
     }
 }

@@ -11,6 +11,10 @@ anyhow.workspace = true
 argon2.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+# Time zones for access policies: chrono-tz carries the IANA database in the binary, so
+# schedules follow daylight saving without relying on the host's tzdata.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
 data-encoding.workspace = true
 enum_dispatch.workspace = true
 futures.workspace = true

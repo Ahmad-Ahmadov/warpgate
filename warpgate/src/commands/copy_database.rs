@@ -48,6 +48,7 @@ macro_rules! with_every_table_in_order {
             SsoCredential,
             CertificateCredential,
             SessionApprovalRequest,
+            AccessApprovalContext,
             TargetAccountBinding,
             // Access Control: accounts first, then what references them
             TargetAccount,
@@ -55,6 +56,7 @@ macro_rules! with_every_table_in_order {
             AccessGroupGrant,
             AccessGroupExclusion,
             AccessMigrationReview,
+            AccessPolicy,
         ];
     };
 }

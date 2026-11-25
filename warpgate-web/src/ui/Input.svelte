@@ -16,6 +16,8 @@
             | 'url'
             /* The only date type used anywhere in the product. */
             | 'datetime-local'
+            /* A time of day, as HH:MM (24-hour) whatever the display locale. */
+            | 'time'
         disabled?: boolean
         readonly?: boolean
         required?: boolean

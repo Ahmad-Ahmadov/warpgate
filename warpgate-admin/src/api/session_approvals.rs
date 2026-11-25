@@ -4,14 +4,15 @@ use poem::{IntoResponse, handler};
 use poem_openapi::param::Path;
 use poem_openapi::payload::Json;
 use poem_openapi::{ApiResponse, Object, OpenApi};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
 use time::OffsetDateTime;
 use warpgate_common::auth::ApprovalKind;
-use warpgate_common::{AdminPermission, UserSessionId, WarpgateError};
+use warpgate_common::{AdminPermission, RuleApproval, UserSessionId, WarpgateError};
 use warpgate_common_http::AuthenticatedRequestContext;
+use warpgate_core::access_policy::approver_allowed;
 use warpgate_core::approvals::{ApprovalDecision, ApprovalScope};
 use warpgate_core::cluster::{ClusterNotification, refresh_notification_stream};
-use warpgate_db_entities::{Parameters, SessionApprovalRequest};
+use warpgate_db_entities::{AccessApprovalContext, Parameters, Role, SessionApprovalRequest, User};
 
 use super::AdminContext;
 use crate::api::common::require_admin_permission;
@@ -28,6 +29,45 @@ struct SessionApprovalItem {
     target: String,
     started: OffsetDateTime,
     caching_grace_seconds: Option<i64>,
+    /// The access policy that asked for this approval, when one did.
+    policy_name: Option<String>,
+    /// Why approval is required.
+    reason: Option<String>,
+    /// The account the approval is for.
+    account: Option<String>,
+    /// When the request lapses unanswered; an approver cannot approve it after.
+    expires_at: Option<OffsetDateTime>,
+    /// How long an approval can start a connection once it is given.
+    valid_for_seconds: Option<i64>,
+    /// Who may approve it, when the policy names approvers.
+    approvers: Option<String>,
+    /// Whether the administrator asking may approve it.
+    can_approve: bool,
+}
+
+/// The approvers a policy names, in words.
+async fn describe_approvers(
+    db: &DatabaseConnection,
+    constraints: &[RuleApproval],
+) -> Result<Option<String>, WarpgateError> {
+    let mut parts: Vec<String> = vec![];
+    for constraint in constraints {
+        let mut names: Vec<String> = vec![];
+        for id in &constraint.approver_user_ids {
+            if let Some(user) = User::Entity::find_by_id(*id).one(db).await? {
+                names.push(user.username);
+            }
+        }
+        for id in &constraint.approver_role_ids {
+            if let Some(role) = Role::Entity::find_by_id(*id).one(db).await? {
+                names.push(format!("group {}", role.name));
+            }
+        }
+        if !names.is_empty() {
+            parts.push(names.join(", "));
+        }
+    }
+    Ok((!parts.is_empty()).then(|| parts.join(" and ")))
 }
 
 #[derive(ApiResponse)]
@@ -98,20 +138,68 @@ impl Api {
             .map_err(WarpgateError::from)?
             .admin_approval_grace_period_seconds;
 
-        Ok(ListResponse::Ok(Json(
-            requests
-                .into_iter()
-                .map(|r| SessionApprovalItem {
-                    id: r.session_id.to_string(),
-                    protocol: r.protocol,
-                    address: r.remote_address,
-                    username: r.username,
-                    target: r.target,
-                    started: r.started,
-                    caching_grace_seconds,
-                })
-                .collect(),
-        )))
+        let db = &admin.services().db;
+        let now = OffsetDateTime::now_utc();
+        let asking = admin.auth.user_id();
+        let mut items = Vec::with_capacity(requests.len());
+        for r in requests {
+            let context =
+                AccessApprovalContext::find(db, r.session_id, ApprovalKind::Admin, &r.target)
+                    .await
+                    .map_err(WarpgateError::from)?;
+            // A request that has gone unanswered past its expiry can no longer be approved;
+            // it is closed when its connection next looks, but is not offered meanwhile.
+            if context
+                .as_ref()
+                .is_some_and(|context| context.expires_at <= now)
+            {
+                continue;
+            }
+            let (
+                policy_name,
+                reason,
+                account,
+                expires_at,
+                valid_for_seconds,
+                approvers,
+                can_approve,
+            ) = match &context {
+                Some(context) => {
+                    let constraints = context.approver_constraints();
+                    let allowed = r.user_id != asking
+                        && approver_allowed(db, &constraints, asking)
+                            .await
+                            .map_err(WarpgateError::from)?;
+                    (
+                        Some(context.policy_name.clone()),
+                        Some(context.reason.clone()),
+                        context.account_name.clone(),
+                        Some(context.expires_at),
+                        Some(context.valid_for_seconds),
+                        describe_approvers(db, &constraints).await?,
+                        allowed,
+                    )
+                }
+                None => (None, None, None, None, None, None, true),
+            };
+            items.push(SessionApprovalItem {
+                id: r.session_id.to_string(),
+                protocol: r.protocol,
+                address: r.remote_address,
+                username: r.username,
+                target: r.target,
+                started: r.started,
+                caching_grace_seconds,
+                policy_name,
+                reason,
+                account,
+                expires_at,
+                valid_for_seconds,
+                approvers,
+                can_approve,
+            });
+        }
+        Ok(ListResponse::Ok(Json(items)))
     }
 
     #[oai(

@@ -12,7 +12,6 @@
     import {
         type AccessAssignment,
         AccessAssignmentBulkAction,
-        type AccessAssignmentOptions,
         AccessAssignmentSource,
         AccessAssignmentStatus,
         api,
@@ -20,6 +19,7 @@
         TargetAccountAuthMethod,
         type User,
     } from 'admin/lib/api'
+    import { describeRules } from 'common/accessRules'
     import { stringifyError } from 'common/errors'
     import ProtocolLabel from 'common/ProtocolLabel.svelte'
     import Badge from 'ui/Badge.svelte'
@@ -29,12 +29,11 @@
     import ConfirmDialog from 'ui/ConfirmDialog.svelte'
     import EmptyState from 'ui/EmptyState.svelte'
     import Input from 'ui/Input.svelte'
-    import Modal from 'ui/Modal.svelte'
     import Select from 'ui/Select.svelte'
     import SkeletonRow from 'ui/SkeletonRow.svelte'
-    import Toggle from 'ui/Toggle.svelte'
     import { toast } from 'ui/toasts.svelte'
     import { adminPermissions } from '../../lib/store'
+    import GrantAccessModal from './GrantAccessModal.svelte'
 
     interface Props {
         initialUser?: string
@@ -119,10 +118,6 @@
         }
     }
 
-    function targetKind(id: string): string {
-        return targets.find(t => t.id === id)?.options.kind ?? ''
-    }
-
     // ---- selection and bulk actions (direct assignments only) ----
     let selected = $state(new Set<string>())
     const selectable = $derived(
@@ -199,167 +194,18 @@
         }
     }
 
-    // ---- the add / edit dialog ----
+    // ---- Grant Access / Edit Access: one dialog (GrantAccessModal) ----
     let editorOpen = $state(false)
     let editing = $state<AccessAssignment | null>(null)
-    let userSearch = $state('')
-    let userId = $state('')
-    let targetId = $state('')
-    let accountId = $state('')
-    let enabled = $state(true)
-    let expiresAt = $state('')
-    let note = $state('')
-    let options = $state<AccessAssignmentOptions | null>(null)
-    let optionsError = $state<string | null>(null)
-    let saving = $state(false)
-    let saveError = $state<string | null>(null)
-
-    const userOptions = $derived([
-        { value: '', label: 'Select a user…' },
-        ...sortedUsers
-            .filter(u =>
-                u.username
-                    .toLowerCase()
-                    .includes(userSearch.trim().toLowerCase()),
-            )
-            .map(u => ({
-                value: u.id,
-                label: u.ldapServerId
-                    ? `${u.username} (linked to LDAP / AD)`
-                    : u.username,
-            })),
-    ])
-    const targetOptions = $derived([
-        { value: '', label: 'Select a target…' },
-        ...sortedTargets.map(t => ({
-            value: t.id,
-            label: `${t.name} (${t.options.kind})`,
-        })),
-    ])
-    const accountOptions = $derived([
-        { value: '', label: 'Select an account…' },
-        ...(options?.accounts ?? []).map(a => ({
-            value: a.id,
-            label: a.problem
-                ? `${a.signsInAs ?? a.account} (${a.problem})`
-                : (a.signsInAs ?? a.account),
-            disabled: !!a.problem && a.id !== editing?.accountId,
-        })),
-    ])
-    const chosenAccount = $derived(
-        options?.accounts.find(a => a.id === accountId),
-    )
-    const chosenUser = $derived(users.find(u => u.id === userId))
-    const chosenTarget = $derived(targets.find(t => t.id === targetId))
-    const canSave = $derived(
-        !!userId &&
-            !!targetId &&
-            !!options &&
-            (!options.usesAccounts || !!accountId) &&
-            !saving,
-    )
-
-    // What can be assigned depends on the user and the target: ask the server.
-    $effect(() => {
-        const user = userId
-        const target = targetId
-        options = null
-        optionsError = null
-        if (!user || !target) {
-            return
-        }
-        let cancelled = false
-        api.getAccessAssignmentOptions({ userId: user, targetId: target })
-            .then(loaded => {
-                if (!cancelled) {
-                    options = loaded
-                    const usable = loaded.accounts.filter(a => !a.problem)
-                    const only = usable[0]
-                    if (!editing && !accountId && usable.length === 1 && only) {
-                        accountId = only.id
-                    }
-                }
-            })
-            .catch(async e => {
-                if (!cancelled) {
-                    optionsError = await stringifyError(e)
-                }
-            })
-        return () => {
-            cancelled = true
-        }
-    })
-
-    function toLocalInput(date?: Date): string {
-        if (!date) {
-            return ''
-        }
-        const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000)
-        return local.toISOString().slice(0, 16)
-    }
 
     function openAdd() {
         editing = null
-        userSearch = ''
-        userId = filterUser
-        targetId = filterTarget
-        accountId = ''
-        enabled = true
-        expiresAt = ''
-        note = ''
-        saveError = null
         editorOpen = true
     }
 
     function openEdit(a: AccessAssignment) {
         editing = a
-        userSearch = ''
-        userId = a.userId
-        targetId = a.targetId
-        accountId = a.accountId ?? ''
-        enabled = a.enabled
-        expiresAt = toLocalInput(a.expiresAt)
-        note = a.note
-        saveError = null
         editorOpen = true
-    }
-
-    async function save() {
-        saving = true
-        saveError = null
-        const expires = expiresAt ? new Date(expiresAt) : undefined
-        try {
-            if (editing?.id) {
-                await api.updateAccessAssignment({
-                    id: editing.id,
-                    updateAccessAssignmentRequest: {
-                        accountId: accountId || undefined,
-                        enabled,
-                        expiresAt: expires,
-                        note,
-                    },
-                })
-                toast.success('Assignment updated')
-            } else {
-                await api.createAccessAssignment({
-                    createAccessAssignmentRequest: {
-                        userId,
-                        targetId,
-                        accountId: accountId || undefined,
-                        enabled,
-                        expiresAt: expires,
-                        note,
-                    },
-                })
-                toast.success('Access assigned')
-            }
-            editorOpen = false
-            await load()
-        } catch (e) {
-            saveError = await stringifyError(e)
-        } finally {
-            saving = false
-        }
     }
 
     async function setEnabled(a: AccessAssignment, value: boolean) {
@@ -376,7 +222,7 @@
                     note: a.note,
                 },
             })
-            toast.success(value ? 'Assignment enabled' : 'Assignment disabled')
+            toast.success(value ? 'Access enabled' : 'Access switched off')
             await load()
         } catch (e) {
             error = await stringifyError(e)
@@ -395,7 +241,7 @@
         }
         try {
             await api.deleteAccessAssignment({ id: target.id })
-            toast.success('Assignment revoked')
+            toast.success('Access revoked')
             await load()
         } catch (e) {
             error = await stringifyError(e)
@@ -513,7 +359,7 @@
             disabled={!$adminPermissions.accessRolesAssign}
             onclick={openAdd}
         >
-            Assign access
+            Grant Access
         </Button>
     </div>
 </div>
@@ -550,8 +396,8 @@
 {:else if !shown.length}
     <EmptyState
         icon={assignments.length ? 'search' : 'access'}
-        title={assignments.length ? 'Nothing matches' : 'No access assigned'}
-        hint="Users connect to a target only through an assignment: direct, or through an access group."
+        title={assignments.length ? 'Nothing matches' : 'No access granted'}
+        hint="Users connect to a target only through access that was granted to them: directly, or through an access group."
     >
         {#snippet action()}
             <Button
@@ -561,7 +407,7 @@
                 disabled={!$adminPermissions.accessRolesAssign}
                 onclick={openAdd}
             >
-                Assign access
+                Grant Access
             </Button>
         {/snippet}
     </EmptyState>
@@ -649,6 +495,11 @@
                                 <Badge tone={statusTone(a.status)}>
                                     {STATUS_LABELS[a.status]}
                                 </Badge>
+                                {#if a.rules}
+                                    <span title={describeRules(a.rules)}>
+                                        <Badge tone="info">Scheduled</Badge>
+                                    </span>
+                                {/if}
                                 {#if a.problem && a.status === AccessAssignmentStatus.Invalid}
                                     <span class="problem">{a.problem}</span>
                                 {/if}
@@ -667,7 +518,7 @@
                                         disabled={!$adminPermissions.accessRolesAssign}
                                         onclick={() => openEdit(a)}
                                     >
-                                        Edit
+                                        Edit Access
                                     </Button>
                                     <Button
                                         variant="ghost"
@@ -714,122 +565,19 @@
     </div>
 {/if}
 
-<Modal
+<GrantAccessModal
     bind:open={editorOpen}
-    title={editing ? 'Edit assignment' : 'Assign access'}
-    size="md"
->
-    <div class="editor">
-        {#if !editing}
-            <Input
-                label="Find a user"
-                type="search"
-                placeholder="Username"
-                bind:value={userSearch}
-            />
-        {/if}
-        <Select
-            label="1. User"
-            options={userOptions}
-            bind:value={userId}
-            disabled={!!editing}
-            hint={chosenUser
-                ? chosenUser.ldapServerId
-                    ? 'Linked to an LDAP / AD directory: their own directory account can be assigned.'
-                    : 'Not linked to a directory: linked directory accounts cannot be assigned to them.'
-                : undefined}
-        />
-        <Select
-            label="2. Target"
-            options={targetOptions}
-            bind:value={targetId}
-            disabled={!!editing}
-        />
-
-        {#if optionsError}
-            <Callout tone="danger" title="Could not load the target's accounts">
-                {optionsError}
-            </Callout>
-        {/if}
-
-        {#if options}
-            {#if options.usesAccounts}
-                {#if options.accounts.length}
-                    <Select
-                        label="3. Account"
-                        options={accountOptions}
-                        bind:value={accountId}
-                        hint="From the target's Accounts. A linked directory account signs each user in as their own directory identity."
-                    />
-                {:else}
-                    <Callout tone="warning" title="This target has no accounts yet">
-                        Add one on the target's page, in Accounts:
-                        <a href="#/config/targets/{targetId}">open {chosenTarget?.name}</a>.
-                    </Callout>
-                {/if}
-            {:else}
-                <Callout title="No remote account on this protocol">
-                    The assignment is the user's entitlement to the target itself.
-                </Callout>
-            {/if}
-
-            <Input
-                label="Expires"
-                type="datetime-local"
-                hint="Optional. The assignment stops working at this time, and live sessions end."
-                bind:value={expiresAt}
-            />
-            <Toggle
-                label="Enabled"
-                checked={enabled}
-                onchange={value => (enabled = value)}
-            />
-            <Input label="Note" placeholder="Why, ticket number…" bind:value={note} />
-
-            {#if userId && targetId && (!options.usesAccounts || chosenAccount)}
-                <div class="review">
-                    <span class="review-label">4. Review</span>
-                    <p>
-                        <strong>{chosenUser?.username}</strong> may connect to
-                        <strong>{chosenTarget?.name}</strong>
-                        {#if chosenAccount}
-                            as <span class="wg-mono">{chosenAccount.signsInAs ?? chosenAccount.account}</span>,
-                            signing in with
-                            {METHOD_LABELS[chosenAccount.authMethod].toLowerCase()}
-                            ({chosenAccount.credentialSource.toLowerCase()})
-                        {/if}{enabled ? '' : ', once enabled'}{expiresAt
-                            ? `, until ${new Date(expiresAt).toLocaleString()}`
-                            : ''}.
-                        Second factors, approvals and session policies still apply.
-                    </p>
-                    {#if options.current.length && !editing}
-                        <p class="muted">
-                            Their access there now:
-                            {options.current
-                                .map(c => `${c.account ?? 'the target'} (${STATUS_LABELS[c.status].toLowerCase()}, ${c.source === AccessAssignmentSource.Group ? `group ${c.groupName}` : 'direct'})`)
-                                .join('; ')}.
-                        </p>
-                    {/if}
-                </div>
-            {/if}
-        {/if}
-
-        {#if saveError}
-            <Callout tone="danger" title="Could not save">{saveError}</Callout>
-        {/if}
-    </div>
-
-    {#snippet footer()}
-        <Button variant="ghost" onclick={() => (editorOpen = false)}>Cancel</Button>
-        <Button variant="primary" disabled={!canSave} onclick={save}>
-            {saving ? 'Saving…' : editing ? 'Save' : 'Assign'}
-        </Button>
-    {/snippet}
-</Modal>
+    {editing}
+    {users}
+    {targets}
+    initialUser={filterUser}
+    initialTarget={filterTarget}
+    onsaved={load}
+/>
 
 <ConfirmDialog
     open={!!revoking}
-    title="Revoke this assignment?"
+    title="Revoke this access?"
     confirmLabel="Revoke"
     onconfirm={revoke}
     oncancel={() => (revoking = null)}
@@ -860,7 +608,7 @@
 
 <ConfirmDialog
     open={!!bulkAction}
-    title="Apply to the selected assignments?"
+    title="Apply to the selected access?"
     confirmLabel="Apply"
     onconfirm={applyBulk}
     oncancel={() => (bulkAction = null)}
@@ -967,30 +715,6 @@
     }
 
     .problem {
-        color: var(--wg-text-muted);
-        font: var(--wg-text-label-md);
-    }
-
-    .editor {
-        display: flex;
-        flex-direction: column;
-        gap: var(--wg-space-md);
-    }
-
-    .review {
-        display: flex;
-        flex-direction: column;
-        gap: var(--wg-space-xs);
-        padding: var(--wg-space-md);
-        border: var(--wg-border-width) solid var(--wg-border);
-        border-radius: var(--wg-radius-md);
-    }
-
-    .review p {
-        margin: 0;
-    }
-
-    .review-label {
         color: var(--wg-text-muted);
         font: var(--wg-text-label-md);
     }

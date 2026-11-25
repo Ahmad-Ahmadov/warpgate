@@ -18,10 +18,12 @@
         watchPendingRequests,
     } from 'common/approvalRequests'
     import DelayedSpinner from 'common/DelayedSpinner.svelte'
+    import Countdown from 'common/Countdown.svelte'
     import { formatDurationAsHumantime } from 'common/duration'
     import EmptyState from 'common/EmptyState.svelte'
     import { errorStatus, stringifyError } from 'common/errors'
     import Fa from 'svelte-fa'
+    import Badge from 'ui/Badge.svelte'
     import Button from 'ui/Button.svelte'
     import Callout from 'ui/Callout.svelte'
     import Modal from 'ui/Modal.svelte'
@@ -206,6 +208,10 @@
                                     is connecting to
                                 </span>
                                 <strong>{entry.session.target}</strong>
+                                {#if entry.session.account}
+                                    <span class="text-muted">as</span>
+                                    <strong>{entry.session.account}</strong>
+                                {/if}
                             </div>
                             <div class="small text-muted">
                                 {#if entry.session.address}
@@ -214,11 +220,37 @@
                                 {/if}
                                 <RelativeDate date={entry.session.started} />
                             </div>
+                            {#if entry.session.policyName}
+                                <!-- An access policy asked for this one: why, until when, and by whom. -->
+                                <div class="policy">
+                                    <Badge tone="warning">Policy: {entry.session.policyName}</Badge>
+                                    <span>{entry.session.reason}</span>
+                                </div>
+                                <div class="small text-muted">
+                                    {#if entry.session.expiresAt}
+                                        Answer within
+                                        <Countdown until={entry.session.expiresAt} />.
+                                    {/if}
+                                    {#if entry.session.validForSeconds}
+                                        An approval lets one connection start for
+                                        {formatDurationAsHumantime(
+                                            entry.session.validForSeconds,
+                                        )}.
+                                    {/if}
+                                    {#if entry.session.approvers}
+                                        Approvers: {entry.session.approvers}.
+                                    {/if}
+                                    {#if !entry.session.canApprove}
+                                        You cannot approve this one: it is your own
+                                        request, or you are not one of its approvers.
+                                    {/if}
+                                </div>
+                            {/if}
                         </div>
 
                         <div class="request-actions">
                             <div class="btn-row">
-                                {#if entry.session.cachingGraceSeconds}
+                                {#if entry.session.cachingGraceSeconds && !entry.session.policyName}
                                     <Button
                                         variant="primary"
                                         click={() =>
@@ -263,6 +295,7 @@
                                 {:else}
                                     <Button
                                         variant="primary"
+                                        disabled={!entry.session.canApprove}
                                         click={() =>
                                         approveSession(
                                             entry.session,
@@ -435,5 +468,14 @@
         display: flex;
         align-items: center;
         gap: var(--wg-space-sm);
+    }
+
+    .policy {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: var(--wg-space-sm);
+        margin-top: var(--wg-space-xs);
+        font: var(--wg-text-body-md);
     }
 </style>

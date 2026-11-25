@@ -7,6 +7,7 @@ use tracing::{info, warn};
 use warpgate_common::auth::ApprovalKind;
 use warpgate_common::helpers::logging::format_related_ids;
 use warpgate_common::{NodeId, UserSessionId, WarpgateError};
+use warpgate_db_entities::AccessApprovalContext;
 use warpgate_db_entities::SessionApprovalRequest::{
     self, Advertised, ApprovalActor, close_request, mark_consumed, upsert_request,
 };
@@ -219,7 +220,7 @@ pub async fn record_decision(
 ) -> Result<bool, WarpgateError> {
     use SessionApprovalRequest::ApprovalRequestStatus;
 
-    let (status, scope) = match decision {
+    let (status, mut scope) = match decision {
         ApprovalDecision::Approved(scope) => (ApprovalRequestStatus::Approved, Some(scope)),
         ApprovalDecision::Rejected => (ApprovalRequestStatus::Rejected, None),
     };
@@ -231,6 +232,46 @@ pub async fn record_decision(
         // entry is gone or already decided
         return Ok(false);
     };
+
+    // A request an access policy asked for carries its own rules (see `policy.rs`): it lapses
+    // unanswered, only its named approvers may approve it, nobody approves their own, and what
+    // is approved is one connection, never a remembered grant.
+    if matches!(kind, ApprovalKind::Admin)
+        && let Some(context) = AccessApprovalContext::find(db, session_id, kind, target).await?
+    {
+        let now = OffsetDateTime::now_utc();
+        if context.expires_at <= now {
+            close_request(
+                db,
+                session_id,
+                kind,
+                target,
+                SessionApprovalRequest::UndecidedApprovalRequestStatus::TimedOut,
+            )
+            .await?;
+            return Ok(false);
+        }
+        if status == ApprovalRequestStatus::Approved {
+            if actor.user_id == row.user_id {
+                return Err(WarpgateError::AccessPolicyDenied(
+                    "You cannot approve your own access request.".into(),
+                ));
+            }
+            if !crate::access_policy::approver_allowed(
+                db,
+                &context.approver_constraints(),
+                actor.user_id,
+            )
+            .await?
+            {
+                return Err(WarpgateError::AccessPolicyDenied(
+                    "You are not one of the approvers the access policy names.".into(),
+                ));
+            }
+            scope = Some(ApprovalScope::Once);
+            AccessApprovalContext::mark_approved(db, session_id, kind, target, now).await?;
+        }
+    }
 
     let recorded = SessionApprovalRequest::settle_request(db, &row, status, scope, &actor).await?;
     if recorded {
