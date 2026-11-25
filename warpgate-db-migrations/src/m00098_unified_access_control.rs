@@ -498,8 +498,6 @@ mod read {
 #[derive(Clone, Debug)]
 pub(crate) struct LegacyUser {
     pub username: String,
-    pub ldap_server_id: Option<Uuid>,
-    pub ldap_object_uuid: Option<Uuid>,
 }
 
 #[derive(Clone, Debug)]
@@ -551,8 +549,6 @@ async fn load_legacy<C: ConnectionTrait>(db: &C) -> Result<Legacy, DbErr> {
             user.id,
             LegacyUser {
                 username: user.username,
-                ldap_server_id: user.ldap_server_id,
-                ldap_object_uuid: user.ldap_object_uuid,
             },
         );
     }
@@ -1968,8 +1964,6 @@ mod tests {
             id,
             LegacyUser {
                 username: name.to_owned(),
-                ldap_server_id: None,
-                ldap_object_uuid: None,
             },
         );
         id

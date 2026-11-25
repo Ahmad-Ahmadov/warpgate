@@ -1171,24 +1171,25 @@ impl AssignmentsApi {
             .collect();
         let users: HashSet<Uuid> = affected.iter().map(|a| a.user_id).collect();
         let targets: HashSet<Uuid> = affected.iter().map(|a| a.target_id).collect();
-        let verb = match body.action {
-            BulkAction::Enable => "enable",
-            BulkAction::Disable => "disable",
-            BulkAction::Revoke => "revoke",
+        let (verb, done) = match body.action {
+            BulkAction::Enable => ("enable", "Enabled"),
+            BulkAction::Disable => ("disable", "Disabled"),
+            BulkAction::Revoke => ("revoke", "Revoked"),
         };
-        let summary = format!(
-            "{} {} assignment(s) of {} user(s) on {} target(s){}",
-            if body.dry_run { "Would" } else { "Did" },
-            verb,
+        let counts = format!(
+            "{} assignment(s) of {} user(s) on {} target(s)",
             affected.len(),
             users.len(),
             targets.len(),
-            if body.dry_run {
-                "."
-            } else {
-                "; their sessions on those targets ended."
-            },
         );
+        // Enabling ends no sessions; disabling and revoking do (below).
+        let summary = if body.dry_run {
+            format!("Would {verb} {counts}.")
+        } else if body.action == BulkAction::Enable {
+            format!("{done} {counts}.")
+        } else {
+            format!("{done} {counts}; their sessions on those targets ended.")
+        };
         let presented: Vec<AssignmentView> = affected.iter().map(|a| lookup.present(a)).collect();
         if !body.dry_run {
             let actor = admin.auth.user_id();
